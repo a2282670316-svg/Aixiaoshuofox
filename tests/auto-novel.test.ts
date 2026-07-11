@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   buildAutomatedChapterPrompt,
+  buildCharacterContinuityIssues,
+  buildRepairDependencyQueue,
   buildBlueprintChaptersPrompt,
   buildChapterQualityIssues,
   applyChapterMemory,
@@ -29,8 +31,9 @@ import {
 } from "../lib/auto-novel";
 import type { StorySeed, WorkspaceData } from "../lib/types";
 import { DEMO_WORKSPACE } from "../lib/demo-data";
-import { normalizeWorkspaceData } from "../lib/workspace";
+import { mergeAutomationWorkspace, normalizeWorkspaceData, pruneWorkspaceHistory } from "../lib/workspace";
 import { normalizeAIEndpoint } from "../lib/ai-endpoint";
+import { reconcileInterruptedTasks, recoverWorkspaceFromStep } from "../lib/workspace-recovery";
 
 test("accepts public HTTP model endpoints and non-default ports", () => {
   assert.equal(
@@ -638,4 +641,89 @@ test("normalizes stage models, task logs, quality and repair review", () => {
   assert.equal(normalized.chapters[0].repairReview?.status, "pending");
   assert.equal(normalized.automation.stageModels?.audit?.model, "audit-model");
   assert.equal(normalized.automation.taskLog?.[0].status, "completed");
+});
+
+
+test("preserves a newer manual chapter while merging background automation progress", () => {
+  const local = structuredClone(DEMO_WORKSPACE);
+  const remote = structuredClone(DEMO_WORKSPACE);
+  local.chapters[0] = { ...local.chapters[0], content: "manual revision", revision: 5, updatedAt: "2026-07-11T10:00:00.000Z" };
+  remote.chapters[0] = { ...remote.chapters[0], content: "background revision", revision: 4, updatedAt: "2026-07-11T11:00:00.000Z" };
+  remote.automation = { ...remote.automation, phase: "writing", currentChapterNumber: 2 };
+  const merged = mergeAutomationWorkspace(local, remote);
+  assert.equal(merged.chapters[0].content, "manual revision");
+  assert.equal(merged.automation.currentChapterNumber, 2);
+});
+
+test("caps persisted chapter versions, resolved issues and task history", () => {
+  const workspace = structuredClone(DEMO_WORKSPACE);
+  const chapterId = workspace.chapters[0].id;
+  workspace.versions = Array.from({ length: 30 }, (_, index) => ({ id: `v-${index}`, chapterId, title: "chapter", content: `${index}`, createdAt: new Date(2026, 0, index + 1).toISOString(), note: "test" }));
+  workspace.issues = Array.from({ length: 450 }, (_, index) => ({ id: `i-${index}`, severity: DEMO_WORKSPACE.issues[0].severity, category: DEMO_WORKSPACE.issues[0].category, title: "old", description: "old", location: "book", resolved: true }));
+  workspace.automation.taskLog = Array.from({ length: 260 }, (_, index) => ({ id: `t-${index}`, kind: "test", label: "test", status: "completed" as const, startedAt: new Date().toISOString() }));
+  const pruned = pruneWorkspaceHistory(workspace);
+  assert.equal(pruned.versions.length, 12);
+  assert.equal(pruned.issues.length, 400);
+  assert.equal(pruned.automation.taskLog?.length, 200);
+});
+
+
+test("verifies outline and foreshadow evidence against exact chapter text", () => {
+  const workspace = structuredClone(DEMO_WORKSPACE);
+  const chapter = { ...workspace.chapters[0], content: "The brass key was hidden beneath the lamp.", targetWords: 40 };
+  workspace.chapters = [chapter];
+  const memory = parseChapterMemory(JSON.stringify({
+    summary: "The key is discovered.", timelineEvents: [], characterUpdates: [], openedThreads: [], resolvedThreads: [], establishedFacts: [],
+    outlineEvidence: [{ key: "objective", label: "find key", status: "executed", score: 92, evidence: "key found", quote: "brass key was hidden" }],
+    foreshadowUpdates: [{ title: workspace.materials.find((item) => item.foreshadowPlan?.length)?.title || "key", status: "planted", evidence: "key shown", quote: "brass key was hidden" }],
+  }));
+  const applied = applyChapterMemory(workspace, chapter.id, memory);
+  assert.equal(applied.chapters[0].memory?.outlineEvidence?.[0].verified, true);
+  assert.equal(applied.chapters[0].memory?.foreshadowUpdates?.[0].verified, true);
+  assert.ok(evaluateChapterQuality(applied, chapter.number).outline >= 90);
+});
+
+test("detects character knowledge regression and orders dependent repairs", () => {
+  const workspace = structuredClone(DEMO_WORKSPACE);
+  const name = workspace.characters[0].name;
+  const chapter = workspace.chapters[1];
+  chapter.memory = { summary: "state", timelineEvents: [], characterUpdates: [{ name, state: "acts unaware", knowledge: [] }], openedThreads: [], resolvedThreads: [], establishedFacts: [] };
+  workspace.canon.characterStates = [{ name, state: "knows identity", knowledge: ["identity secret"], chapterNumber: chapter.number - 1 }];
+  assert.ok(buildCharacterContinuityIssues(workspace, chapter.number).some((issue) => issue.id.startsWith("character-knowledge")));
+  workspace.issues = [
+    { id: "root", severity: "\u9519\u8bef", category: "\u4eba\u7269", title: "identity conflict", description: "identity secret is wrong", location: "chapter 1", resolved: false, chapterNumber: 1 },
+    { id: "derived", severity: "\u9519\u8bef", category: "\u4eba\u7269", title: "identity conflict later", description: "identity secret remains wrong", location: "chapter 2", resolved: false, chapterNumber: 2 },
+  ];
+  const queue = buildRepairDependencyQueue(workspace);
+  assert.deepEqual(queue.map((item) => item.chapterNumber), [1, 2]);
+  assert.deepEqual(queue[1].dependsOn, [1]);
+  assert.deepEqual(queue[0].affectedChapters, [2]);
+});
+
+
+test("marks stale foreground tasks as interrupted after reload", () => {
+  const workspace = structuredClone(DEMO_WORKSPACE);
+  workspace.automation.phase = "writing";
+  workspace.automation.taskLog = [{
+    id: "stale", kind: "repair", label: "repair", status: "running", startedAt: "2026-07-11T00:00:00.000Z",
+  }];
+  const reconciled = reconcileInterruptedTasks(workspace, new Date("2026-07-11T01:00:00.000Z"));
+  assert.equal(reconciled.automation.phase, "paused");
+  assert.equal(reconciled.automation.taskLog?.[0].status, "failed");
+  assert.match(reconciled.automation.taskLog?.[0].error || "", /\u4e2d\u65ad/);
+});
+
+test("recovers chapter writing from a persisted generation step", () => {
+  const workspace = structuredClone(DEMO_WORKSPACE);
+  workspace.automation.generatedChapterIds = [workspace.chapters[0].id];
+  const recovered = recoverWorkspaceFromStep(workspace, {
+    id: "step", runId: "run-recovery", stepKey: "chapter-1-segment-2", kind: "chapter_segment",
+    chapterNumber: 1, segmentNumber: 2, status: "completed", attempts: 1,
+    createdAt: "2026-07-11T00:00:00.000Z", updatedAt: "2026-07-11T00:00:00.000Z",
+  });
+  assert.equal(recovered.automation.runId, "run-recovery");
+  assert.equal(recovered.automation.phase, "paused");
+  assert.equal(recovered.automation.currentChapterNumber, 1);
+  assert.equal(recovered.automation.currentSegment, 2);
+  assert.equal(recovered.automation.generatedChapterIds.includes(workspace.chapters[0].id), false);
 });

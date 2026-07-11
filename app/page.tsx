@@ -67,7 +67,9 @@ import { buildUserPrompt } from "@/lib/prompts";
 import {
   applyChapterMemory,
   buildChapterMemoryPrompt,
+  buildCharacterContinuityIssues,
   buildConsistencyRepairPrompt,
+  buildRepairDependencyQueue,
   buildRollingAuditPrompt,
   buildForeshadowLedger,
   detectAIStage,
@@ -79,7 +81,10 @@ import {
   removeChapterFromCanon,
   replaceChapterAuditIssues,
 } from "@/lib/auto-novel";
-import { cloneWorkspace, createBlankWorkspace, normalizeWorkspaceData } from "@/lib/workspace";
+import { cloneWorkspace, createBlankWorkspace, mergeAutomationWorkspace, normalizeWorkspaceData, pruneWorkspaceHistory } from "@/lib/workspace";
+import { MAX_STAGE_OUTPUT_TOKENS } from "@/lib/ai-limits";
+import { readPersistentValue, removePersistentValue, writePersistentValue } from "@/lib/browser-storage";
+import { reconcileInterruptedTasks } from "@/lib/workspace-recovery";
 import type {
   AIConfig,
   Chapter,
@@ -227,31 +232,33 @@ export default function Home() {
   const activeCloudRevisionRef = useRef<number | null>(null);
   const cloudBootstrappedRef = useRef(false);
   const cloudSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const aiConfigured = Boolean(config.baseUrl.trim() && config.model.trim());
 
   useEffect(() => {
-    const frame = window.requestAnimationFrame(() => {
-      const stored = localStorage.getItem(WORKSPACE_KEY);
+    let cancelled = false;
+    void (async () => {
       try {
-        if (stored) setWorkspace(normalizeWorkspaceData(JSON.parse(stored), DEMO_WORKSPACE));
+        const stored = await readPersistentValue<unknown>(WORKSPACE_KEY);
+        if (stored && !cancelled) setWorkspace(reconcileInterruptedTasks(normalizeWorkspaceData(stored, DEMO_WORKSPACE)));
       } catch {
-        if (stored) localStorage.setItem(`${WORKSPACE_KEY}-quarantine-${Date.now()}`, stored);
-        setToast("检测到损坏的作品数据，已保留原文并载入演示作品");
+        await removePersistentValue(WORKSPACE_KEY).catch(() => undefined);
+        if (!cancelled) setToast("检测到损坏的作品数据，已隔离并载入演示作品");
       }
       try {
         const savedConfig = localStorage.getItem(CONFIG_KEY);
         const parsed = savedConfig ? JSON.parse(savedConfig) as Partial<AIConfig> : {};
-        setConfig({
+        if (!cancelled) setConfig({
           ...DEFAULT_AI_CONFIG,
           ...parsed,
           apiKey: parsed.rememberKey ? parsed.apiKey ?? "" : sessionStorage.getItem(SESSION_KEY) ?? "",
         });
       } catch {
         localStorage.removeItem(CONFIG_KEY);
-        setConfig({ ...DEFAULT_AI_CONFIG, apiKey: sessionStorage.getItem(SESSION_KEY) ?? "" });
+        if (!cancelled) setConfig({ ...DEFAULT_AI_CONFIG, apiKey: sessionStorage.getItem(SESSION_KEY) ?? "" });
       }
       try {
-        const savedBackups = JSON.parse(localStorage.getItem(BACKUP_KEY) || "[]") as unknown;
-        if (Array.isArray(savedBackups)) {
+        const savedBackups = await readPersistentValue<unknown>(BACKUP_KEY);
+        if (Array.isArray(savedBackups) && !cancelled) {
           setBackups(savedBackups.flatMap((item) => {
             if (!item || typeof item !== "object") return [];
             const candidate = item as Partial<WorkspaceBackup>;
@@ -268,17 +275,17 @@ export default function Home() {
           }).slice(0, 5));
         }
       } catch {
-        localStorage.removeItem(BACKUP_KEY);
+        await removePersistentValue(BACKUP_KEY).catch(() => undefined);
       } finally {
         const activeProject = localStorage.getItem(ACTIVE_PROJECT_KEY);
-        if (activeProject) {
+        if (!cancelled && activeProject) {
           activeCloudProjectIdRef.current = activeProject;
           setActiveCloudProjectId(activeProject);
         }
-        setHydrated(true);
+        if (!cancelled) setHydrated(true);
       }
-    });
-    return () => window.cancelAnimationFrame(frame);
+    })();
+    return () => { cancelled = true; };
   }, []);
 
   useEffect(() => {
@@ -288,7 +295,7 @@ export default function Home() {
         const response = await fetch("/api/projects", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ projectId: activeCloudProjectId, workspace, expectedRevision: activeCloudRevisionRef.current }),
+          body: JSON.stringify({ projectId: activeCloudProjectId, workspace: pruneWorkspaceHistory(workspace), expectedRevision: activeCloudRevisionRef.current }),
         });
         const payload = await response.json().catch(() => ({})) as { project?: { revision?: number }; error?: string; conflict?: boolean };
         if (!response.ok) {
@@ -341,7 +348,7 @@ export default function Home() {
         const payload = await response.json() as { project?: { workspace?: unknown; revision?: number }; active?: { status?: string } | null; configuration?: BackgroundConfiguration; error?: string };
         if (!response.ok || !payload.project?.workspace) throw new Error(payload.error || "读取后台进度失败");
         const next = normalizeWorkspaceData(payload.project.workspace, DEMO_WORKSPACE, { preserveWritingPhase: true });
-        setWorkspace(next);
+        setWorkspace((current) => mergeAutomationWorkspace(current, next));
         if (payload.project.revision) activeCloudRevisionRef.current = payload.project.revision;
         if (payload.configuration) setBackgroundConfiguration(payload.configuration);
         const stillActive = ["queued", "processing"].includes(payload.active?.status || "") && next.automation.phase === "writing";
@@ -364,11 +371,9 @@ export default function Home() {
     if (!hydrated) return;
     const saveDelay = ["writing", "paused", "error", "completed"].includes(workspace.automation.phase) ? 0 : 350;
     const timer = window.setTimeout(() => {
-      try {
-        localStorage.setItem(WORKSPACE_KEY, JSON.stringify(workspace));
-      } catch {
+      void writePersistentValue(WORKSPACE_KEY, pruneWorkspaceHistory(workspace)).catch(() => {
         window.setTimeout(() => setToast("浏览器存储空间不足，请立即导出完整备份"), 0);
-      }
+      });
     }, saveDelay);
     return () => window.clearTimeout(timer);
   }, [workspace, hydrated]);
@@ -382,11 +387,9 @@ export default function Home() {
 
   useEffect(() => {
     if (!hydrated) return;
-    try {
-      localStorage.setItem(BACKUP_KEY, JSON.stringify(backups));
-    } catch {
+    void writePersistentValue(BACKUP_KEY, backups.map((backup) => ({ ...backup, workspace: pruneWorkspaceHistory(backup.workspace) }))).catch(() => {
       window.setTimeout(() => setToast("自动备份空间不足，请导出 JSON 备份"), 0);
-    }
+    });
   }, [backups, hydrated]);
 
   useEffect(() => {
@@ -481,7 +484,7 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           projectId,
-          workspace: source,
+          workspace: pruneWorkspaceHistory(source),
           expectedRevision: projectId ? activeCloudRevisionRef.current : undefined,
           createSnapshot: Boolean(projectId),
           snapshotLabel: createCopy ? "复制作品" : "手动云端保存前快照",
@@ -617,7 +620,7 @@ export default function Home() {
       const response = await fetch("/api/automation/checkpoint", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ projectId: activeCloudProjectIdRef.current, workspace: source, step }),
+        body: JSON.stringify({ projectId: activeCloudProjectIdRef.current, workspace: pruneWorkspaceHistory(source), expectedRevision: activeCloudRevisionRef.current, step }),
       });
       const payload = await response.json().catch(() => ({})) as { projectId?: string; revision?: number; error?: string };
       if (!response.ok || !payload.projectId) throw new Error(payload.error || "云端检查点保存失败");
@@ -857,7 +860,7 @@ export default function Home() {
         working = reserveAIRequestUsage(working);
         setWorkspace(working);
         const payload = await callAIText(buildRollingAuditPrompt(working, chapter.number), 8192);
-        const issues = parseRollingAudit(payload.text!, id(`manual-audit-${chapter.number}`), chapter.number);
+        const issues = [...parseRollingAudit(payload.text!, id(`manual-audit-${chapter.number}`), chapter.number), ...buildCharacterContinuityIssues(working, chapter.number)];
         working = applyAITokenUsage({
           ...working,
           issues: [...working.issues, ...issues],
@@ -976,15 +979,14 @@ export default function Home() {
   };
 
   const repairAllConsistencyIssues = async () => {
-    const grouped = new Map<number, ConsistencyIssue[]>();
-    workspace.issues.filter((issue) => !issue.resolved && issue.severity === "错误" && issue.chapterNumber).forEach((issue) => grouped.set(issue.chapterNumber!, [...(grouped.get(issue.chapterNumber!) || []), issue]));
-    if (!grouped.size) return notify("当前没有可自动修复的章节错误");
-    if (workspace.automation.maxRequests - workspace.automation.usage.requestCount < grouped.size * 3) return notify(`修复队列至少需要 ${grouped.size * 3} 次调用预算`);
-    if (!window.confirm(`将按章节顺序修复 ${grouped.size} 章，每章都会保存原稿、重建记忆并复审。是否继续？`)) return;
+    const queue = buildRepairDependencyQueue(workspace);
+    if (!queue.length) return notify("当前没有可自动修复的章节错误");
+    if (workspace.automation.maxRequests - workspace.automation.usage.requestCount < queue.length * 3) return notify(`修复队列至少需要 ${queue.length * 3} 次调用预算`);
+    if (!window.confirm(`将按章节顺序修复 ${queue.length} 章，每章都会保存原稿、重建记忆并复审。是否继续？`)) return;
     setAiBusy(true); setRepairQueueRunning(true); createBackup(workspace, "全书修复队列前自动备份"); let working = workspace; let haltedAt: number | undefined;
     try {
-      for (const [chapterNumber, issues] of [...grouped.entries()].sort((a, b) => a[0] - b[0])) {
-        const combined: ConsistencyIssue = { ...issues[0], chapterNumber, title: `第 ${chapterNumber} 章错误修复队列（${issues.length} 项）`, description: issues.map((item, index) => `${index + 1}. ${item.title}：${item.description}`).join("\n"), suggestedFix: issues.map((item) => item.suggestedFix).filter(Boolean).join("；") };
+      for (const { chapterNumber, issues, dependsOn, affectedChapters } of queue) {
+        const combined: ConsistencyIssue = { ...issues[0], chapterNumber, title: `\u7b2c ${chapterNumber} \u7ae0\u9519\u8bef\u4fee\u590d\u961f\u5217\uff08${issues.length} \u9879\uff09`, description: [...issues.map((item, index) => `${index + 1}. ${item.title}\uff1a${item.description}`), ...(dependsOn.length ? [`\u4f9d\u8d56\u5148\u4fee\u7ae0\u8282\uff1a${dependsOn.join("\u3001")}`] : []), ...(affectedChapters.length ? [`\u4fee\u590d\u540e\u9700\u91cd\u65b0\u68c0\u67e5\uff1a${affectedChapters.join("\u3001")}`] : [])].join("\n"), suggestedFix: issues.map((item) => item.suggestedFix).filter(Boolean).join("\uff1b") };
         const result = await repairIssueAgainst(working, combined); working = result.working; setWorkspace(working);
         if (!result.accepted) { haltedAt = chapterNumber; break; }
       }
@@ -1342,7 +1344,7 @@ export default function Home() {
         <div className="brand"><Brand /><span>万象小说工坊</span><button className="icon-button sidebar-close" aria-label="关闭导航" onClick={() => setMobileNav(false)}><X size={18} /></button></div>
         <button className="project-switcher" onClick={openProjectLibrary}><span><strong>{workspace.project.title}</strong><small>{workspace.project.genre} · {workspace.project.status}{activeCloudProjectId ? " · 云端" : " · 本地"}</small></span><ChevronDown size={16} /></button>
         <nav className="main-nav" aria-label="工作台导航">{navItems.map(({ label, icon: Icon }) => <button key={label} aria-current={active === label ? "page" : undefined} className={active === label ? "active" : ""} onClick={() => { setActive(label); setMobileNav(false); }}><Icon size={18} /><span>{label}</span>{label === "一致性" && <em className={unresolved ? "has-count" : ""}>{unresolved}</em>}{label === "章节" && <em>{workspace.chapters.length}</em>}</button>)}</nav>
-        <button className="sidebar-tip" onClick={() => { setSettingsTab("AI"); setSettingsOpen(true); }}><BrainCircuit size={16} /><span><b>{config.apiKey ? "AI 已连接" : "连接你的 AI"}</b><small>{config.apiKey ? config.model : "配置兼容接口与模型"}</small></span><ChevronRight size={14} /></button>
+        <button className="sidebar-tip" onClick={() => { setSettingsTab("AI"); setSettingsOpen(true); }}><BrainCircuit size={16} /><span><b>{aiConfigured ? "AI 已连接" : "连接你的 AI"}</b><small>{aiConfigured ? config.model : "配置兼容接口与模型"}</small></span><ChevronRight size={14} /></button>
         <div className="sidebar-footer"><button onClick={() => { setSettingsTab("AI"); setSettingsOpen(true); }}><Settings2 size={18} />设置</button><button onClick={() => notify("先完善人物、世界与大纲，再让 AI 生成章节，效果更稳定。")}><HelpCircle size={18} />写作提示</button></div>
       </aside>
       {mobileNav && <button className="sidebar-scrim" onClick={() => setMobileNav(false)} />}
@@ -1359,8 +1361,8 @@ export default function Home() {
         <div className="content-grid">
           <section className="main-content">{renderView()}</section>
           <aside className={`assistant-panel ${assistantOpen ? "assistant-open" : ""}`}>
-            <div className="assistant-heading"><div><span className="assistant-icon"><Bot size={17} /></span><h2>创作助手</h2></div><span className={`connection-dot ${config.apiKey ? "connected" : ""}`}><i />{config.apiKey ? "已连接" : "未配置"}</span><button className="icon-button assistant-close" aria-label="关闭创作助手" onClick={() => setAssistantOpen(false)}><X size={17} /></button></div>
-            <div className="assistant-body"><div className="assistant-context"><span>当前写作上下文</span><strong>第 {chapter?.number || "—"} 章 · {chapter?.title || "未选择章节"}</strong><p>{chapter?.summary || "选择章节后，助手会带入相关人物、设定和大纲。"}</p></div><div className="quick-task-grid"><button disabled={aiBusy || !chapter?.content} onClick={() => runAI("续写本章", "自然承接正文结尾。", chapter?.id)}><PenLine size={17} /><span>续写本章</span></button><button disabled={aiBusy || !chapter?.content} onClick={() => runAI("润色改写", "保持情节不变，优化表达。", chapter?.id)}><WandSparkles size={17} /><span>润色改写</span></button><button disabled={aiBusy} onClick={() => runAI("情节推进", "设计三个不同代价的推进方案。", chapter?.id)}><ListTree size={17} /><span>情节推进</span></button></div>{aiResult && <button className="latest-result" onClick={() => setResultOpen(true)}><span><Sparkles size={16} /></span><div><b>最近结果 · {aiResult.task}</b><p>{aiResult.text.slice(0, 88)}{aiResult.text.length > 88 ? "…" : ""}</p></div><ChevronRight size={16} /></button>}<div className="assistant-composer"><textarea value={assistantInput} onChange={(event) => setAssistantInput(event.target.value)} placeholder="询问剧情、人物，或描述你想写的内容…" /><div><span><button onClick={() => notify("可将资料保存到素材库后带入上下文")}><Paperclip size={16} /></button><button onClick={() => notify("助手已读取人物、世界、大纲和伏笔")}><AtSign size={16} /></button></span><button className="send-button" disabled={aiBusy} onClick={() => assistantInput.trim() ? runAI("自由对话", assistantInput, chapter?.id) : notify("请先输入问题")}>{aiBusy ? <RefreshCw className="spin" size={16} /> : <Send size={16} />}</button></div></div><button className="model-selector" onClick={() => { setSettingsTab("AI"); setSettingsOpen(true); }}><BrainCircuit size={16} /><span>模型</span><strong>{config.apiKey ? config.model : "尚未配置"}</strong><ChevronRight size={14} /></button><div className="context-section"><div className="context-title"><span>已带入上下文</span><Cloud size={14} /></div><div className="context-list"><div><i /><span>世界观</span><em>{workspace.world.length} 条</em></div><div><i /><span>人物卡</span><em>{workspace.characters.length} 人</em></div><div><i /><span>故事大纲</span><em>{workspace.outline.length} 节点</em></div><div><i /><span>伏笔与问题</span><em>{workspace.materials.filter((item) => item.type === "伏笔").length + unresolved} 条</em></div></div></div><div className="privacy-note"><KeyRound size={14} /><span>API Key 默认只保留到当前浏览器会话结束。</span></div></div>
+            <div className="assistant-heading"><div><span className="assistant-icon"><Bot size={17} /></span><h2>创作助手</h2></div><span className={`connection-dot ${aiConfigured ? "connected" : ""}`}><i />{aiConfigured ? "已连接" : "未配置"}</span><button className="icon-button assistant-close" aria-label="关闭创作助手" onClick={() => setAssistantOpen(false)}><X size={17} /></button></div>
+            <div className="assistant-body"><div className="assistant-context"><span>当前写作上下文</span><strong>第 {chapter?.number || "—"} 章 · {chapter?.title || "未选择章节"}</strong><p>{chapter?.summary || "选择章节后，助手会带入相关人物、设定和大纲。"}</p></div><div className="quick-task-grid"><button disabled={aiBusy || !chapter?.content} onClick={() => runAI("续写本章", "自然承接正文结尾。", chapter?.id)}><PenLine size={17} /><span>续写本章</span></button><button disabled={aiBusy || !chapter?.content} onClick={() => runAI("润色改写", "保持情节不变，优化表达。", chapter?.id)}><WandSparkles size={17} /><span>润色改写</span></button><button disabled={aiBusy} onClick={() => runAI("情节推进", "设计三个不同代价的推进方案。", chapter?.id)}><ListTree size={17} /><span>情节推进</span></button></div>{aiResult && <button className="latest-result" onClick={() => setResultOpen(true)}><span><Sparkles size={16} /></span><div><b>最近结果 · {aiResult.task}</b><p>{aiResult.text.slice(0, 88)}{aiResult.text.length > 88 ? "…" : ""}</p></div><ChevronRight size={16} /></button>}<div className="assistant-composer"><textarea aria-label={"\u521b\u4f5c\u52a9\u624b\u8f93\u5165"} value={assistantInput} onChange={(event) => setAssistantInput(event.target.value)} placeholder="询问剧情、人物，或描述你想写的内容…" /><div><span><button aria-label={"\u6dfb\u52a0\u5199\u4f5c\u7d20\u6750"} onClick={() => notify("可将资料保存到素材库后带入上下文")}><Paperclip size={16} /></button><button aria-label={"\u67e5\u770b\u5df2\u5e26\u5165\u4e0a\u4e0b\u6587"} onClick={() => notify("助手已读取人物、世界、大纲和伏笔")}><AtSign size={16} /></button></span><button className="send-button" aria-label={"\u53d1\u9001\u7ed9\u521b\u4f5c\u52a9\u624b"} disabled={aiBusy} onClick={() => assistantInput.trim() ? runAI("自由对话", assistantInput, chapter?.id) : notify("请先输入问题")}>{aiBusy ? <RefreshCw className="spin" size={16} /> : <Send size={16} />}</button></div></div><button className="model-selector" onClick={() => { setSettingsTab("AI"); setSettingsOpen(true); }}><BrainCircuit size={16} /><span>模型</span><strong>{aiConfigured ? config.model : "尚未配置"}</strong><ChevronRight size={14} /></button><div className="context-section"><div className="context-title"><span>已带入上下文</span><Cloud size={14} /></div><div className="context-list"><div><i /><span>世界观</span><em>{workspace.world.length} 条</em></div><div><i /><span>人物卡</span><em>{workspace.characters.length} 人</em></div><div><i /><span>故事大纲</span><em>{workspace.outline.length} 节点</em></div><div><i /><span>伏笔与问题</span><em>{workspace.materials.filter((item) => item.type === "伏笔").length + unresolved} 条</em></div></div></div><div className="privacy-note"><KeyRound size={14} /><span>API Key 默认只保留到当前浏览器会话结束。</span></div></div>
           </aside>
         </div>
       </section>
@@ -1371,7 +1373,7 @@ export default function Home() {
       {projectLibraryOpen && <div className="modal-backdrop" onMouseDown={(event) => { if (event.currentTarget === event.target) setProjectLibraryOpen(false); }}><section className="project-library-modal" role="dialog" aria-modal="true" aria-label="作品库"><header><div><LibraryBig size={19} /><span><b>我的作品库</b><small>本地编辑、云端保存与任务恢复</small></span></div><button className="icon-button" aria-label="关闭作品库" onClick={() => setProjectLibraryOpen(false)}><X size={18} /></button></header><div className="project-library-actions"><button className="primary-button" onClick={createNewProject}><Plus size={16} />新建作品</button><button className="secondary-button" disabled={cloudBusy} onClick={() => void saveCloudProject(workspace)}><Cloud size={16} />保存当前作品</button><button className="secondary-button" disabled={cloudBusy} onClick={() => void saveCloudProject(workspace, true)}><Copy size={16} />复制为新作品</button><button className="icon-button" aria-label="刷新云端作品" disabled={cloudBusy} onClick={() => void loadCloudProjects()}><RefreshCw className={cloudBusy ? "spin" : ""} size={16} /></button></div>{cloudError && <div className="project-cloud-error"><CircleAlert size={16} />{cloudError}</div>}<div className="project-library-current"><span><BookOpen size={18} /></span><div><small>当前浏览器作品</small><b>《{workspace.project.title}》</b><p>{workspace.project.genre} · {workspace.chapters.length} 章 · {activeCloudProjectId ? "已关联云端" : "仅保存在本机"}</p></div></div><div className="project-library-list"><div className="section-bar"><div><h2>云端作品</h2><span>{cloudProjects.length} 部</span></div><small>{cloudBusy ? "正在同步…" : "按最近更新排序"}</small></div>{cloudProjects.length ? cloudProjects.map((project) => <article key={project.id} className={activeCloudProjectId === project.id ? "active" : ""}><button className="project-open-button" onClick={() => void openCloudProject(project.id)}><span><BookOpen size={17} /></span><div><b>《{project.title}》</b><small>{project.genre || "题材待定"} · {project.status} · {dateLabel(project.updatedAt)}</small></div>{activeCloudProjectId === project.id ? <i>当前</i> : <ChevronRight size={16} />}</button><button className="icon-button project-delete-button" aria-label={`删除《${project.title}》`} onClick={() => void removeCloudProject(project)}><Trash2 size={15} /></button></article>) : <Empty icon={<Cloud />} title="还没有云端作品" text="保存当前作品后，可跨设备恢复并持久保存自动写作检查点。" />}</div></section></div>}
 
       {settingsOpen && <div className="modal-backdrop" onMouseDown={(event) => { if (event.currentTarget === event.target) setSettingsOpen(false); }}><section className="settings-modal" role="dialog" aria-modal="true" aria-label="工作台设置"><header><div><Settings2 size={19} /><span><b>工作台设置</b><small>AI、作品与本地数据</small></span></div><button className="icon-button" aria-label="关闭设置" onClick={() => setSettingsOpen(false)}><X size={18} /></button></header><div className="settings-layout"><nav><button className={settingsTab === "AI" ? "active" : ""} onClick={() => setSettingsTab("AI")}><BrainCircuit size={17} />AI 模型</button><button className={settingsTab === "作品" ? "active" : ""} onClick={() => setSettingsTab("作品")}><BookOpen size={17} />作品信息</button><button className={settingsTab === "数据" ? "active" : ""} onClick={() => setSettingsTab("数据")}><Archive size={17} />数据管理</button></nav><div className="settings-content">
-        {settingsTab === "AI" && <><div className="settings-title"><h2>连接 OpenAI 兼容模型</h2><p>支持 HTTP/HTTPS、Chat Completions 与 Responses；密钥不会写入项目源码。</p></div><div className="form-grid"><label><span>接口地址</span><input value={config.baseUrl} onChange={(event) => setConfig((current) => ({ ...current, baseUrl: event.target.value }))} placeholder="http://127.0.0.1:11434/v1" /><small>可填写 /v1、/chat/completions 或 /responses；本地地址需本地运行本站</small></label><label><span>接口模式</span><select value={config.apiMode} onChange={(event) => setConfig((current) => ({ ...current, apiMode: event.target.value as AIConfig["apiMode"] }))}><option value="auto">自动识别（推荐）</option><option value="chat">Chat Completions</option><option value="responses">Responses API</option></select><small>自动模式遇到 Chat 404 时会改用 Responses</small></label><label><span>API Key（可选）</span><input type="password" value={config.apiKey} onChange={(event) => setConfig((current) => ({ ...current, apiKey: event.target.value }))} autoComplete="off" /><small>Ollama 等无鉴权接口可以留空</small></label><label><span>模型名称</span><input value={config.model} onChange={(event) => setConfig((current) => ({ ...current, model: event.target.value }))} /></label><section className="stage-model-settings"><div><b>分阶段模型</b><small>留空时使用上方默认模型；可为正文、记忆、审校和修复分别指定模型。</small></div><div>{stageModelOptions.map(([stage, label]) => <label key={stage}><span>{label}</span><input value={workspace.automation.stageModels?.[stage]?.model || ""} placeholder={config.model || "使用默认模型"} onChange={(event) => setWorkspace((current) => ({ ...current, automation: { ...current.automation, stageModels: { ...current.automation.stageModels, [stage]: { ...current.automation.stageModels?.[stage], model: event.target.value } } } }))} /><input type="number" min={256} max={131072} value={workspace.automation.stageModels?.[stage]?.maxOutputTokens || ""} placeholder="输出 Token" onChange={(event) => setWorkspace((current) => ({ ...current, automation: { ...current.automation, stageModels: { ...current.automation.stageModels, [stage]: { ...current.automation.stageModels?.[stage], maxOutputTokens: event.target.value ? Number(event.target.value) : undefined } } } }))} /></label>)}</div></section><label><span>创作温度 · {config.temperature.toFixed(1)}</span><input type="range" min="0" max="2" step="0.1" value={config.temperature} onChange={(event) => setConfig((current) => ({ ...current, temperature: Number(event.target.value) }))} /></label><label className="check-label"><input type="checkbox" checked={config.rememberKey} onChange={(event) => setConfig((current) => ({ ...current, rememberKey: event.target.checked }))} /><span><b>在此浏览器中记住密钥</b><small>关闭时，仅保留到本次会话结束。</small></span></label></div><div className="settings-callout"><ShieldCheck size={17} /><span>Responses 请求只发送合法的文本输入，不会把 output_text 作为输入类型；公网 HTTP 建议改用 HTTPS。</span></div><button className="secondary-button" disabled={aiBusy || !config.baseUrl || !config.model} onClick={() => runAI("自由对话", "只回复：连接成功。")}><Zap size={16} />测试连接</button></>}
+        {settingsTab === "AI" && <><div className="settings-title"><h2>连接 OpenAI 兼容模型</h2><p>支持 HTTP/HTTPS、Chat Completions 与 Responses；密钥不会写入项目源码。</p></div><div className="form-grid"><label><span>接口地址</span><input value={config.baseUrl} onChange={(event) => setConfig((current) => ({ ...current, baseUrl: event.target.value }))} placeholder="http://127.0.0.1:11434/v1" /><small>可填写 /v1、/chat/completions 或 /responses；本地地址需本地运行本站</small></label><label><span>接口模式</span><select value={config.apiMode} onChange={(event) => setConfig((current) => ({ ...current, apiMode: event.target.value as AIConfig["apiMode"] }))}><option value="auto">自动识别（推荐）</option><option value="chat">Chat Completions</option><option value="responses">Responses API</option></select><small>自动模式遇到 Chat 404 时会改用 Responses</small></label><label><span>API Key（可选）</span><input type="password" value={config.apiKey} onChange={(event) => setConfig((current) => ({ ...current, apiKey: event.target.value }))} autoComplete="off" /><small>Ollama 等无鉴权接口可以留空</small></label><label><span>模型名称</span><input value={config.model} onChange={(event) => setConfig((current) => ({ ...current, model: event.target.value }))} /></label><section className="stage-model-settings"><div><b>分阶段模型</b><small>留空时使用上方默认模型；可为正文、记忆、审校和修复分别指定模型。</small></div><div>{stageModelOptions.map(([stage, label]) => <label key={stage}><span>{label}</span><input value={workspace.automation.stageModels?.[stage]?.model || ""} placeholder={config.model || "使用默认模型"} onChange={(event) => setWorkspace((current) => ({ ...current, automation: { ...current.automation, stageModels: { ...current.automation.stageModels, [stage]: { ...current.automation.stageModels?.[stage], model: event.target.value } } } }))} /><input type="number" min={256} max={MAX_STAGE_OUTPUT_TOKENS} value={workspace.automation.stageModels?.[stage]?.maxOutputTokens || ""} placeholder="输出 Token" onChange={(event) => setWorkspace((current) => ({ ...current, automation: { ...current.automation, stageModels: { ...current.automation.stageModels, [stage]: { ...current.automation.stageModels?.[stage], maxOutputTokens: event.target.value ? Number(event.target.value) : undefined } } } }))} /></label>)}</div></section><label><span>创作温度 · {config.temperature.toFixed(1)}</span><input type="range" min="0" max="2" step="0.1" value={config.temperature} onChange={(event) => setConfig((current) => ({ ...current, temperature: Number(event.target.value) }))} /></label><label className="check-label"><input type="checkbox" checked={config.rememberKey} onChange={(event) => setConfig((current) => ({ ...current, rememberKey: event.target.checked }))} /><span><b>在此浏览器中记住密钥</b><small>关闭时，仅保留到本次会话结束。</small></span></label></div><div className="settings-callout"><ShieldCheck size={17} /><span>Responses 请求只发送合法的文本输入，不会把 output_text 作为输入类型；公网 HTTP 建议改用 HTTPS。</span></div><button className="secondary-button" disabled={aiBusy || !config.baseUrl || !config.model} onClick={() => runAI("自由对话", "只回复：连接成功。")}><Zap size={16} />测试连接</button></>}
         {settingsTab === "作品" && <><div className="settings-title"><h2>作品信息</h2><p>这些内容会作为全局约束带入每一次 AI 创作。</p></div><div className="form-grid two-col"><label><span>书名</span><input value={workspace.project.title} onChange={(event) => setWorkspace((current) => ({ ...current, project: { ...current.project, title: event.target.value } }))} /></label><label><span>题材</span><input value={workspace.project.genre} onChange={(event) => setWorkspace((current) => ({ ...current, project: { ...current.project, genre: event.target.value } }))} /></label><label className="full"><span>一句话梗概</span><textarea value={workspace.project.premise} onChange={(event) => setWorkspace((current) => ({ ...current, project: { ...current.project, premise: event.target.value } }))} /></label><label className="full"><span>主题表达</span><textarea value={workspace.project.theme} onChange={(event) => setWorkspace((current) => ({ ...current, project: { ...current.project, theme: event.target.value } }))} /></label><label><span>目标字数</span><input type="number" value={workspace.project.targetWords} onChange={(event) => setWorkspace((current) => ({ ...current, project: { ...current.project, targetWords: Number(event.target.value) } }))} /></label><label><span>目标章节</span><input type="number" value={workspace.project.targetChapters} onChange={(event) => setWorkspace((current) => ({ ...current, project: { ...current.project, targetChapters: Number(event.target.value) } }))} /></label><label className="full"><span>叙事视角</span><input value={workspace.project.pointOfView} onChange={(event) => setWorkspace((current) => ({ ...current, project: { ...current.project, pointOfView: event.target.value } }))} /></label><label className="full"><span>文风约束</span><textarea value={workspace.project.writingStyle} onChange={(event) => setWorkspace((current) => ({ ...current, project: { ...current.project, writingStyle: event.target.value } }))} /></label></div></>}
         {settingsTab === "数据" && <>
           <div className="settings-title"><h2>本地数据管理</h2><p>导出完整备份后，可以在另一台设备恢复。</p></div>

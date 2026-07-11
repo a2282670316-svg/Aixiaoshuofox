@@ -1109,11 +1109,12 @@ export function buildChapterMemoryPrompt(workspace: WorkspaceData, chapter: Chap
 {
   "summary": "300—600字的本章因果摘要",
   "timelineEvents": ["按发生顺序记录的事件"],
-  "characterUpdates": [{"name":"人物姓名","state":"本章结束时的位置、身体、情绪、已知信息、目标或关系变化"}],
+  "characterUpdates": [{"name":"人物姓名","state":"本章结束综合状态","location":"所在地点","physical":"身体状态","emotion":"情绪","knowledge":["已经确认知道的信息"],"inventory":["持有的重要物品"],"goal":"当前目标"}],
   "openedThreads": ["本章新出现且尚未解决的线索或承诺"],
   "resolvedThreads": ["本章明确解决或回收的线索"],
   "establishedFacts": ["后文不可随意推翻的明确事实"],
-  "foreshadowUpdates": [{"title":"伏笔名称","status":"planted|advanced|resolved","evidence":"正文中的执行证据"}]
+  "outlineEvidence": [{"key":"objective|opening|scene|turningPoint|endingHook","label":"对应章纲项目","status":"executed|partial|missing","score":0,"evidence":"执行判断","quote":"正文中的连续原文引用"}],
+  "foreshadowUpdates": [{"title":"伏笔名称","status":"planted|advanced|resolved","evidence":"如何执行","quote":"正文中的连续原文引用"}]
 }
 
 要求：只记录正文能够支持的内容；不要推测未来；人物姓名必须沿用现有人物档案；每个数组最多 20 条。
@@ -1144,11 +1145,31 @@ export function parseChapterMemory(value: string): ChapterMemory {
     characterUpdates: list(payload.characterUpdates).map((item) => record(item)).flatMap((item) => {
       const name = text(item.name);
       const state = text(item.state);
-      return name && state ? [{ name, state }] : [];
+      return name && state ? [{
+        name,
+        state,
+        location: text(item.location) || undefined,
+        physical: text(item.physical) || undefined,
+        emotion: text(item.emotion) || undefined,
+        knowledge: list(item.knowledge).map((entry) => text(entry)).filter(Boolean).slice(0, 100),
+        inventory: list(item.inventory).map((entry) => text(entry)).filter(Boolean).slice(0, 100),
+        goal: text(item.goal) || undefined,
+      }] : [];
     }).slice(0, 20),
     openedThreads: list(payload.openedThreads).map((item) => text(item)).filter(Boolean).slice(0, 20),
     resolvedThreads: list(payload.resolvedThreads).map((item) => text(item)).filter(Boolean).slice(0, 20),
     establishedFacts: list(payload.establishedFacts).map((item) => text(item)).filter(Boolean).slice(0, 30),
+    outlineEvidence: list(payload.outlineEvidence).filter(isJsonRecord).flatMap((item) => {
+      const label = text(item.label);
+      if (!label) return [];
+      const key = ["objective", "opening", "scene", "turningPoint", "endingHook"].includes(text(item.key))
+        ? text(item.key) as "objective" | "opening" | "scene" | "turningPoint" | "endingHook"
+        : "scene";
+      const status = ["executed", "partial", "missing"].includes(text(item.status))
+        ? text(item.status) as "executed" | "partial" | "missing"
+        : "missing";
+      return [{ key, label, status, score: clamp(Number(item.score) || 0, 0, 100), evidence: text(item.evidence), quote: text(item.quote), verified: false }];
+    }).slice(0, 50),
     foreshadowUpdates: list(payload.foreshadowUpdates).filter(isJsonRecord).flatMap((item) => {
       const title = text(item.title);
       if (!title) return [];
@@ -1156,9 +1177,17 @@ export function parseChapterMemory(value: string): ChapterMemory {
         title,
         status: ["planted", "advanced", "resolved"].includes(text(item.status)) ? text(item.status) as "planted" | "advanced" | "resolved" : "advanced",
         evidence: text(item.evidence),
+        quote: text(item.quote),
+        verified: false,
       }];
     }).slice(0, 30),
   };
+}
+
+function verifyQuotedEvidence(content: string, quote?: string) {
+  const normalizedQuote = (quote || "").replace(/\s+/g, "").trim();
+  if (normalizedQuote.length < 6) return false;
+  return content.replace(/\s+/g, "").includes(normalizedQuote);
 }
 
 export function applyChapterMemory(
@@ -1169,6 +1198,12 @@ export function applyChapterMemory(
   const chapter = workspace.chapters.find((item) => item.id === chapterId);
   if (!chapter) return workspace;
   const chapterNumber = chapter.number;
+  const verifiedMemory: ChapterMemory = {
+    ...memory,
+    outlineEvidence: (memory.outlineEvidence || []).map((entry) => ({ ...entry, verified: verifyQuotedEvidence(chapter.content, entry.quote) })),
+    foreshadowUpdates: (memory.foreshadowUpdates || []).map((entry) => ({ ...entry, verified: verifyQuotedEvidence(chapter.content, entry.quote) })),
+  };
+  memory = verifiedMemory;
   const nextRevision = workspace.canon.revision + 1;
   const characterIds = new Map(workspace.characters.map((item) => [item.name, item.id]));
   const previousSummaries = workspace.canon.chapterSummaries.filter((item) => item.chapterId !== chapterId);
@@ -1198,6 +1233,12 @@ export function applyChapterMemory(
       name: item.name,
       state: item.state,
       chapterNumber,
+      location: item.location,
+      physical: item.physical,
+      emotion: item.emotion,
+      knowledge: item.knowledge,
+      inventory: item.inventory,
+      goal: item.goal,
     }))],
     threads: [...updatedThreads, ...openedThreadTitles.filter((title) => !knownThreadTitles.has(title)).map((title, index) => ({
       id: `thread-${nextRevision}-${chapterNumber}-${index + 1}`,
@@ -1293,7 +1334,11 @@ export function evaluateChapterQuality(workspace: WorkspaceData, chapterNumber: 
     chapter.chapterOutline.turningPoint,
     chapter.chapterOutline.endingHook,
   ] : [];
-  const outlineBase = outlineFields.length ? outlineFields.filter(Boolean).length / outlineFields.length * 100 : 20;
+  const outlineEvidence = chapter.memory?.outlineEvidence || [];
+  const verifiedOutline = outlineEvidence.filter((entry) => entry.verified);
+  const outlineBase = outlineEvidence.length
+    ? verifiedOutline.reduce((sum, entry) => sum + entry.score, 0) / outlineEvidence.length
+    : outlineFields.length ? outlineFields.filter(Boolean).length / outlineFields.length * 40 : 20;
   const chapterIssues = workspace.issues.filter((issue) => !issue.resolved && issue.chapterNumber === chapterNumber);
   const outlinePenalty = chapterIssues.filter((issue) => /章纲|场景|转折|钩子|目标/.test(issue.title + issue.description)).length * 18;
   const outline = clamp(outlineBase - outlinePenalty, 0, 100);
@@ -1302,7 +1347,7 @@ export function evaluateChapterQuality(workspace: WorkspaceData, chapterNumber: 
   const continuity = clamp(100 - errors * 30 - warnings * 12, 0, 100);
   const tasks = foreshadowTasksForChapter(workspace, chapterNumber);
   const updates = chapter.memory?.foreshadowUpdates || [];
-  const matched = tasks.filter((task) => updates.some((update) => update.title === task.title && update.status === (task.action === "plant" ? "planted" : task.action === "resolve" ? "resolved" : "advanced"))).length;
+  const matched = tasks.filter((task) => updates.some((update) => update.verified && update.title === task.title && update.status === (task.action === "plant" ? "planted" : task.action === "resolve" ? "resolved" : "advanced"))).length;
   const foreshadow = tasks.length ? clamp(matched / tasks.length * 100, 0, 100) : 100;
   const styleIssues = chapterIssues.filter((issue) => issue.category === "文风").length;
   const style = clamp(100 - styleIssues * 18, 0, 100);
@@ -1313,14 +1358,14 @@ export function evaluateChapterQuality(workspace: WorkspaceData, chapterNumber: 
     ...(continuity < 80 ? ["仍有一致性问题需要处理"] : []),
     ...(foreshadow < 100 ? ["本章伏笔任务尚未全部验证"] : []),
   ];
-  return { overall, length, outline, continuity, foreshadow, style, evaluatedAt: new Date().toISOString(), notes };
+  return { overall, length, outline, continuity, foreshadow, style, evaluatedAt: new Date().toISOString(), notes, outlineEvidence };
 }
 
 export function buildForeshadowLedger(workspace: WorkspaceData) {
   return workspace.materials.filter((material) => material.type === "伏笔").map((material) => {
     const plan = material.foreshadowPlan || [];
     const evidence = workspace.chapters.flatMap((chapter) => (chapter.memory?.foreshadowUpdates || [])
-      .filter((update) => update.title === material.title)
+      .filter((update) => update.title === material.title && update.verified)
       .map((update) => ({ chapterNumber: chapter.number, status: update.status, evidence: update.evidence })));
     const plannedResolve = plan.find((step) => step.action === "resolve")?.chapterNumber;
     const actualResolve = evidence.find((item) => item.status === "resolved")?.chapterNumber;
@@ -1415,4 +1460,83 @@ export function parseConsistencyRepair(value: string) {
   const revisedContent = text(payload.revisedContent);
   if (revisedContent.replace(/\s+/g, "").length < 300) throw new Error("AI 修订结果过短，已拒绝覆盖原章节");
   return { revisedContent, changeSummary: text(payload.changeSummary, "已按一致性问题完成最小修订") };
+}
+
+export function buildCharacterContinuityIssues(workspace: WorkspaceData, chapterNumber: number): ConsistencyIssue[] {
+  const chapter = workspace.chapters.find((item) => item.number === chapterNumber);
+  if (!chapter?.memory) return [];
+  const issues: ConsistencyIssue[] = [];
+  for (const update of chapter.memory.characterUpdates) {
+    const previous = workspace.canon.characterStates
+      .filter((state) => state.name === update.name && state.chapterNumber < chapterNumber)
+      .sort((left, right) => right.chapterNumber - left.chapterNumber)[0];
+    if (!previous) continue;
+    const currentKnowledge = new Set(update.knowledge || []);
+    const forgotten = (previous.knowledge || []).filter((fact) => !currentKnowledge.has(fact));
+    if (forgotten.length) {
+      issues.push({
+        id: `character-knowledge-${chapterNumber}-${update.name}`,
+        severity: "\u9519\u8bef",
+        category: "\u4eba\u7269",
+        title: `${update.name}\u7684\u5df2\u77e5\u4fe1\u606f\u51fa\u73b0\u56de\u9000`,
+        description: `\u4e0a\u4e00\u72b6\u6001\u5df2\u786e\u8ba4\u77e5\u9053\uff1a${forgotten.join("\uff1b")}\uff0c\u672c\u7ae0\u72b6\u6001\u672a\u4fdd\u7559\u3002`,
+        location: `\u7b2c ${chapterNumber} \u7ae0`,
+        resolved: false,
+        chapterNumber,
+        evidence: update.state,
+        suggestedFix: "\u786e\u8ba4\u4eba\u7269\u662f\u5426\u771f\u7684\u5931\u5fc6\uff1b\u5426\u5219\u6062\u590d\u5df2\u77e5\u4fe1\u606f\u5e76\u4fee\u6b63\u884c\u4e3a\u3002",
+        source: "local",
+      });
+    }
+    if (previous.location && update.location && previous.location !== update.location && !/[\u5230\u8fbe\u79bb\u5f00\u8d76\u5f80\u8fd4\u56de\u8f6c\u79fb\u4e58\u5750\u6b65\u884c]/.test(update.state)) {
+      issues.push({
+        id: `character-location-${chapterNumber}-${update.name}`,
+        severity: "\u8b66\u544a",
+        category: "\u4eba\u7269",
+        title: `${update.name}\u7684\u5730\u70b9\u53d8\u5316\u7f3a\u5c11\u8fc7\u6e21\u8bc1\u636e`,
+        description: `\u4eba\u7269\u4ece\u201c${previous.location}\u201d\u53d8\u4e3a\u201c${update.location}\u201d\uff0c\u72b6\u6001\u6458\u8981\u4e2d\u6ca1\u6709\u660e\u786e\u79fb\u52a8\u8fc7\u7a0b\u3002`,
+        location: `\u7b2c ${chapterNumber} \u7ae0`,
+        resolved: false,
+        chapterNumber,
+        evidence: update.state,
+        suggestedFix: "\u8865\u5145\u573a\u666f\u8f6c\u6362\u3001\u65f6\u95f4\u6d41\u901d\u6216\u4ea4\u901a\u8fc7\u7a0b\u3002",
+        source: "local",
+      });
+    }
+  }
+  return issues;
+}
+
+export interface RepairQueueGroup {
+  chapterNumber: number;
+  issues: ConsistencyIssue[];
+  dependsOn: number[];
+  affectedChapters: number[];
+}
+
+function repairIssueTokens(issue: ConsistencyIssue) {
+  return new Set(`${issue.title} ${issue.description}`.toLowerCase().match(/[\p{L}\p{N}]{2,}/gu) || []);
+}
+
+export function buildRepairDependencyQueue(workspace: WorkspaceData): RepairQueueGroup[] {
+  const grouped = new Map<number, ConsistencyIssue[]>();
+  for (const issue of workspace.issues) {
+    if (issue.resolved || issue.severity !== "\u9519\u8bef" || !issue.chapterNumber) continue;
+    grouped.set(issue.chapterNumber, [...(grouped.get(issue.chapterNumber) || []), issue]);
+  }
+  const groups = [...grouped.entries()].sort((left, right) => left[0] - right[0]).map(([chapterNumber, issues]) => ({ chapterNumber, issues, dependsOn: [] as number[], affectedChapters: [] as number[] }));
+  for (let index = 0; index < groups.length; index += 1) {
+    const current = groups[index];
+    const currentTokens = new Set(current.issues.flatMap((issue) => [...repairIssueTokens(issue)]));
+    for (let priorIndex = 0; priorIndex < index; priorIndex += 1) {
+      const prior = groups[priorIndex];
+      const sameCategory = current.issues.some((issue) => prior.issues.some((candidate) => candidate.category === issue.category));
+      const sharedToken = prior.issues.some((issue) => [...repairIssueTokens(issue)].some((token) => currentTokens.has(token)));
+      if (sameCategory && sharedToken) {
+        current.dependsOn.push(prior.chapterNumber);
+        prior.affectedChapters.push(current.chapterNumber);
+      }
+    }
+  }
+  return groups;
 }

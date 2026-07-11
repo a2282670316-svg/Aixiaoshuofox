@@ -41,6 +41,10 @@ test("renders the complete novel workspace", async () => {
   assert.match(html, /创作助手/);
   assert.match(html, /一致性/);
   assert.match(html, /素材库/);
+  assert.match(html, /aria-label="\u521b\u4f5c\u52a9\u624b\u8f93\u5165"/);
+  assert.match(html, /aria-label="\u6dfb\u52a0\u5199\u4f5c\u7d20\u6750"/);
+  assert.match(html, /aria-label="\u53d1\u9001\u7ed9\u521b\u4f5c\u52a9\u624b"/);
+  assert.doesNotMatch(html, /aria-label="\?{3,}"/);
 });
 
 test("rejects incomplete AI proxy requests", async () => {
@@ -213,6 +217,18 @@ test("rejects cross-origin automation checkpoints", async () => {
     context,
   );
   assert.equal(response.status, 403);
+});
+
+
+
+test("requires authentication before listing automation recovery history", async () => {
+  const worker = await workerPromise;
+  const response = await worker.fetch(
+    new Request("https://novel.example/api/automation/checkpoint?projectId=test-project"),
+    env,
+    context,
+  );
+  assert.equal(response.status, 401);
 });
 
 test("reports background automation configuration without exposing secrets", async () => {

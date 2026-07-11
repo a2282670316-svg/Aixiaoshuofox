@@ -1,6 +1,7 @@
 "use client";
 
 import {
+  useEffect,
   useRef,
   useState,
   type Dispatch,
@@ -36,6 +37,7 @@ import {
   buildBlueprintWorldPrompt,
   buildChapterMemoryPrompt,
   buildChapterQualityIssues,
+  buildCharacterContinuityIssues,
   buildConsistencyRepairPrompt,
   buildRollingAuditPrompt,
   buildSeedPrompt,
@@ -65,8 +67,12 @@ import type {
   ConsistencyIssue,
   NovelAutomation,
   StorySeed,
+  AutomationRecoveryData,
+  GenerationRecoveryStep,
   WorkspaceData,
 } from "@/lib/types";
+import { recoverWorkspaceFromStep } from "@/lib/workspace-recovery";
+import AutomationTaskCenter from "@/app/components/automation-task-center";
 
 type Props = {
   workspace: WorkspaceData;
@@ -176,6 +182,8 @@ export default function AutoNovelStudio({
   const usageRef = useRef(workspace.automation.usage);
   const budgetRef = useRef({ maxRequests: workspace.automation.maxRequests, maxTokens: workspace.automation.maxTokens });
   const [blueprintStage, setBlueprintStage] = useState("");
+  const [recovery, setRecovery] = useState<AutomationRecoveryData | null>(null);
+  const [recoveryLoading, setRecoveryLoading] = useState(false);
   const automation = workspace.automation;
   const isRunning = activePhases.includes(automation.phase) && !(automation.phase === "planning" && !aiBusy);
   const generatedCount = workspace.chapters.filter((item) => automation.generatedChapterIds.includes(item.id)).length;
@@ -189,6 +197,32 @@ export default function AutoNovelStudio({
   const currentWorkflowChapter = workspace.chapters.find((chapter) => chapter.number === automation.currentChapterNumber)
     || writingEstimate.pendingChapters[0];
   const currentWorkflowStage = chapterWorkflowStage(currentWorkflowChapter);
+
+  const loadRecovery = async () => {
+    if (!durableProjectId) { setRecovery(null); return; }
+    setRecoveryLoading(true);
+    try {
+      const response = await fetch(`/api/automation/checkpoint?projectId=${encodeURIComponent(durableProjectId)}`);
+      const payload = await response.json().catch(() => ({})) as { recovery?: AutomationRecoveryData; error?: string };
+      if (!response.ok) throw new Error(payload.error || "\u8bfb\u53d6\u6062\u590d\u8bb0\u5f55\u5931\u8d25");
+      setRecovery(payload.recovery || null);
+    } catch (error) {
+      setRecovery(null);
+      notify(error instanceof Error ? error.message : "\u8bfb\u53d6\u6062\u590d\u8bb0\u5f55\u5931\u8d25");
+    } finally { setRecoveryLoading(false); }
+  };
+
+  useEffect(() => {
+    void loadRecovery();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [durableProjectId]);
+
+  const recoverFromStep = (step: GenerationRecoveryStep) => {
+    setWorkspace((current) => recoverWorkspaceFromStep(current, step));
+    notify(step.chapterNumber
+      ? `\u5df2\u6062\u590d\u5230\u7b2c ${step.chapterNumber} \u7ae0\u7684\u68c0\u67e5\u70b9\uff0c\u53ef\u7ee7\u7eed\u5199\u4f5c`
+      : "\u5df2\u6062\u590d\u5230\u9009\u5b9a\u84dd\u56fe\u9636\u6bb5\uff0c\u53ef\u7ee7\u7eed\u751f\u6210");
+  };
 
   const patchAutomation = (patch: Partial<NovelAutomation>) => {
     setWorkspace((current) => ({
@@ -565,6 +599,7 @@ export default function AutoNovelStudio({
           if (stopRequested.current || runTokenRef.current !== runId) break;
           const auditIssues = [
             ...buildChapterQualityIssues(working, item.number, runId),
+            ...buildCharacterContinuityIssues(working, item.number),
             ...aiAuditIssues,
           ];
           working = replaceChapterAuditIssues(working, item.number, auditIssues);
@@ -1144,7 +1179,6 @@ export default function AutoNovelStudio({
         <div className="heading-actions">
           {activePhases.includes(automation.phase) && aiBusy ? <button className="secondary-button" onClick={() => backgroundActive ? void onPauseBackground?.() : pause()}><Pause size={16} />暂停</button> : null}
           {resumableSeed && ["planning", "paused", "error"].includes(automation.phase) && automation.blueprintDraft && automation.blueprintDraft.completedStage < 5 ? <button className="primary-button" disabled={aiBusy} onClick={() => void buildBlueprintFrom(workspace, resumableSeed, false)}><RotateCcw size={16} />从第 {Math.min(5, automation.blueprintDraft!.completedStage + 1)} 步继续蓝图</button> : null}
-          {["paused", "error", "ready"].includes(automation.phase) && workspace.chapters.length ? <><button className="secondary-button" disabled={aiBusy || backgroundBusy || writingEstimate.pendingChapters.length === 0 || writingEstimate.errors.length > 0} onClick={() => void writeNovel(scheduledWorkspace)}><Play size={16} />浏览器连续写作</button><button className="primary-button" disabled={backgroundBusy || !backgroundConfigured || writingEstimate.pendingChapters.length === 0 || writingEstimate.errors.length > 0} onClick={() => void onStartBackground?.(scheduledWorkspace)}><Cloud size={16} />{backgroundBusy ? "正在启动…" : "云端后台写作"}</button></> : null}
         </div>
       </div>
 
@@ -1238,12 +1272,13 @@ export default function AutoNovelStudio({
             return <button key={item.id} className={current ? "current" : done ? "done" : ""} onClick={() => onOpenChapter(item.id)}><span>{done ? <Check size={14} /> : current ? <LoaderCircle className={automation.phase === "writing" ? "spin" : ""} size={14} /> : item.number}</span><div><b>第 {item.number} 章 · {item.title}</b><small>{done ? `${countCharacters(item.content).toLocaleString("zh-CN")} 字 · 已验收` : current ? chapterWorkflowStage(item) : chapterWorkflowStage(item)}</small></div><ChevronRight size={15} /></button>;
           })}
         </div>
-        <section className="automation-task-center"><div className="auto-section-title"><div><span>TASK CENTER</span><h3>后台任务中心</h3></div><small>{(automation.taskLog || []).length} 条记录</small></div>{(automation.taskLog || []).length ? <div className="automation-task-list">{(automation.taskLog || []).slice(0, 12).map((task) => <article key={task.id} className={`task-${task.status}`}><i>{task.status === "completed" ? <Check size={13} /> : task.status === "failed" ? <AlertTriangle size={13} /> : task.status === "cancelled" ? <CircleStop size={13} /> : <LoaderCircle className={task.status === "running" ? "spin" : ""} size={13} />}</i><div><b>{task.label}</b><small>{task.chapterNumber ? `第 ${task.chapterNumber} 章 · ` : ""}{task.status === "running" ? "运行中" : task.status === "completed" ? "已完成" : task.status === "failed" ? task.error || "失败" : task.status === "cancelled" ? "已取消" : "排队中"}</small></div><time>{new Date(task.finishedAt || task.startedAt).toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" })}</time></article>)}</div> : <p className="automation-task-empty">启动章节重建、修复队列或后台写作后，任务记录会显示在这里。</p>}</section>
         <footer className="auto-control-bar">
           <span>{backgroundActive ? <Cloud size={14} /> : durableProjectId ? <Cloud size={14} /> : <AlertTriangle size={14} />}{backgroundActive ? "后台工作器正在接力生成，关闭网页后任务仍会继续。" : durableProjectId ? backgroundConfigured ? "云端检查点已开启；保持后台工作器运行即可关闭网页。" : "云端检查点已开启；第三方后台模型密钥尚待配置。" : "首次运行会创建云端检查点；浏览器模式需保持页面打开。"}</span>
-          <div>{automation.phase === "writing" ? <button className="secondary-button" disabled={backgroundBusy} onClick={() => backgroundActive ? void onPauseBackground?.() : pause()}><CircleStop size={16} />暂停并保存</button> : automation.phase !== "completed" ? <><button className="secondary-button" disabled={aiBusy || backgroundBusy || writingEstimate.pendingChapters.length === 0 || writingEstimate.errors.length > 0} onClick={() => void writeNovel(scheduledWorkspace)}><Play size={16} />浏览器续写</button><button className="primary-button" disabled={backgroundBusy || !backgroundConfigured || writingEstimate.pendingChapters.length === 0 || writingEstimate.errors.length > 0} onClick={() => void onStartBackground?.(scheduledWorkspace)}><Cloud size={16} />云端后台续写</button></> : <button className="primary-button" onClick={() => onOpenChapter(workspace.chapters[0].id)}><BookOpenCheck size={16} />审阅全书</button>}<button className="secondary-button" disabled={isRunning} onClick={resetWorkflow}><RotateCcw size={15} />重置流程</button></div>
+          <div>{automation.phase === "writing" ? <button className="secondary-button" disabled={backgroundBusy} onClick={() => backgroundActive ? void onPauseBackground?.() : pause()}><CircleStop size={16} />{"\u6682\u505c\u5e76\u4fdd\u5b58"}</button> : automation.phase === "completed" ? <button className="primary-button" onClick={() => onOpenChapter(workspace.chapters[0].id)}><BookOpenCheck size={16} />{"\u5ba1\u9605\u5168\u4e66"}</button> : <small>{"\u8bf7\u5728\u4e0a\u65b9\u201c\u5199\u4f5c\u8c03\u5ea6\u4e2d\u5fc3\u201d\u9009\u62e9\u8303\u56f4\u5e76\u542f\u52a8"}</small>}<button className="secondary-button" disabled={isRunning} onClick={resetWorkflow}><RotateCcw size={15} />{"\u91cd\u7f6e\u6d41\u7a0b"}</button></div>
         </footer>
       </section>}
+
+        <AutomationTaskCenter automation={automation} recovery={recovery} recoveryLoading={recoveryLoading} durableProjectId={durableProjectId} isRunning={isRunning} onRefreshRecovery={() => void loadRecovery()} onRecoverStep={recoverFromStep} />
     </div>
   );
 }

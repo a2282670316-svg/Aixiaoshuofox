@@ -1,3 +1,4 @@
+import { MAX_STAGE_OUTPUT_TOKENS } from "./ai-limits";
 import { createAutomationState } from "./auto-novel";
 import type {
   AutomationPhase,
@@ -170,6 +171,15 @@ export function normalizeWorkspaceData(
       openedThreads: stringList(rawMemory.openedThreads, 100),
       resolvedThreads: stringList(rawMemory.resolvedThreads, 100),
       establishedFacts: stringList(rawMemory.establishedFacts, 200),
+      outlineEvidence: objects(rawMemory.outlineEvidence, 100).map((entry, index) => ({
+        key: enumValue(entry.key, ["objective", "opening", "scene", "turningPoint", "endingHook"] as const, "scene"),
+        label: stringValue(entry.label, `outline-${index + 1}`, 1000),
+        status: enumValue(entry.status, ["executed", "partial", "missing"] as const, "missing"),
+        score: numberValue(entry.score, 0, 0, 100),
+        evidence: typeof entry.evidence === "string" ? entry.evidence.slice(0, 4000) : undefined,
+        quote: typeof entry.quote === "string" ? entry.quote.slice(0, 1000) : undefined,
+        verified: Boolean(entry.verified),
+      })),
       foreshadowUpdates: objects(rawMemory.foreshadowUpdates, 100).flatMap((update) => {
         const title = stringValue(update.title, "", 500).trim();
         if (!title) return [];
@@ -177,6 +187,8 @@ export function normalizeWorkspaceData(
           title,
           status: enumValue(update.status, ["planted", "advanced", "resolved"] as const, "advanced"),
           evidence: stringValue(update.evidence, "", 4000),
+          quote: typeof update.quote === "string" ? update.quote.slice(0, 1000) : undefined,
+          verified: Boolean(update.verified),
         }];
       }),
     } : undefined;
@@ -190,6 +202,15 @@ export function normalizeWorkspaceData(
       style: numberValue(rawQuality.style, 0, 0, 100),
       evaluatedAt: dateValue(rawQuality.evaluatedAt),
       notes: stringList(rawQuality.notes, 20),
+      outlineEvidence: objects(rawQuality.outlineEvidence, 100).map((entry, index) => ({
+        key: enumValue(entry.key, ["objective", "opening", "scene", "turningPoint", "endingHook"] as const, "scene"),
+        label: stringValue(entry.label, `outline-${index + 1}`, 1000),
+        status: enumValue(entry.status, ["executed", "partial", "missing"] as const, "missing"),
+        score: numberValue(entry.score, 0, 0, 100),
+        evidence: typeof entry.evidence === "string" ? entry.evidence.slice(0, 4000) : undefined,
+        quote: typeof entry.quote === "string" ? entry.quote.slice(0, 1000) : undefined,
+        verified: Boolean(entry.verified),
+      })),
     } : undefined;
     const rawRepairReview = record(item.repairReview);
     const repairReview = typeof rawRepairReview.beforeVersionId === "string" ? {
@@ -357,7 +378,7 @@ export function normalizeWorkspaceData(
     stageModels: Object.fromEntries(Object.entries(record(rawAutomation.stageModels)).flatMap(([stage, value]) => {
       if (!["ideation", "blueprint", "chapter", "memory", "audit", "repair"].includes(stage)) return [];
       const config = record(value);
-      return [[stage, { model: typeof config.model === "string" ? config.model.slice(0, 300) : undefined, maxOutputTokens: typeof config.maxOutputTokens === "number" ? numberValue(config.maxOutputTokens, 16_384, 256, 131_072) : undefined }]];
+      return [[stage, { model: typeof config.model === "string" ? config.model.slice(0, 300) : undefined, maxOutputTokens: typeof config.maxOutputTokens === "number" ? numberValue(config.maxOutputTokens, 16_384, 256, MAX_STAGE_OUTPUT_TOKENS) : undefined }]];
     })),
     taskLog: objects(rawAutomation.taskLog, 500).map((item, index) => ({
       id: stringValue(item.id, "task-" + (index + 1), 200),
@@ -394,6 +415,12 @@ export function normalizeWorkspaceData(
       name: stringValue(item.name, "未知人物", 200),
       state: stringValue(item.state, "", 4000),
       chapterNumber: numberValue(item.chapterNumber, 1, 1, 9999),
+      location: typeof item.location === "string" ? item.location.slice(0, 500) : undefined,
+      physical: typeof item.physical === "string" ? item.physical.slice(0, 1000) : undefined,
+      emotion: typeof item.emotion === "string" ? item.emotion.slice(0, 1000) : undefined,
+      knowledge: stringList(item.knowledge, 100),
+      inventory: stringList(item.inventory, 100),
+      goal: typeof item.goal === "string" ? item.goal.slice(0, 2000) : undefined,
     })),
     threads: objects(rawCanon.threads, 2000).map((item, index) => ({
       id: stringValue(item.id, `thread-${index + 1}`, 200),
@@ -479,4 +506,64 @@ export function createBlankWorkspace(fallback: WorkspaceData): WorkspaceData {
       maxTokens: fallback.automation.maxTokens,
     }),
   };
+}
+
+const MAX_VERSIONS_PER_CHAPTER = 12;
+const MAX_RESOLVED_ISSUES = 400;
+const MAX_TASK_LOGS = 200;
+
+export function pruneWorkspaceHistory(workspace: WorkspaceData): WorkspaceData {
+  const versionCounts = new Map<string, number>();
+  const versions = [...workspace.versions]
+    .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+    .filter((version) => {
+      const count = versionCounts.get(version.chapterId) || 0;
+      if (count >= MAX_VERSIONS_PER_CHAPTER) return false;
+      versionCounts.set(version.chapterId, count + 1);
+      return true;
+    });
+  const unresolved = workspace.issues.filter((issue) => !issue.resolved);
+  const resolved = workspace.issues.filter((issue) => issue.resolved).slice(-MAX_RESOLVED_ISSUES);
+  return {
+    ...workspace,
+    versions,
+    issues: [...resolved, ...unresolved],
+    automation: {
+      ...workspace.automation,
+      taskLog: (workspace.automation.taskLog || []).slice(0, MAX_TASK_LOGS),
+    },
+  };
+}
+
+export function mergeAutomationWorkspace(local: WorkspaceData, remote: WorkspaceData): WorkspaceData {
+  const localById = new Map(local.chapters.map((chapter) => [chapter.id, chapter]));
+  let preservedManualChapter = false;
+  const chapters = remote.chapters.map((remoteChapter) => {
+    const localChapter = localById.get(remoteChapter.id);
+    if (!localChapter) return remoteChapter;
+    const localRevision = localChapter.revision || 0;
+    const remoteRevision = remoteChapter.revision || 0;
+    if (localRevision > remoteRevision) {
+      preservedManualChapter = true;
+      return localChapter;
+    }
+    if (localRevision < remoteRevision) return remoteChapter;
+    return localChapter.updatedAt > remoteChapter.updatedAt ? localChapter : remoteChapter;
+  });
+  for (const localChapter of local.chapters) {
+    if (!remote.chapters.some((chapter) => chapter.id === localChapter.id)) chapters.push(localChapter);
+  }
+  const issueMap = new Map(local.issues.map((issue) => [issue.id, issue]));
+  for (const issue of remote.issues) issueMap.set(issue.id, issue);
+  const versionMap = new Map(local.versions.map((version) => [version.id, version]));
+  for (const version of remote.versions) versionMap.set(version.id, version);
+  return pruneWorkspaceHistory({
+    ...local,
+    project: { ...local.project, status: remote.project.status },
+    chapters: chapters.sort((left, right) => left.number - right.number),
+    issues: [...issueMap.values()],
+    versions: [...versionMap.values()],
+    canon: preservedManualChapter ? local.canon : remote.canon,
+    automation: remote.automation,
+  });
 }

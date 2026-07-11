@@ -87,6 +87,16 @@ export interface ChapterOutline {
   }>;
 }
 
+export interface OutlineExecutionEvidence {
+  key: "objective" | "opening" | "scene" | "turningPoint" | "endingHook";
+  label: string;
+  status: "executed" | "partial" | "missing";
+  score: number;
+  evidence?: string;
+  quote?: string;
+  verified: boolean;
+}
+
 export interface ChapterQualityReport {
   overall: number;
   length: number;
@@ -96,6 +106,7 @@ export interface ChapterQualityReport {
   style: number;
   evaluatedAt: string;
   notes: string[];
+  outlineEvidence?: OutlineExecutionEvidence[];
 }
 
 export interface ChapterRepairReview {
@@ -134,14 +145,26 @@ export interface Chapter {
 export interface ChapterMemory {
   summary: string;
   timelineEvents: string[];
-  characterUpdates: Array<{ name: string; state: string }>;
+  characterUpdates: Array<{
+    name: string;
+    state: string;
+    location?: string;
+    physical?: string;
+    emotion?: string;
+    knowledge?: string[];
+    inventory?: string[];
+    goal?: string;
+  }>;
   openedThreads: string[];
   resolvedThreads: string[];
   establishedFacts: string[];
+  outlineEvidence?: OutlineExecutionEvidence[];
   foreshadowUpdates?: Array<{
     title: string;
     status: "planted" | "advanced" | "resolved";
     evidence: string;
+    quote?: string;
+    verified?: boolean;
   }>;
 }
 
@@ -149,7 +172,18 @@ export interface CanonLedger {
   revision: number;
   chapterSummaries: Array<{ chapterId: string; chapterNumber: number; summary: string }>;
   timeline: Array<{ id: string; chapterNumber: number; event: string }>;
-  characterStates: Array<{ characterId?: string; name: string; state: string; chapterNumber: number }>;
+  characterStates: Array<{
+    characterId?: string;
+    name: string;
+    state: string;
+    chapterNumber: number;
+    location?: string;
+    physical?: string;
+    emotion?: string;
+    knowledge?: string[];
+    inventory?: string[];
+    goal?: string;
+  }>;
   threads: Array<{ id: string; title: string; status: "open" | "resolved"; openedChapter: number; resolvedChapter?: number }>;
   facts: Array<{ id: string; chapterNumber: number; fact: string }>;
   lastAuditedChapter: number;
@@ -249,6 +283,41 @@ export interface AutomationTaskLog {
   startedAt: string;
   finishedAt?: string;
   error?: string;
+}
+
+export interface GenerationRecoveryStep {
+  id: string;
+  runId: string;
+  stepKey: string;
+  kind: string;
+  chapterNumber?: number;
+  segmentNumber?: number;
+  status: "completed" | "failed";
+  attempts: number;
+  contextHash?: string;
+  outputExcerpt?: string;
+  error?: string;
+  usage?: NovelAutomation["usage"];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AutomationRecoveryRun {
+  id: string;
+  status: string;
+  phase: AutomationPhase;
+  currentChapterNumber: number;
+  currentSegment: number;
+  usage: NovelAutomation["usage"];
+  lastError?: string;
+  createdAt: string;
+  updatedAt: string;
+  steps: GenerationRecoveryStep[];
+}
+
+export interface AutomationRecoveryData {
+  projectId: string;
+  runs: AutomationRecoveryRun[];
 }
 
 export interface NovelAutomation {

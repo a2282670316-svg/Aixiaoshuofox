@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { resolveAIEndpoint, type AIEndpointMode } from "@/lib/ai-endpoint";
+import { DEFAULT_STAGE_OUTPUT_TOKENS, MAX_STAGE_OUTPUT_TOKENS, MIN_STAGE_OUTPUT_TOKENS } from "@/lib/ai-limits";
 
 type AIRequestBody = {
   baseUrl?: string;
@@ -121,8 +122,8 @@ export async function POST(request: Request) {
   if (body.apiMode !== undefined && !["auto", "chat", "responses"].includes(body.apiMode)) {
     return NextResponse.json({ error: "接口模式无效" }, { status: 400 });
   }
-  const maxOutputTokens = body.maxOutputTokens === undefined ? 16_384 : body.maxOutputTokens;
-  if (!Number.isInteger(maxOutputTokens) || maxOutputTokens < 256 || maxOutputTokens > 65_536) {
+  const maxOutputTokens = body.maxOutputTokens === undefined ? DEFAULT_STAGE_OUTPUT_TOKENS : body.maxOutputTokens;
+  if (!Number.isInteger(maxOutputTokens) || maxOutputTokens < MIN_STAGE_OUTPUT_TOKENS || maxOutputTokens > MAX_STAGE_OUTPUT_TOKENS) {
     return NextResponse.json({ error: "最大输出 Token 必须是 256 到 65536 之间的整数" }, { status: 400 });
   }
 

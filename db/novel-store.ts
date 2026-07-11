@@ -1,5 +1,6 @@
 import { getD1 } from "./index";
-import type { WorkspaceData } from "@/lib/types";
+import type { AutomationRecoveryData, AutomationRecoveryRun, GenerationRecoveryStep, WorkspaceData } from "@/lib/types";
+import { mergeAutomationWorkspace, pruneWorkspaceHistory } from "@/lib/workspace";
 
 export type ProjectSummary = {
   id: string;
@@ -217,24 +218,36 @@ export async function saveAutomationCheckpoint(
   projectId: string,
   workspace: WorkspaceData,
   step?: GenerationStepInput,
+  expectedRevision?: number,
 ) {
   await ensureNovelSchema();
   const db = getD1();
-  const run = workspace.automation;
+  const ownership = await db.prepare("SELECT owner_id FROM projects WHERE id = ?").bind(projectId).first();
+  if (ownership && String(ownership.owner_id) !== ownerId) throw new Error("Project ownership mismatch");
+
+  let candidate = pruneWorkspaceHistory(workspace);
+  let savedProject: Awaited<ReturnType<typeof saveProject>> | null = null;
+  for (let attempt = 0; attempt < 2 && !savedProject; attempt += 1) {
+    const existing = await getProject(ownerId, projectId);
+    if (expectedRevision !== undefined && existing?.revision !== expectedRevision) throw new Error("PROJECT_CONFLICT");
+    const nextWorkspace = existing && expectedRevision === undefined
+      ? mergeAutomationWorkspace(existing.workspace, candidate)
+      : candidate;
+    try {
+      savedProject = await saveProject(ownerId, projectId, nextWorkspace, existing?.revision);
+      candidate = savedProject.workspace;
+    } catch (error) {
+      if (!(error instanceof Error) || error.message !== "PROJECT_CONFLICT" || expectedRevision !== undefined || attempt > 0) throw error;
+    }
+  }
+  if (!savedProject) throw new Error("PROJECT_CONFLICT");
+
+  const run = candidate.automation;
   if (!run.runId) throw new Error("Automation run id is missing");
-  const existingProject = await db.prepare("SELECT owner_id FROM projects WHERE id = ?").bind(projectId).first();
-  if (existingProject && String(existingProject.owner_id) !== ownerId) throw new Error("Project ownership mismatch");
   const existingRun = await db.prepare("SELECT owner_id FROM automation_runs WHERE id = ?").bind(run.runId).first();
   if (existingRun && String(existingRun.owner_id) !== ownerId) throw new Error("Run ownership mismatch");
   const now = new Date().toISOString();
   const statements = [
-    db.prepare(`INSERT INTO projects
-      (id, owner_id, title, genre, status, workspace_json, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET title = excluded.title, genre = excluded.genre,
-        status = excluded.status, workspace_json = excluded.workspace_json, updated_at = excluded.updated_at
-      WHERE projects.owner_id = excluded.owner_id`)
-      .bind(projectId, ownerId, workspace.project.title, workspace.project.genre, workspace.project.status, JSON.stringify(workspace), now, now),
     db.prepare(`INSERT INTO automation_runs
       (id, project_id, owner_id, status, phase, current_chapter, current_segment,
        request_count, input_tokens, output_tokens, total_tokens, last_error, created_at, updated_at)
@@ -252,7 +265,7 @@ export async function saveAutomationCheckpoint(
       VALUES (?, ?, ?, ?, ?)
       ON CONFLICT(project_id) DO UPDATE SET revision = excluded.revision, state_json = excluded.state_json,
         last_audited_chapter = excluded.last_audited_chapter, updated_at = excluded.updated_at`)
-      .bind(projectId, workspace.canon.revision, JSON.stringify(workspace.canon), workspace.canon.lastAuditedChapter, now),
+      .bind(projectId, candidate.canon.revision, JSON.stringify(candidate.canon), candidate.canon.lastAuditedChapter, now),
   ];
   if (step) {
     statements.push(db.prepare(`INSERT INTO generation_steps
@@ -269,6 +282,64 @@ export async function saveAutomationCheckpoint(
         step.error?.slice(0, 4000) ?? null, JSON.stringify(run.usage), now, now));
   }
   await db.batch(statements);
-  const projectRevision = await db.prepare("SELECT revision FROM projects WHERE id = ? AND owner_id = ?").bind(projectId, ownerId).first<{ revision: number }>();
-  return { projectId, runId: run.runId, revision: Number(projectRevision?.revision) || 1, updatedAt: now };
+  return { projectId, runId: run.runId, revision: savedProject.revision, updatedAt: now };
+}
+
+
+export async function listAutomationRecovery(ownerId: string, projectId: string): Promise<AutomationRecoveryData | null> {
+  await ensureNovelSchema();
+  const project = await getProject(ownerId, projectId);
+  if (!project) return null;
+  const db = getD1();
+  const runResult = await db.prepare(`SELECT * FROM automation_runs
+    WHERE project_id = ? AND owner_id = ? ORDER BY updated_at DESC LIMIT 10`).bind(projectId, ownerId).all();
+  const rows = runResult.results || [];
+  const runs: AutomationRecoveryRun[] = [];
+  for (const row of rows) {
+    const runId = String(row.id);
+    const stepResult = await db.prepare(`SELECT * FROM generation_steps
+      WHERE project_id = ? AND run_id = ? ORDER BY updated_at DESC LIMIT 100`).bind(projectId, runId).all();
+    const steps: GenerationRecoveryStep[] = (stepResult.results || []).map((step) => {
+      let usage: GenerationRecoveryStep["usage"];
+      try {
+        usage = step.usage_json ? JSON.parse(String(step.usage_json)) as GenerationRecoveryStep["usage"] : undefined;
+      } catch {
+        usage = undefined;
+      }
+      return {
+        id: String(step.id),
+        runId,
+        stepKey: String(step.step_key),
+        kind: String(step.kind),
+        chapterNumber: step.chapter_number === null || step.chapter_number === undefined ? undefined : Number(step.chapter_number),
+        segmentNumber: step.segment_number === null || step.segment_number === undefined ? undefined : Number(step.segment_number),
+        status: String(step.status) === "failed" ? "failed" : "completed",
+        attempts: Number(step.attempts) || 1,
+        contextHash: step.context_hash ? String(step.context_hash) : undefined,
+        outputExcerpt: step.output_excerpt ? String(step.output_excerpt) : undefined,
+        error: step.error ? String(step.error) : undefined,
+        usage,
+        createdAt: String(step.created_at),
+        updatedAt: String(step.updated_at),
+      };
+    });
+    runs.push({
+      id: runId,
+      status: String(row.status),
+      phase: String(row.phase) as AutomationRecoveryRun["phase"],
+      currentChapterNumber: Number(row.current_chapter) || 0,
+      currentSegment: Number(row.current_segment) || 0,
+      usage: {
+        requestCount: Number(row.request_count) || 0,
+        inputTokens: Number(row.input_tokens) || 0,
+        outputTokens: Number(row.output_tokens) || 0,
+        totalTokens: Number(row.total_tokens) || 0,
+      },
+      lastError: row.last_error ? String(row.last_error) : undefined,
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at),
+      steps,
+    });
+  }
+  return { projectId, runs };
 }

@@ -1,3 +1,4 @@
+import { clampStageOutputTokens } from "./ai-limits";
 import OpenAI from "openai";
 import { env } from "cloudflare:workers";
 import { getD1 } from "@/db";
@@ -7,6 +8,7 @@ import {
   buildAutomatedChapterPrompt,
   buildChapterMemoryPrompt,
   buildChapterQualityIssues,
+  buildCharacterContinuityIssues,
   buildConsistencyRepairPrompt,
   buildRollingAuditPrompt,
   estimateWritingRange,
@@ -267,7 +269,7 @@ async function submitStep(ownerId: string, projectId: string, workspace: Workspa
       instructions: "你是严谨、尊重作者意图的中文长篇小说创作助手。严格遵循用户要求的输出格式。",
       background: true,
       store: true,
-      max_output_tokens: workspace.automation.stageModels?.[stage]?.maxOutputTokens || 16_000,
+      max_output_tokens: clampStageOutputTokens(workspace.automation.stageModels?.[stage]?.maxOutputTokens, 16_000),
       metadata: { novel_job_id: jobId, novel_run_id: runId.slice(0, 64) },
     });
     await getD1().prepare("UPDATE background_responses SET response_id = ?, updated_at = ? WHERE id = ?")
@@ -392,7 +394,7 @@ function applyCompletedStep(workspace: WorkspaceData, job: BackgroundJobRow, out
   }
 
   const aiIssues = parseRollingAudit(output, runId, chapter.number);
-  const auditIssues = [...buildChapterQualityIssues(workspace, chapter.number, runId), ...aiIssues];
+  const auditIssues = [...buildChapterQualityIssues(workspace, chapter.number, runId), ...buildCharacterContinuityIssues(workspace, chapter.number), ...aiIssues];
   let updated = replaceChapterAuditIssues(workspace, chapter.number, auditIssues);
   let quality = evaluateChapterQuality(updated, chapter.number);
   if (quality.overall < 70) {

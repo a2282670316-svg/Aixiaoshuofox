@@ -1,8 +1,23 @@
 import { NextResponse } from "next/server";
-import { saveAutomationCheckpoint, type GenerationStepInput } from "@/db/novel-store";
+import { listAutomationRecovery, saveAutomationCheckpoint, type GenerationStepInput } from "@/db/novel-store";
 import { DEMO_WORKSPACE } from "@/lib/demo-data";
 import { normalizeWorkspaceData } from "@/lib/workspace";
 import { isRecord, readJsonBody, rejectCrossOrigin, requestOwner } from "../../_lib/request";
+
+
+export async function GET(request: Request) {
+  const ownerId = requestOwner(request);
+  if (!ownerId) return NextResponse.json({ error: "\u8bf7\u5148\u767b\u5f55\u540e\u67e5\u770b\u6062\u590d\u8bb0\u5f55" }, { status: 401 });
+  const projectId = new URL(request.url).searchParams.get("projectId")?.trim().slice(0, 200);
+  if (!projectId) return NextResponse.json({ error: "\u7f3a\u5c11\u4e91\u7aef\u9879\u76ee ID" }, { status: 400 });
+  try {
+    const recovery = await listAutomationRecovery(ownerId, projectId);
+    if (!recovery) return NextResponse.json({ error: "\u672a\u627e\u5230\u4e91\u7aef\u4f5c\u54c1" }, { status: 404 });
+    return NextResponse.json({ recovery });
+  } catch {
+    return NextResponse.json({ error: "\u8bfb\u53d6\u4efb\u52a1\u6062\u590d\u8bb0\u5f55\u5931\u8d25" }, { status: 503 });
+  }
+}
 
 export async function POST(request: Request) {
   const crossOrigin = rejectCrossOrigin(request);
@@ -21,6 +36,12 @@ export async function POST(request: Request) {
     const projectId = typeof raw.projectId === "string" && raw.projectId.trim()
       ? raw.projectId.slice(0, 200)
       : crypto.randomUUID();
+    const expectedRevision = raw.expectedRevision === null || raw.expectedRevision === undefined
+      ? undefined
+      : Number(raw.expectedRevision);
+    if (expectedRevision !== undefined && (!Number.isInteger(expectedRevision) || expectedRevision < 1)) {
+      return NextResponse.json({ error: "\u9879\u76ee\u7248\u672c\u53f7\u65e0\u6548" }, { status: 400 });
+    }
     const rawStep = isRecord(raw.step) ? raw.step : null;
     const step: GenerationStepInput | undefined = rawStep && typeof rawStep.stepKey === "string" && typeof rawStep.kind === "string"
       ? {
@@ -35,8 +56,11 @@ export async function POST(request: Request) {
           error: typeof rawStep.error === "string" ? rawStep.error : undefined,
         }
       : undefined;
-    return NextResponse.json(await saveAutomationCheckpoint(ownerId, projectId, workspace, step));
+    return NextResponse.json(await saveAutomationCheckpoint(ownerId, projectId, workspace, step, expectedRevision));
   } catch (error) {
+    if (error instanceof Error && error.message === "PROJECT_CONFLICT") {
+      return NextResponse.json({ error: "\u4e91\u7aef\u4f5c\u54c1\u5df2\u66f4\u65b0\uff0c\u8bf7\u540c\u6b65\u540e\u91cd\u8bd5", conflict: true }, { status: 409 });
+    }
     if (error instanceof Error && error.message === "REQUEST_TOO_LARGE") {
       return NextResponse.json({ error: "任务检查点过大" }, { status: 413 });
     }
