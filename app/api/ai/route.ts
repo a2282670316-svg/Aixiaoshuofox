@@ -13,6 +13,7 @@ type AIRequestBody = {
 
 const MAX_REQUEST_BYTES = 1_000_000;
 const MAX_RESPONSE_BYTES = 12_000_000;
+const UPSTREAM_TIMEOUT_MS = 600_000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -160,7 +161,7 @@ export async function POST(request: Request) {
         }),
       }),
       redirect: "manual",
-      signal: AbortSignal.timeout(180_000),
+      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
     });
     let selectedMode = endpoint.mode;
     let upstream = await callUpstream(endpoint.url, selectedMode);
@@ -219,11 +220,12 @@ export async function POST(request: Request) {
       usage: isRecord(payload.usage) ? payload.usage : undefined,
     });
   } catch (error) {
-    const message = error instanceof Error && error.name === "TimeoutError"
-      ? "模型响应超时，请稍后重试"
+    const timedOut = error instanceof Error && ["TimeoutError", "AbortError"].includes(error.name);
+    const message = timedOut
+      ? "模型在 10 分钟内没有完成响应。请求已安全停止；建议降低单章字数或最大输出 Token 后重试。"
       : error instanceof Error && error.message === "模型响应过大"
         ? error.message
         : "无法连接模型接口";
-    return NextResponse.json({ error: message }, { status: 502 });
+    return NextResponse.json({ error: message }, { status: timedOut ? 504 : 502 });
   }
 }

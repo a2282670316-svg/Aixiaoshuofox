@@ -789,8 +789,17 @@ export default function Home() {
     }
   };
 
+  const resolveIssueChapterNumber = (issue: ConsistencyIssue) => {
+    if (issue.chapterNumber && workspace.chapters.some((item) => item.number === issue.chapterNumber)) return issue.chapterNumber;
+    const text = [issue.location, issue.title, issue.description].filter(Boolean).join(" ");
+    const numbers = [...text.matchAll(/第\s*(\d+)\s*章/g)].map((match) => Number(match[1]));
+    const uniqueNumbers = [...new Set(numbers)].filter((number) => workspace.chapters.some((item) => item.number === number));
+    return uniqueNumbers.length === 1 ? uniqueNumbers[0] : undefined;
+  };
+
   const repairConsistencyIssue = async (issue: ConsistencyIssue) => {
-    const chapter = issue.chapterNumber ? workspace.chapters.find((item) => item.number === issue.chapterNumber) : undefined;
+    const chapterNumber = resolveIssueChapterNumber(issue);
+    const chapter = chapterNumber ? workspace.chapters.find((item) => item.number === chapterNumber) : undefined;
     if (!chapter?.content.trim()) return notify("该问题没有可定位的章节正文，无法自动修复");
     if (!config.baseUrl.trim() || !config.model.trim()) {
       setSettingsTab("AI");
@@ -809,7 +818,8 @@ export default function Home() {
       setAuditProgress(`正在修订第 ${chapter.number} 章正文`);
       working = reserveAIRequestUsage(working);
       setWorkspace(working);
-      const repairPayload = await callAIText(buildConsistencyRepairPrompt(working, issue, chapter), 32_768);
+      const repairOutputTokens = Math.min(32_768, Math.max(16_384, Math.ceil(chapter.content.replace(/\s+/g, "").length * 2 + 2_048)));
+      const repairPayload = await callAIText(buildConsistencyRepairPrompt(working, issue, chapter), repairOutputTokens);
       const repair = parseConsistencyRepair(repairPayload.text!);
       working = removeChapterFromCanon(working, chapter.number);
       working = applyAITokenUsage({
@@ -1170,7 +1180,7 @@ export default function Home() {
             <div><h3>待回收线索</h3>{openThreads.length ? openThreads.slice(0, 4).map((item) => <p key={item.id}><b>{item.title}</b><span>尚未解决</span><small>始于第 {item.openedChapter} 章</small></p>) : <em>当前没有未收束线索。</em>}</div>
           </div>
         </section>
-        <section className="audit-list card"><div className="card-heading"><div><span>审校结果</span><h2>待确认内容</h2></div><small>{openIssues.length} 项</small></div>{openIssues.length ? openIssues.map((item) => <article className="issue-row" key={item.id}><span className={`issue-icon severity-${item.severity}`}><CircleAlert size={17} /></span><div className="issue-content"><div><i className={`severity-label severity-${item.severity}`}>{item.severity}</i><i>{item.category}</i><small>{item.location}</small>{item.source && <i>{item.source === "ai" ? "AI 逐章检查" : "规则扫描"}</i>}</div><h3>{item.title}</h3><p>{item.description}</p>{item.evidence && <p className="issue-evidence"><b>正文证据：</b>{item.evidence}</p>}{item.suggestedFix && <p className="issue-suggestion"><b>修复建议：</b>{item.suggestedFix}</p>}</div><div className="issue-actions">{item.chapterNumber && workspace.chapters.some((entry) => entry.number === item.chapterNumber && entry.content.trim()) && <button className="primary-button compact" disabled={aiBusy} onClick={() => repairConsistencyIssue(item)}>{repairingIssueId === item.id ? <RefreshCw className="spin" size={15} /> : <WandSparkles size={15} />}{repairingIssueId === item.id ? "正在修复" : "AI 一键修复"}</button>}<button className="secondary-button compact" disabled={aiBusy} onClick={() => setWorkspace((current) => ({ ...current, issues: current.issues.map((issue) => issue.id === item.id ? { ...issue, resolved: true } : issue) }))}><Check size={15} />标记已处理</button></div></article>) : <Empty icon={<ShieldCheck />} title="当前没有待处理问题" text="运行逐章 AI 检查后，会按章节给出正文证据和一键修复入口。" />}</section>
+        <section className="audit-list card"><div className="card-heading"><div><span>审校结果</span><h2>待确认内容</h2></div><small>{openIssues.length} 项</small></div>{openIssues.length ? openIssues.map((item) => <article className="issue-row" key={item.id}><span className={`issue-icon severity-${item.severity}`}><CircleAlert size={17} /></span><div className="issue-content"><div><i className={`severity-label severity-${item.severity}`}>{item.severity}</i><i>{item.category}</i><small>{item.location}</small>{item.source && <i>{item.source === "ai" ? "AI 逐章检查" : "规则扫描"}</i>}</div><h3>{item.title}</h3><p>{item.description}</p>{item.evidence && <p className="issue-evidence"><b>正文证据：</b>{item.evidence}</p>}{item.suggestedFix && <p className="issue-suggestion"><b>修复建议：</b>{item.suggestedFix}</p>}</div><div className="issue-actions"><button className="primary-button compact" disabled={aiBusy || !resolveIssueChapterNumber(item) || !workspace.chapters.some((entry) => entry.number === resolveIssueChapterNumber(item) && entry.content.trim())} title={!resolveIssueChapterNumber(item) ? "该问题涉及全书或多个章节，需要先定位到单章" : "自动保存旧稿、修订正文、重建记忆并再次检查"} onClick={() => repairConsistencyIssue(item)}>{repairingIssueId === item.id ? <RefreshCw className="spin" size={15} /> : <WandSparkles size={15} />}{repairingIssueId === item.id ? "正在修复" : resolveIssueChapterNumber(item) ? "AI 一键修复" : "需先定位章节"}</button><button className="secondary-button compact" disabled={aiBusy} onClick={() => setWorkspace((current) => ({ ...current, issues: current.issues.map((issue) => issue.id === item.id ? { ...issue, resolved: true } : issue) }))}><Check size={15} />标记已处理</button></div></article>) : <Empty icon={<ShieldCheck />} title="当前没有待处理问题" text="运行逐章 AI 检查后，会按章节给出正文证据和一键修复入口。" />}</section>
       </div>
     );
   };
