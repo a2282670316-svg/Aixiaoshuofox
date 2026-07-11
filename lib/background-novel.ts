@@ -8,6 +8,8 @@ import {
   buildAutomatedChapterPrompt,
   buildChapterMemoryPrompt,
   buildChapterQualityIssues,
+  buildChapterPlanDeviationIssues,
+  buildMemoryEvidenceIssues,
   buildCharacterContinuityIssues,
   buildConsistencyRepairPrompt,
   buildRollingAuditPrompt,
@@ -19,6 +21,7 @@ import {
   removeChapterFromCanon,
   replaceChapterAuditIssues,
   unresolvedChapterErrors,
+  validateGeneratedChapterDraft,
 } from "@/lib/auto-novel";
 import type { Chapter, ConsistencyIssue, WorkspaceData } from "@/lib/types";
 
@@ -81,12 +84,9 @@ function backgroundModel() {
   return configuredValue(env.BACKGROUND_AI_MODEL) || configuredValue(env.OPENAI_MODEL);
 }
 
-function countCharacters(value: string) {
-  return value.replace(/\s/g, "").length;
-}
-
 function chapterSegments(chapter: Chapter) {
-  return Math.max(1, Math.ceil(chapter.targetWords / 2200));
+  void chapter;
+  return 1;
 }
 
 function updateUsage(workspace: WorkspaceData, usage: { input_tokens?: number; output_tokens?: number; total_tokens?: number } | null | undefined) {
@@ -121,7 +121,7 @@ function prepareWritingWorkspace(source: WorkspaceData): WorkspaceData {
       generation: {
         runId,
         status: chapter.generation?.status || "planned",
-        completedSegments: chapter.generation?.completedSegments || 0,
+        completedSegments: chapter.content.trim() && !validateGeneratedChapterDraft(chapter, chapter.content).length ? 1 : 0,
         baseRevision: chapter.generation?.baseRevision ?? chapter.revision ?? 0,
       },
     }),
@@ -155,15 +155,11 @@ function nextBackgroundStep(workspace: WorkspaceData): BackgroundStep | null {
     const completedSegments = Math.min(total, generation?.completedSegments || 0);
     if (completedSegments < total) {
       return {
-        stepKey: `${runId}:chapter:${chapter.number}:segment:${completedSegments + 1}`,
+        stepKey: `${runId}:chapter:${chapter.number}:draft:1`,
         kind: "chapter_segment",
         chapterNumber: chapter.number,
-        segmentNumber: completedSegments + 1,
-        prompt: buildAutomatedChapterPrompt(workspace, chapter, {
-          index: completedSegments,
-          total,
-          existingDraft: chapter.content,
-        }),
+        segmentNumber: 1,
+        prompt: buildAutomatedChapterPrompt(workspace, chapter, { existingDraft: chapter.content }),
       };
     }
     if (!chapter.memory) {
@@ -313,31 +309,30 @@ function applyCompletedStep(workspace: WorkspaceData, job: BackgroundJobRow, out
   const now = new Date().toISOString();
 
   if (job.kind === "chapter_segment") {
-    const total = chapterSegments(chapter);
-    const segmentNumber = job.segment_number || 1;
-    const minimumLength = Math.max(300, Math.floor(chapter.targetWords / total * 0.45));
-    if (countCharacters(output) < minimumLength) throw new Error(`模型输出过短：${countCharacters(output)} 字，至少需要 ${minimumLength} 字`);
-    const content = `${chapter.content.trim()}${chapter.content.trim() ? "\n\n" : ""}${output.trim()}`;
+    const guardIssues = validateGeneratedChapterDraft(chapter, output);
+    if (guardIssues.length) throw new Error(`\u540e\u53f0\u6574\u7ae0\u6b63\u6587\u672a\u901a\u8fc7\u5b57\u6570\u6216\u683c\u5f0f\u68c0\u67e5\uff1a${guardIssues.join("\uff1b")}`);
+    const cleaned = removeChapterFromCanon(workspace, chapter.number);
     return {
-      ...workspace,
-      chapters: workspace.chapters.map((item) => item.id === chapter.id ? {
+      ...cleaned,
+      chapters: cleaned.chapters.map((item) => item.id === chapter.id ? {
         ...item,
-        content,
-        status: segmentNumber === total ? "修订中" as const : "草稿" as const,
+        content: output.trim(),
+        memory: undefined,
+        status: "\u4fee\u8ba2\u4e2d" as const,
         updatedAt: now,
         generation: {
           runId,
           status: "generating" as const,
-          completedSegments: segmentNumber,
+          completedSegments: 1,
           baseRevision: item.generation?.baseRevision ?? item.revision ?? 0,
           repairAttempts: item.generation?.repairAttempts || 0,
         },
       } : item),
       automation: {
-        ...workspace.automation,
+        ...cleaned.automation,
         phase: "writing" as const,
         currentChapterNumber: chapter.number,
-        currentSegment: segmentNumber,
+        currentSegment: 1,
         updatedAt: now,
       },
     };
@@ -394,7 +389,7 @@ function applyCompletedStep(workspace: WorkspaceData, job: BackgroundJobRow, out
   }
 
   const aiIssues = parseRollingAudit(output, runId, chapter.number);
-  const auditIssues = [...buildChapterQualityIssues(workspace, chapter.number, runId), ...buildCharacterContinuityIssues(workspace, chapter.number), ...aiIssues];
+  const auditIssues = [...buildChapterQualityIssues(workspace, chapter.number, runId), ...buildChapterPlanDeviationIssues(workspace, chapter.number, runId), ...buildMemoryEvidenceIssues(workspace, chapter.number, runId), ...buildCharacterContinuityIssues(workspace, chapter.number), ...aiIssues];
   let updated = replaceChapterAuditIssues(workspace, chapter.number, auditIssues);
   let quality = evaluateChapterQuality(updated, chapter.number);
   if (quality.overall < 70) {

@@ -143,6 +143,7 @@ export interface Chapter {
 }
 
 export interface ChapterMemory {
+  evidenceVersion?: 1;
   summary: string;
   timelineEvents: string[];
   characterUpdates: Array<{
@@ -154,7 +155,12 @@ export interface ChapterMemory {
     knowledge?: string[];
     inventory?: string[];
     goal?: string;
+    quote?: string;
+    verified?: boolean;
   }>;
+  timelineEvidence?: Array<{ event: string; quote?: string; verified?: boolean }>;
+  threadEvidence?: Array<{ title: string; status: "opened" | "resolved"; quote?: string; verified?: boolean }>;
+  factEvidence?: Array<{ fact: string; quote?: string; verified?: boolean }>;
   openedThreads: string[];
   resolvedThreads: string[];
   establishedFacts: string[];

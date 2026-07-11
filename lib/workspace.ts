@@ -162,15 +162,36 @@ export function normalizeWorkspaceData(
     };
     const rawMemory = record(item.memory);
     const memory: ChapterMemory | undefined = typeof rawMemory.summary === "string" ? {
+      evidenceVersion: rawMemory.evidenceVersion === 1 ? 1 : undefined,
       summary: stringValue(rawMemory.summary, "", 20_000),
       timelineEvents: stringList(rawMemory.timelineEvents, 100),
+      timelineEvidence: objects(rawMemory.timelineEvidence, 100).flatMap((entry) => {
+        const event = stringValue(entry.event, "", 4000).trim();
+        return event ? [{ event, quote: typeof entry.quote === "string" ? entry.quote.slice(0, 2000) : undefined, verified: Boolean(entry.verified) }] : [];
+      }),
       characterUpdates: objects(rawMemory.characterUpdates, 100).map((update) => ({
-        name: stringValue(update.name, "未知人物", 200),
+        name: stringValue(update.name, "\u672a\u77e5\u4eba\u7269", 200),
         state: stringValue(update.state, "", 4000),
+        location: typeof update.location === "string" ? update.location.slice(0, 1000) : undefined,
+        physical: typeof update.physical === "string" ? update.physical.slice(0, 1000) : undefined,
+        emotion: typeof update.emotion === "string" ? update.emotion.slice(0, 1000) : undefined,
+        knowledge: stringList(update.knowledge, 100),
+        inventory: stringList(update.inventory, 100),
+        goal: typeof update.goal === "string" ? update.goal.slice(0, 2000) : undefined,
+        quote: typeof update.quote === "string" ? update.quote.slice(0, 2000) : undefined,
+        verified: typeof update.verified === "boolean" ? update.verified : undefined,
       })),
       openedThreads: stringList(rawMemory.openedThreads, 100),
       resolvedThreads: stringList(rawMemory.resolvedThreads, 100),
+      threadEvidence: objects(rawMemory.threadEvidence, 100).flatMap((entry) => {
+        const title = stringValue(entry.title, "", 1000).trim();
+        return title ? [{ title, status: enumValue(entry.status, ["opened", "resolved"] as const, "opened"), quote: typeof entry.quote === "string" ? entry.quote.slice(0, 2000) : undefined, verified: Boolean(entry.verified) }] : [];
+      }),
       establishedFacts: stringList(rawMemory.establishedFacts, 200),
+      factEvidence: objects(rawMemory.factEvidence, 200).flatMap((entry) => {
+        const fact = stringValue(entry.fact, "", 4000).trim();
+        return fact ? [{ fact, quote: typeof entry.quote === "string" ? entry.quote.slice(0, 2000) : undefined, verified: Boolean(entry.verified) }] : [];
+      }),
       outlineEvidence: objects(rawMemory.outlineEvidence, 100).map((entry, index) => ({
         key: enumValue(entry.key, ["objective", "opening", "scene", "turningPoint", "endingHook"] as const, "scene"),
         label: stringValue(entry.label, `outline-${index + 1}`, 1000),

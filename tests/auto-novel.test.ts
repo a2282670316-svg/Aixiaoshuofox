@@ -2,12 +2,17 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   buildAutomatedChapterPrompt,
+  chapterDraftWordRange,
   buildCharacterContinuityIssues,
   buildRepairDependencyQueue,
   buildBlueprintChaptersPrompt,
   buildChapterQualityIssues,
+  buildChapterPlanDeviationIssues,
+  buildMemoryEvidenceIssues,
+  chapterSegmentObligations,
   applyChapterMemory,
   canonBeforeChapter,
+  canonContextBeforeChapter,
   compactCanonBeforeChapter,
   foreshadowTasksForChapter,
   createAutomationState,
@@ -28,6 +33,8 @@ import {
   restartBlueprintDraft,
   unresolvedChapterErrors,
   rewindNovelFromChapter,
+  validateGeneratedChapterDraft,
+  validateGeneratedChapterSegment,
 } from "../lib/auto-novel";
 import type { StorySeed, WorkspaceData } from "../lib/types";
 import { DEMO_WORKSPACE } from "../lib/demo-data";
@@ -444,8 +451,8 @@ test("estimates a persisted chapter writing range and its minimum request budget
   assert.deepEqual(estimate.range, { fromChapter: 2, toChapter: 3 });
   assert.equal(estimate.chapters.length, 2);
   assert.equal(estimate.pendingChapters.length, 2);
-  assert.equal(estimate.remainingSegments, 4);
-  assert.equal(estimate.minimumRequests, 8);
+  assert.equal(estimate.remainingSegments, 2);
+  assert.equal(estimate.minimumRequests, 6);
   assert.equal(estimate.remainingRequestBudget, 25);
   assert.deepEqual(estimate.errors, []);
 });
@@ -455,7 +462,7 @@ test("blocks a writing range that skips empty predecessors or exceeds request bu
     targetChapters: 4,
     targetWords: 16000,
     chapterWords: 4000,
-    maxRequests: 6,
+    maxRequests: 5,
     writingRange: { fromChapter: 3, toChapter: 4 },
   });
   const parsed = parseNovelBlueprint(blueprintJson(), seed, settings);
@@ -465,7 +472,7 @@ test("blocks a writing range that skips empty predecessors or exceeds request bu
   assert.deepEqual(estimate.missingPredecessorNumbers, [1, 2]);
   assert.equal(estimate.errors.length, 2);
   assert.match(estimate.errors[0], /不能跳过前文/);
-  assert.match(estimate.errors[1], /仅剩 6 次预算/);
+  assert.match(estimate.errors[1], /仅剩 5 次预算/);
 });
 
 test("normalizes an imported writing range to existing chapter bounds", () => {
@@ -584,6 +591,10 @@ test("blocks chapter acceptance when the final draft is materially too short", (
   assert.equal(issues[0].severity, "错误");
   const audited = replaceChapterAuditIssues(workspace, 1, issues);
   assert.equal(unresolvedChapterErrors(audited, 1).length, 1);
+  const longChapter = { ...chapter, content: "长".repeat(2201) };
+  const longIssues = buildChapterQualityIssues({ ...workspace, chapters: [longChapter] }, 1, "quality-long");
+  assert.equal(longIssues.length, 1);
+  assert.match(longIssues[0].title, /过多/);
 });
 
 test("re-audit resolves stale chapter issues before adding the new result", () => {
@@ -726,4 +737,132 @@ test("recovers chapter writing from a persisted generation step", () => {
   assert.equal(recovered.automation.currentChapterNumber, 1);
   assert.equal(recovered.automation.currentSegment, 2);
   assert.equal(recovered.automation.generatedChapterIds.includes(workspace.chapters[0].id), false);
+});
+
+
+test("assigns chapter outline obligations to the correct writing segment", () => {
+  const target = structuredClone(DEMO_WORKSPACE.chapters[0]);
+  target.chapterOutline = {
+    objective: "find the key", opening: "enter the harbor", scenes: ["question guard", "search warehouse", "escape"],
+    turningPoint: "the key opens the wrong door", endingHook: "a voice answers", foreshadowActions: [],
+  };
+  const first = chapterSegmentObligations(target, 0, 3);
+  const last = chapterSegmentObligations(target, 2, 3);
+  assert.equal(first.opening, "enter the harbor");
+  assert.equal(first.turningPoint, undefined);
+  assert.ok(first.forbiddenUntilLater.includes("the key opens the wrong door"));
+  assert.equal(last.turningPoint, "the key opens the wrong door");
+  assert.equal(last.endingHook, "a voice answers");
+});
+
+test("does not expose the next chapter summary to the current prose prompt", () => {
+  const workspace = structuredClone(DEMO_WORKSPACE);
+  workspace.chapters[1].summary = "UNIQUE_FUTURE_REVEAL_92831";
+  const prompt = buildAutomatedChapterPrompt(workspace, workspace.chapters[0], { index: 0, total: 2, existingDraft: "" });
+  assert.equal(prompt.includes("UNIQUE_FUTURE_REVEAL_92831"), false);
+  assert.match(prompt, /wholeChapterObligations/);
+  assert.match(prompt, /whole_chapter_single_pass/);
+  assert.doesNotMatch(prompt, /\u5206\u6bb5\u4efb\u52a1/);
+});
+
+test("rejects unsupported memory claims before they enter the canon ledger", () => {
+  const workspace = structuredClone(DEMO_WORKSPACE);
+  const chapter = workspace.chapters[0];
+  chapter.content = "The brass key entered the pocket. She stayed at the harbor.";
+  const memory = parseChapterMemory(JSON.stringify({
+    evidenceVersion: 1, summary: "The key changes hands.",
+    timelineEvents: [{ event: "The key enters the pocket", quote: "The brass key entered the pocket" }],
+    characterUpdates: [
+      { name: workspace.characters[0].name, state: "holds the brass key", inventory: ["brass key"], quote: "The brass key entered the pocket" },
+      { name: "Unknown Person", state: "knows every secret", quote: "The brass key entered the pocket" },
+    ],
+    openedThreads: [], resolvedThreads: [],
+    establishedFacts: [
+      { fact: "The protagonist holds the brass key", quote: "The brass key entered the pocket" },
+      { fact: "The mayor supplied the key", quote: "The mayor handed over the key" },
+    ],
+    outlineEvidence: [], foreshadowUpdates: [],
+  }));
+  const updated = applyChapterMemory(workspace, chapter.id, memory);
+  assert.deepEqual(updated.canon.facts.map((item) => item.fact), ["The protagonist holds the brass key"]);
+  assert.equal(updated.canon.characterStates.some((item) => item.name === "Unknown Person"), false);
+  assert.equal(updated.chapters[0].memory?.factEvidence?.filter((item) => item.verified).length, 1);
+  assert.equal(buildMemoryEvidenceIssues(updated, chapter.number, "run").length, 1);
+});
+
+test("turns missing verified outline evidence into blocking errors", () => {
+  const workspace = structuredClone(DEMO_WORKSPACE);
+  const chapter = workspace.chapters[0];
+  chapter.chapterOutline = { objective: "find key", opening: "enter warehouse", scenes: ["search shelves"], turningPoint: "someone waits behind door", endingHook: "lights go out", foreshadowActions: [] };
+  chapter.memory = {
+    evidenceVersion: 1, summary: "Only objective completed", timelineEvents: [], characterUpdates: [], openedThreads: [], resolvedThreads: [], establishedFacts: [],
+    outlineEvidence: [{ key: "objective", label: "find key", status: "executed", score: 90, quote: "find key", verified: true }],
+  };
+  workspace.chapters = [chapter];
+  const issues = buildChapterPlanDeviationIssues(workspace, chapter.number, "run");
+  assert.ok(issues.length >= 4);
+  assert.ok(issues.every((issue) => issue.severity === String.fromCodePoint(0x9519, 0x8bef)));
+  assert.ok(issues.some((issue) => issue.id.endsWith("turningPoint")));
+  assert.ok(issues.some((issue) => issue.id.endsWith("scenes")));
+});
+
+test("preserves structured character memory and evidence across persistence normalization", () => {
+  const workspace = structuredClone(DEMO_WORKSPACE);
+  workspace.chapters[0].memory = {
+    evidenceVersion: 1, summary: "state update", timelineEvents: ["arrives at harbor"],
+    timelineEvidence: [{ event: "arrives at harbor", quote: "walks into harbor", verified: true }],
+    characterUpdates: [{ name: workspace.characters[0].name, state: "investigating", location: "harbor", physical: "injured", emotion: "alert", knowledge: ["tide time"], inventory: ["brass key"], goal: "find ship", quote: "walks into harbor", verified: true }],
+    openedThreads: ["missing ship"], resolvedThreads: [], establishedFacts: ["key is held"],
+    threadEvidence: [{ title: "missing ship", status: "opened", quote: "ship is gone", verified: true }],
+    factEvidence: [{ fact: "key is held", quote: "holds the key", verified: true }],
+  };
+  const normalized = normalizeWorkspaceData(workspace, DEMO_WORKSPACE);
+  const memory = normalized.chapters[0].memory!;
+  assert.equal(memory.evidenceVersion, 1);
+  assert.equal(memory.characterUpdates[0].location, "harbor");
+  assert.deepEqual(memory.characterUpdates[0].knowledge, ["tide time"]);
+  assert.equal(memory.factEvidence?.[0].verified, true);
+});
+
+
+test("rejects repeated prose and premature ending hooks before saving a segment", () => {
+  const target = structuredClone(DEMO_WORKSPACE.chapters[0]);
+  target.chapterOutline = { objective: "investigate", opening: "arrive", scenes: ["search"], turningPoint: "THE_LOCKED_DOOR_OPENS", endingHook: "THE_LIGHTS_GO_OUT", foreshadowActions: [] };
+  const repeated = "A".repeat(90);
+  const issues = validateGeneratedChapterSegment(target, { index: 0, total: 2, existingDraft: repeated }, `${repeated}\n\nTHE_LIGHTS_GO_OUT`);
+  assert.equal(issues.length, 2);
+  assert.equal(validateGeneratedChapterSegment(target, { index: 1, total: 2, existingDraft: repeated }, "A clean final segment." ).length, 0);
+});
+
+test("keeps legacy unsupported canon out of verified writing context", () => {
+  const workspace = structuredClone(DEMO_WORKSPACE);
+  workspace.chapters[0].memory = {
+    summary: "legacy generated memory", timelineEvents: ["legacy event"], characterUpdates: [],
+    openedThreads: [], resolvedThreads: [], establishedFacts: ["legacy unsupported fact"],
+  };
+  workspace.canon.timeline = [{ id: "legacy-event", chapterNumber: 1, event: "legacy event" }];
+  workspace.canon.facts = [{ id: "legacy-fact", chapterNumber: 1, fact: "legacy unsupported fact" }];
+  const legacy = canonContextBeforeChapter(workspace, 2);
+  assert.equal(legacy.verified.timeline.length, 0);
+  assert.equal(legacy.verified.facts.length, 0);
+  assert.deepEqual(legacy.legacyMemoryChapters, [1]);
+
+  workspace.chapters[0].memory.evidenceVersion = 1;
+  const rebuilt = canonContextBeforeChapter(workspace, 2);
+  assert.equal(rebuilt.verified.timeline.length, 1);
+  assert.equal(rebuilt.verified.facts.length, 1);
+});
+
+test("generates one complete chapter within a ten percent word range", () => {
+  const target = structuredClone(DEMO_WORKSPACE.chapters[0]);
+  target.targetWords = 4000;
+  assert.deepEqual(chapterDraftWordRange(target.targetWords), { minimum: 3600, maximum: 4400 });
+  assert.equal(validateGeneratedChapterDraft(target, "A".repeat(3599)).length, 1);
+  assert.equal(validateGeneratedChapterDraft(target, "A".repeat(3600)).length, 0);
+  assert.equal(validateGeneratedChapterDraft(target, "A".repeat(4400)).length, 0);
+  assert.equal(validateGeneratedChapterDraft(target, "A".repeat(4401)).length, 1);
+  const prompt = buildAutomatedChapterPrompt(DEMO_WORKSPACE, target, { existingDraft: "old partial draft" });
+  assert.match(prompt, /3600/);
+  assert.match(prompt, /4400/);
+  assert.match(prompt, /whole_chapter_single_pass/);
 });

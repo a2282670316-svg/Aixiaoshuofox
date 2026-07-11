@@ -96,14 +96,11 @@ export function estimateWritingRange(workspace: WorkspaceData): WritingRangeEsti
   const ordered = [...workspace.chapters].sort((a, b) => a.number - b.number);
   const chapters = ordered.filter((chapter) => chapter.number >= range.fromChapter && chapter.number <= range.toChapter);
   const pendingChapters = chapters.filter((chapter) => !workspace.automation.generatedChapterIds.includes(chapter.id));
-  const remainingSegments = pendingChapters.reduce((total, chapter) => {
-    const segments = Math.max(1, Math.ceil(chapter.targetWords / 2200));
-    return total + Math.max(0, segments - Math.min(segments, chapter.generation?.completedSegments || 0));
-  }, 0);
+  const remainingSegments = pendingChapters.reduce((total, chapter) =>
+    total + (chapter.content.trim() && !validateGeneratedChapterDraft(chapter, chapter.content).length ? 0 : 1), 0);
   const workflowRequests = pendingChapters.reduce((total, chapter) => {
-    const segments = Math.max(1, Math.ceil(chapter.targetWords / 2200));
-    const completedSegments = Math.min(segments, chapter.generation?.completedSegments || 0);
-    if (completedSegments < segments) return total + 2;
+    const draftComplete = chapter.content.trim() && !validateGeneratedChapterDraft(chapter, chapter.content).length;
+    if (!draftComplete) return total + 2;
     if (!chapter.memory) return total + 2;
     const blocking = workspace.issues.some((issue) => !issue.resolved && issue.severity === "错误" && issue.chapterNumber === chapter.number);
     if (chapter.generation?.status === "audited" && blocking) {
@@ -988,13 +985,49 @@ export function compactCanonBeforeChapter(workspace: WorkspaceData, chapterNumbe
   const openThreads = full.threads.filter((item) => item.status === "open").slice(-80);
   const recentResolvedThreads = full.threads.filter((item) => item.status === "resolved").slice(-20);
 
+  const mergeById = <T extends { id: string }>(...groups: T[][]) => [...new Map(groups.flat().map((item) => [item.id, item])).values()];
+  const milestoneSummaries = full.chapterSummaries.filter((item) => item.chapterNumber === 1 || item.chapterNumber % 10 === 0).slice(-4);
+  const chapterSummaries = [...new Map([...milestoneSummaries, ...full.chapterSummaries.slice(-12)].map((item) => [item.chapterId, item])).values()]
+    .sort((a, b) => a.chapterNumber - b.chapterNumber);
+  const selectedTimeline = select(full.timeline, (item) => item.chapterNumber, (item) => item.event, 40, 20);
+  const timeline = mergeById(full.timeline.slice(0, 10), selectedTimeline.slice(-50))
+    .sort((a, b) => a.chapterNumber - b.chapterNumber);
+  const selectedFacts = select(full.facts, (item) => item.chapterNumber, (item) => item.fact, 60, 30);
+  const facts = mergeById(full.facts.slice(0, 20), selectedFacts.slice(-70))
+    .sort((a, b) => a.chapterNumber - b.chapterNumber);
   return {
-    ...full,
-    chapterSummaries: full.chapterSummaries.slice(-16),
-    timeline: select(full.timeline, (item) => item.chapterNumber, (item) => item.event, 40, 20),
-    characterStates: latestCharacterStates,
-    threads: [...openThreads, ...recentResolvedThreads].slice(-100),
-    facts: select(full.facts, (item) => item.chapterNumber, (item) => item.fact, 60, 30),
+    ...full, chapterSummaries, timeline, characterStates: latestCharacterStates,
+    threads: [...openThreads, ...recentResolvedThreads].slice(-100), facts,
+  };
+}
+
+export function canonContextBeforeChapter(workspace: WorkspaceData, chapterNumber: number) {
+  const compact = compactCanonBeforeChapter(workspace, chapterNumber);
+  const { chapterSummaries, ...canon } = compact;
+  const evidenceBackedChapters = new Set(workspace.chapters
+    .filter((item) => item.number < chapterNumber && item.memory?.evidenceVersion === 1)
+    .map((item) => item.number));
+  const verified: CanonLedger = {
+    ...canon,
+    chapterSummaries: [],
+    timeline: canon.timeline.filter((item) => evidenceBackedChapters.has(item.chapterNumber)),
+    characterStates: canon.characterStates.filter((item) => evidenceBackedChapters.has(item.chapterNumber)),
+    facts: canon.facts.filter((item) => evidenceBackedChapters.has(item.chapterNumber)),
+    threads: canon.threads
+      .filter((item) => evidenceBackedChapters.has(item.openedChapter))
+      .map((item) => item.resolvedChapter !== undefined && !evidenceBackedChapters.has(item.resolvedChapter)
+        ? { ...item, status: "open" as const, resolvedChapter: undefined }
+        : item),
+  };
+  return {
+    verified,
+    narrativeRecaps: chapterSummaries.map((item) => ({
+      chapterNumber: item.chapterNumber, summary: item.summary,
+      warning: "\u5bfc\u822a\u6458\u8981\uff0c\u4e0d\u80fd\u5355\u72ec\u7528\u4f5c\u4e8b\u5b9e\u8bc1\u636e",
+    })),
+    legacyMemoryChapters: workspace.chapters
+      .filter((item) => item.number < chapterNumber && item.memory && item.memory.evidenceVersion !== 1)
+      .map((item) => item.number),
   };
 }
 
@@ -1033,132 +1066,235 @@ export function removeChapterFromCanon(workspace: WorkspaceData, chapterNumber: 
   };
 }
 
+export function chapterSegmentObligations(target: Chapter, segmentIndex: number, totalSegments: number) {
+  const outline = target.chapterOutline;
+  const total = Math.max(1, totalSegments);
+  const index = Math.max(0, Math.min(total - 1, segmentIndex));
+  const scenes = outline?.scenes || [];
+  const sceneStart = Math.floor(index * scenes.length / total);
+  const sceneEnd = Math.floor((index + 1) * scenes.length / total);
+  return {
+    objective: outline?.objective || target.summary,
+    opening: index === 0 ? outline?.opening : undefined,
+    scenes: scenes.slice(sceneStart, Math.max(sceneStart + (scenes.length ? 1 : 0), sceneEnd)).filter(Boolean),
+    turningPoint: index === total - 1 ? outline?.turningPoint : undefined,
+    endingHook: index === total - 1 ? outline?.endingHook : undefined,
+    forbiddenUntilLater: index < total - 1 ? [outline?.turningPoint, outline?.endingHook].filter(Boolean) : [],
+  };
+}
+
+export function chapterDraftWordRange(targetWords: number) {
+  const target = Math.max(500, Math.round(targetWords));
+  return { minimum: Math.max(300, Math.floor(target * 0.9)), maximum: Math.ceil(target * 1.1) };
+}
+
 export function buildAutomatedChapterPrompt(
   workspace: WorkspaceData,
   target: Chapter,
-  segment: { index: number; total: number; existingDraft: string },
+  draft: { index?: number; total?: number; existingDraft: string },
 ) {
   const chapters = [...workspace.chapters].sort((a, b) => a.number - b.number);
   const index = chapters.findIndex((item) => item.id === target.id);
   const previous = chapters[index - 1];
-  const next = chapters[index + 1];
-  const outlineBeat = workspace.outline.find((item) => item.id === target.outlineBeatId);
   const isFinal = index === chapters.length - 1;
-  const isFirstSegment = segment.index === 0;
-  const isLastSegment = segment.index === segment.total - 1;
-  const segmentTarget = Math.ceil(target.targetWords / segment.total);
+  const canonContext = canonContextBeforeChapter(workspace, target.number);
+  const obligations = chapterSegmentObligations(target, 0, 1);
+  const wordRange = chapterDraftWordRange(target.targetWords);
   const compactContext = {
+    writingMode: "whole_chapter_single_pass",
+    factPriority: [
+      "\u5df2\u9a8c\u8bc1\u4e8b\u5b9e\u8d26\u672c\u4e0e\u4e0a\u4e00\u7ae0\u5b9e\u9645\u7ed3\u5c3e",
+      "\u672c\u7ae0\u5b8c\u6574\u7ae0\u7eb2\u4e0e\u4f0f\u7b14\u4efb\u52a1",
+      "\u4e16\u754c\u89c4\u5219\u4e0e\u4eba\u7269\u6700\u65b0\u72b6\u6001",
+      "\u4eba\u7269\u521d\u59cb\u6863\u6848\u548c\u5168\u4e66\u8bbe\u5b9a",
+    ],
     project: workspace.project,
-    characters: workspace.characters,
-    world: workspace.world,
+    authorCharacterDossiers: workspace.characters.map((character) => ({
+      id: character.id, name: character.name, role: character.role, age: character.age,
+      identity: character.identity, goal: character.goal, traits: character.traits,
+    })),
+    worldRules: workspace.world,
     relationships: workspace.relationships.map((relation) => ({
       from: workspace.characters.find((item) => item.id === relation.fromId)?.name,
       to: workspace.characters.find((item) => item.id === relation.toId)?.name,
-      label: relation.label,
-      tone: relation.tone,
-      description: relation.description,
+      label: relation.label, tone: relation.tone, description: relation.description,
     })),
-    outlineBeat,
+    outlineBeat: workspace.outline.find((item) => item.id === target.outlineBeatId),
     chapterOutline: target.chapterOutline,
+    wholeChapterObligations: obligations,
     foreshadowTasks: foreshadowTasksForChapter(workspace, target.number),
     currentChapter: {
-      number: target.number,
-      title: target.title,
-      summary: target.summary,
-      pov: target.pov,
+      number: target.number, title: target.title, summary: target.summary, pov: target.pov,
       targetWords: target.targetWords,
-      segment: `${segment.index + 1}/${segment.total}`,
-      existingDraftEnding: segment.existingDraft.slice(-5000),
+      hardWordRange: wordRange,
+      existingDraftReference: draft.existingDraft.slice(0, 40_000),
     },
     previousChapter: previous ? {
-      number: previous.number,
-      title: previous.title,
-      summary: previous.summary,
-      ending: previous.content.slice(-6000),
+      number: previous.number, title: previous.title,
+      ending: previous.content.slice(-8000),
     } : null,
-    nextChapter: next ? {
-      number: next.number,
-      title: next.title,
-      summary: next.summary,
-    } : null,
-    unresolvedIssues: workspace.issues.filter((item) => !item.resolved && (!item.chapterNumber || item.chapterNumber <= target.number)),
-    canon: compactCanonBeforeChapter(workspace, target.number),
+    verifiedCanon: canonContext.verified,
+    unverifiedNarrativeRecaps: canonContext.narrativeRecaps,
+    latestCharacterStates: canonContext.verified.characterStates,
+    openThreads: canonContext.verified.threads.filter((item) => item.status === "open"),
+    problemsToAvoid: workspace.issues
+      .filter((item) => !item.resolved && (!item.chapterNumber || item.chapterNumber <= target.number))
+      .map((item) => ({ title: item.title, description: item.description, suggestedFix: item.suggestedFix })),
   };
 
-  return `你是正在连续创作同一部长篇小说的中文作家。请完成第 ${target.number} 章《${target.title}》正文的第 ${segment.index + 1}/${segment.total} 段。
+  return `\u4f60\u662f\u6b63\u5728\u8fde\u7eed\u521b\u4f5c\u540c\u4e00\u90e8\u957f\u7bc7\u5c0f\u8bf4\u7684\u4e2d\u6587\u4f5c\u5bb6\u3002\u8bf7\u4e00\u6b21\u6027\u5b8c\u6210\u7b2c ${target.number} \u7ae0\u300a${target.title}\u300b\u7684\u5b8c\u6574\u6b63\u6587\u3002\u4e0d\u8981\u5206\u6bb5\u8bf7\u6c42\u3001\u4e0d\u8981\u53ea\u7eed\u5199\u5c40\u90e8\u3001\u4e0d\u8981\u8f93\u51fa\u672a\u5b8c\u6210\u7ae0\u8282\u3002
 
-硬性要求：
-1. 本次目标约 ${segmentTarget} 个中文字符，允许上下浮动 20%；完整章节目标约 ${target.targetWords} 字。
-2. 严格使用“${target.pov || workspace.project.pointOfView}”视角，延续前文事实、时态、语气与人物动机。
-3. 必须逐项落实 chapterOutline 的 objective、scenes、turningPoint 和 endingHook，不能用总结代替场景。
-4. ${isFirstSegment ? "这是本章第一段：自然承接上一章并迅速进入场景。" : "这是本章续写段：必须紧接 existingDraftEnding，不得重写或概述已经写过的内容。"}
-5. ${isLastSegment ? "这是本章最后一段：完成本章转折，并形成下一章需要回应的钩子。" : "这不是本章最后一段：推进冲突，但不要提前完成本章转折或写章节收束。"}
-6. 不得擅自改名，不得推翻世界规则，不得把尚未发生的后续梗概提前写成既定事实。
-7. ${isFinal && isLastSegment ? "这是全书最后一章的最后一段：必须解决核心冲突、完成人物弧光、回收主要伏笔，并给出有余韵但明确的结局。" : "不要提前结束全书。"}
-8. foreshadowTasks 中的 plant/advance/resolve 任务必须在本章以可被读者感知、但不生硬说明的方式执行。
-9. 只输出本段新增小说正文，不要重复已有正文，不要标题、提纲、创作说明或 Markdown。
+\u4e8b\u5b9e\u4f18\u5148\u7ea7\uff1a\u5df2\u9a8c\u8bc1\u4e8b\u5b9e > \u672c\u7ae0\u5b8c\u6574\u7ae0\u7eb2 > \u4e16\u754c\u89c4\u5219\u4e0e\u6700\u65b0\u4eba\u7269\u72b6\u6001 > \u4f5c\u8005\u540e\u53f0\u6863\u6848\u3002\u5982\u6709\u51b2\u7a81\uff0c\u5fc5\u987b\u9075\u5faa\u4f18\u5148\u7ea7\u66f4\u9ad8\u7684\u5185\u5bb9\u3002
 
-【全书与相邻章节上下文】
+\u786c\u6027\u8981\u6c42\uff1a
+1. \u6b63\u6587\u5b57\u6570\u5fc5\u987b\u5728 ${wordRange.minimum}\u2014${wordRange.maximum} \u4e2a\u4e2d\u6587\u5b57\u7b26\u4e4b\u95f4\uff1b\u5141\u8bb8\u76f8\u5bf9\u76ee\u6807\u5b57\u6570\u4e0a\u4e0b\u6d6e\u52a8 10%\uff0c\u4f46\u4e0d\u5f97\u8d85\u51fa\u8be5\u8303\u56f4\u3002
+2. \u4e00\u6b21\u8f93\u51fa\u6574\u7ae0\uff0c\u5fc5\u987b\u5305\u542b opening\u3001\u5168\u90e8 scenes\u3001turningPoint \u548c endingHook\uff0c\u4e0d\u5f97\u5206\u6279\u3001\u7559\u5f85\u4e0b\u6b21\u7eed\u5199\u3002
+3. \u4e25\u683c\u4f7f\u7528\u201c${target.pov || workspace.project.pointOfView}\u201d\u89c6\u89d2\uff0c\u4eba\u7269\u53ea\u80fd\u77e5\u9053 verifiedCanon \u548c knowledge \u4e2d\u5df2\u786e\u8ba4\u77e5\u9053\u7684\u4fe1\u606f\u3002
+4. \u81ea\u7136\u627f\u63a5\u4e0a\u4e00\u7ae0\u7684\u5b9e\u9645\u7ed3\u5c3e\uff0c\u4ece opening \u8fdb\u5165\uff0c\u4f9d\u6b21\u5b8c\u6210\u573a\u666f\u3001\u8f6c\u6298\u548c\u7ae0\u672b\u94a9\u5b50\u3002
+5. existingDraftReference \u53ea\u662f\u65e7\u8349\u7a3f\u53c2\u8003\uff1b\u5982\u5176\u4e0d\u4e3a\u7a7a\uff0c\u5e94\u4fdd\u7559\u5176\u4e2d\u6709\u6548\u60c5\u8282\u548c\u6587\u98ce\uff0c\u4f46\u4ecd\u5fc5\u987b\u8fd4\u56de\u4ece\u5f00\u573a\u5230\u7ed3\u5c3e\u7684\u5b8c\u6574\u65b0\u7ae0\u8282\uff0c\u4e0d\u5f97\u53ea\u8fd4\u56de\u8ffd\u52a0\u5185\u5bb9\u3002
+6. unverifiedNarrativeRecaps \u53ea\u7528\u4e8e\u5b9a\u4f4d\u524d\u6587\uff0c\u4e0d\u80fd\u5355\u72ec\u5f53\u4f5c\u4e8b\u5b9e\u8bc1\u636e\u3002\u4f5c\u8005\u540e\u53f0\u6863\u6848\u4e0d\u7b49\u4e8e\u4eba\u7269\u5df2\u77e5\u4fe1\u606f\u3002
+7. problemsToAvoid \u662f\u9700\u8981\u907f\u514d\u7684\u65e7\u95ee\u9898\uff0c\u4e0d\u662f\u4e8b\u5b9e\uff0c\u4e0d\u5f97\u5c06\u95ee\u9898\u63cf\u8ff0\u5199\u8fdb\u6b63\u6587\u3002
+8. \u4e0d\u5f97\u64c5\u81ea\u6539\u540d\u3001\u65b0\u589e\u6838\u5fc3\u8eab\u4efd\u3001\u6539\u53d8\u7269\u4ef6\u5f52\u5c5e\u3001\u91cd\u7f6e\u4eba\u7269\u4f24\u52bf\u6216\u63a8\u7ffb\u4e16\u754c\u89c4\u5219\u3002
+9. ${isFinal ? "\u8fd9\u662f\u5168\u4e66\u6700\u540e\u4e00\u7ae0\uff1a\u5fc5\u987b\u6309\u84dd\u56fe\u89e3\u51b3\u6838\u5fc3\u51b2\u7a81\u5e76\u56de\u6536\u4e3b\u8981\u4f0f\u7b14\u3002" : "\u4e0d\u8981\u63d0\u524d\u7ed3\u675f\u5168\u4e66\u3002"}
+10. foreshadowTasks \u53ea\u80fd\u6267\u884c\u5f53\u524d\u7ae0\u6307\u5b9a\u7684 plant/advance/resolve\uff0c\u4e0d\u5f97\u81ea\u884c\u56de\u6536\u5176\u4ed6\u4f0f\u7b14\u3002
+11. \u53ea\u8f93\u51fa\u5b8c\u6574\u5c0f\u8bf4\u6b63\u6587\uff0c\u4e0d\u8981\u7ae0\u8282\u6807\u9898\u3001\u5b57\u6570\u8bf4\u660e\u3001\u63d0\u7eb2\u3001\u521b\u4f5c\u8bf4\u660e\u6216 Markdown\u3002
+
+\u3010\u7ecf\u8fc7\u5206\u5c42\u7684\u5199\u4f5c\u4e0a\u4e0b\u6587\u3011
 ${JSON.stringify(compactContext, null, 2)}`;
 }
 
-export function buildChapterMemoryPrompt(workspace: WorkspaceData, chapter: Chapter) {
-  return `你是长篇小说的连续性记录员。请从刚完成的章节正文中提取可供后续章节继承的事实记忆。
-
-只输出合法 JSON，不要 Markdown，不要解释。结构如下：
-{
-  "summary": "300—600字的本章因果摘要",
-  "timelineEvents": ["按发生顺序记录的事件"],
-  "characterUpdates": [{"name":"人物姓名","state":"本章结束综合状态","location":"所在地点","physical":"身体状态","emotion":"情绪","knowledge":["已经确认知道的信息"],"inventory":["持有的重要物品"],"goal":"当前目标"}],
-  "openedThreads": ["本章新出现且尚未解决的线索或承诺"],
-  "resolvedThreads": ["本章明确解决或回收的线索"],
-  "establishedFacts": ["后文不可随意推翻的明确事实"],
-  "outlineEvidence": [{"key":"objective|opening|scene|turningPoint|endingHook","label":"对应章纲项目","status":"executed|partial|missing","score":0,"evidence":"执行判断","quote":"正文中的连续原文引用"}],
-  "foreshadowUpdates": [{"title":"伏笔名称","status":"planted|advanced|resolved","evidence":"如何执行","quote":"正文中的连续原文引用"}]
+export function validateGeneratedChapterDraft(target: Chapter, generated: string) {
+  const issues: string[] = [];
+  const length = generated.replace(/\s/g, "").length;
+  const range = chapterDraftWordRange(target.targetWords);
+  if (length < range.minimum) issues.push(`\u6574\u7ae0\u6b63\u6587\u53ea\u6709 ${length} \u5b57\uff0c\u4f4e\u4e8e\u786c\u6027\u4e0b\u9650 ${range.minimum} \u5b57`);
+  if (length > range.maximum) issues.push(`\u6574\u7ae0\u6b63\u6587\u6709 ${length} \u5b57\uff0c\u8d85\u8fc7\u786c\u6027\u4e0a\u9650 ${range.maximum} \u5b57`);
+  if (/^(?:#{1,6}\s*|\u3010?\u7b2c\s*\d+\s*\u7ae0|\u521b\u4f5c\u8bf4\u660e|\u7ae0\u7eb2)/.test(generated.trim())) {
+    issues.push("\u8f93\u51fa\u5305\u542b\u6807\u9898\u6216\u521b\u4f5c\u8bf4\u660e\uff0c\u4e0d\u662f\u7eaf\u6b63\u6587");
+  }
+  return issues;
 }
 
-要求：只记录正文能够支持的内容；不要推测未来；人物姓名必须沿用现有人物档案；每个数组最多 20 条。
+export function validateGeneratedChapterSegment(
+  target: Chapter,
+  segment: { index: number; total: number; existingDraft: string },
+  generated: string,
+) {
+  const issues: string[] = [];
+  const normalizedDraft = segment.existingDraft.replace(/\s+/g, "");
+  const repeatedParagraph = generated.split(/\n{2,}/).map((item) => item.trim()).find((paragraph) => {
+    const normalized = paragraph.replace(/\s+/g, "");
+    return normalized.length >= 80 && normalizedDraft.includes(normalized);
+  });
+  if (repeatedParagraph) issues.push("\u8f93\u51fa\u91cd\u590d\u4e86\u672c\u7ae0\u5df2\u6709\u6b63\u6587");
+  if (/^(?:#{1,6}\s*|\u3010?\u7b2c\s*\d+\s*\u7ae0|\u521b\u4f5c\u8bf4\u660e|\u7ae0\u7eb2)/.test(generated.trim())) {
+    issues.push("\u8f93\u51fa\u5305\u542b\u6807\u9898\u6216\u521b\u4f5c\u8bf4\u660e\uff0c\u4e0d\u662f\u7eaf\u6b63\u6587");
+  }
+  if (segment.index < segment.total - 1) {
+    const forbidden = [target.chapterOutline?.turningPoint, target.chapterOutline?.endingHook].filter((item): item is string => Boolean(item?.trim()));
+    const normalizedGenerated = generated.replace(/\s+/g, "");
+    for (const item of forbidden) {
+      const normalized = item.replace(/\s+/g, "");
+      if (normalized.length >= 6 && normalizedGenerated.includes(normalized)) {
+        issues.push(`\u975e\u6700\u540e\u5206\u6bb5\u63d0\u524d\u5199\u5165\u540e\u7eed\u8f6c\u6298\u6216\u7ae0\u672b\u94a9\u5b50\uff1a${item}`);
+      }
+    }
+  }
+  return issues;
+}
 
-【作品】
+export function buildChapterMemoryPrompt(workspace: WorkspaceData, chapter: Chapter) {
+  return `\u4f60\u662f\u957f\u7bc7\u5c0f\u8bf4\u7684\u8bc1\u636e\u5316\u8fde\u7eed\u6027\u8bb0\u5f55\u5458\u3002\u8bf7\u4ece\u521a\u5b8c\u6210\u7684\u7ae0\u8282\u6b63\u6587\u4e2d\u63d0\u53d6\u53ef\u4f9b\u540e\u7eed\u7ae0\u8282\u7ee7\u627f\u7684\u4e8b\u5b9e\u8bb0\u5fc6\u3002
+
+\u53ea\u8f93\u51fa\u5408\u6cd5 JSON\uff0c\u4e0d\u8981 Markdown\uff0c\u4e0d\u8981\u89e3\u91ca\u3002\u7ed3\u6784\u5982\u4e0b\uff1a
+{
+  "evidenceVersion": 1,
+  "summary": "300\u2014600\u5b57\u7684\u672c\u7ae0\u56e0\u679c\u6458\u8981",
+  "timelineEvents": [{"event":"\u6309\u53d1\u751f\u987a\u5e8f\u8bb0\u5f55\u7684\u4e8b\u4ef6","quote":"\u80fd\u76f4\u63a5\u8bc1\u660e\u8be5\u4e8b\u4ef6\u7684\u6b63\u6587\u8fde\u7eed\u539f\u53e5"}],
+  "characterUpdates": [{"name":"\u4eba\u7269\u59d3\u540d","state":"\u672c\u7ae0\u7ed3\u675f\u7efc\u5408\u72b6\u6001","location":"\u6240\u5728\u5730\u70b9","physical":"\u8eab\u4f53\u72b6\u6001","emotion":"\u60c5\u7eea","knowledge":["\u5df2\u7ecf\u786e\u8ba4\u77e5\u9053\u7684\u4fe1\u606f"],"inventory":["\u6301\u6709\u7684\u91cd\u8981\u7269\u54c1"],"goal":"\u5f53\u524d\u76ee\u6807","quote":"\u80fd\u76f4\u63a5\u8bc1\u660e\u8be5\u72b6\u6001\u7684\u6b63\u6587\u8fde\u7eed\u539f\u53e5"}],
+  "openedThreads": [{"title":"\u672c\u7ae0\u65b0\u51fa\u73b0\u4e14\u5c1a\u672a\u89e3\u51b3\u7684\u7ebf\u7d22","quote":"\u6b63\u6587\u8fde\u7eed\u539f\u53e5"}],
+  "resolvedThreads": [{"title":"\u672c\u7ae0\u660e\u786e\u89e3\u51b3\u7684\u7ebf\u7d22","quote":"\u6b63\u6587\u8fde\u7eed\u539f\u53e5"}],
+  "establishedFacts": [{"fact":"\u540e\u6587\u4e0d\u53ef\u968f\u610f\u63a8\u7ffb\u7684\u660e\u786e\u4e8b\u5b9e","quote":"\u80fd\u76f4\u63a5\u8bc1\u660e\u8be5\u4e8b\u5b9e\u7684\u6b63\u6587\u8fde\u7eed\u539f\u53e5"}],
+  "outlineEvidence": [{"key":"objective|opening|scene|turningPoint|endingHook","label":"\u5bf9\u5e94\u7ae0\u7eb2\u9879\u76ee","status":"executed|partial|missing","score":0,"evidence":"\u6267\u884c\u5224\u65ad","quote":"\u6b63\u6587\u4e2d\u7684\u8fde\u7eed\u539f\u53e5"}],
+  "foreshadowUpdates": [{"title":"\u4f0f\u7b14\u540d\u79f0","status":"planted|advanced|resolved","evidence":"\u5982\u4f55\u6267\u884c","quote":"\u6b63\u6587\u4e2d\u7684\u8fde\u7eed\u539f\u53e5"}]
+}
+
+\u8bc1\u636e\u786c\u89c4\u5219\uff1a
+1. timelineEvents\u3001characterUpdates\u3001openedThreads\u3001resolvedThreads\u3001establishedFacts \u6bcf\u4e00\u9879\u90fd\u5fc5\u987b\u6709 quote\u3002
+2. quote \u5fc5\u987b\u662f\u6b63\u6587\u4e2d\u771f\u5b9e\u5b58\u5728\u7684\u8fde\u7eed\u539f\u6587\uff0c\u4e0d\u5f97\u6539\u5199\u3001\u6982\u62ec\u6216\u62fc\u63a5\u3002
+3. \u6ca1\u6709\u53ef\u5f15\u7528\u539f\u6587\u7684\u63a8\u6d4b\u3001\u89e3\u8bfb\u3001\u672a\u6765\u53ef\u80fd\u6216\u4f5c\u8005\u8bbe\u5b9a\uff0c\u4e00\u5f8b\u4e0d\u5f97\u5199\u5165\u3002
+4. \u4eba\u7269\u59d3\u540d\u5fc5\u987b\u6765\u81ea\u73b0\u6709\u4eba\u7269\u6863\u6848\uff1b\u6ca1\u6709\u51fa\u573a\u6216\u72b6\u6001\u672a\u53d8\u5316\u7684\u4eba\u7269\u4e0d\u8981\u5199 characterUpdates\u3002
+5. \u4e0d\u8981\u628a\u65e7\u4e8b\u5b9e\u91cd\u590d\u5f53\u4f5c\u672c\u7ae0\u65b0\u4e8b\u5b9e\uff0c\u4e0d\u8981\u628a\u7591\u95ee\u5f53\u7ed3\u8bba\uff0c\u4e0d\u8981\u628a\u4eba\u7269\u8bf4\u8c0e\u5f53\u5ba2\u89c2\u4e8b\u5b9e\u3002
+6. outlineEvidence \u5fc5\u987b\u5206\u522b\u8f93\u51fa objective\u3001opening\u3001turningPoint\u3001endingHook\uff1bchapterOutline.scenes \u4e2d\u6bcf\u4e2a\u573a\u666f\u5fc5\u987b\u5355\u72ec\u8f93\u51fa\u4e00\u6761 key=scene \u7684\u8bc1\u636e\uff0c\u4e0d\u5f97\u5408\u5e76\u3002
+7. \u6bcf\u4e2a\u6570\u7ec4\u6700\u591a 20 \u6761\u3002
+
+\u3010\u4f5c\u54c1\u3011
 ${JSON.stringify(workspace.project)}
 
-【人物档案】
+\u3010\u4eba\u7269\u6863\u6848\u3011
 ${JSON.stringify(workspace.characters.map((item) => ({ name: item.name, identity: item.identity, goal: item.goal, conflict: item.conflict })))}
 
-【本章之前的事实账本】
-${JSON.stringify(compactCanonBeforeChapter(workspace, chapter.number))}
+\u3010\u672c\u7ae0\u4e4b\u524d\u7684\u5df2\u9a8c\u8bc1\u4e8b\u5b9e\u8d26\u672c\u3011
+${JSON.stringify(canonContextBeforeChapter(workspace, chapter.number).verified)}
 
-【本章应执行的伏笔任务】
+\u3010\u672c\u7ae0\u7ae0\u7eb2\u3011
+${JSON.stringify(chapter.chapterOutline || { summary: chapter.summary })}
+
+\u3010\u672c\u7ae0\u5e94\u6267\u884c\u7684\u4f0f\u7b14\u4efb\u52a1\u3011
 ${JSON.stringify(foreshadowTasksForChapter(workspace, chapter.number))}
 
-【第 ${chapter.number} 章《${chapter.title}》正文】
-${chapter.content.slice(-30_000)}`;
+\u3010\u7b2c ${chapter.number} \u7ae0\u300a${chapter.title}\u300b\u5b8c\u6574\u6b63\u6587\u3011
+${chapter.content.slice(-60_000)}`;
 }
 
 export function parseChapterMemory(value: string): ChapterMemory {
   const payload = parseJson(value);
   const summary = text(payload.summary);
-  if (!summary) throw new Error("章节记忆缺少有效摘要");
+  if (!summary) throw new Error("\u7ae0\u8282\u8bb0\u5fc6\u7f3a\u5c11\u6709\u6548\u6458\u8981");
+  const evidenceVersion = Number(payload.evidenceVersion) === 1 ? 1 as const : undefined;
+  const timelineEvidence = list(payload.timelineEvents).flatMap((item) => {
+    if (isJsonRecord(item)) {
+      const event = text(item.event);
+      return event ? [{ event, quote: text(item.quote) || undefined, verified: false }] : [];
+    }
+    return [];
+  }).slice(0, 20);
+  const threadEvidence = [
+    ...list(payload.openedThreads).flatMap((item) => isJsonRecord(item) && text(item.title) ? [{ title: text(item.title), status: "opened" as const, quote: text(item.quote) || undefined, verified: false }] : []),
+    ...list(payload.resolvedThreads).flatMap((item) => isJsonRecord(item) && text(item.title) ? [{ title: text(item.title), status: "resolved" as const, quote: text(item.quote) || undefined, verified: false }] : []),
+  ].slice(0, 40);
+  const factEvidence = list(payload.establishedFacts).flatMap((item) => {
+    if (isJsonRecord(item)) {
+      const fact = text(item.fact);
+      return fact ? [{ fact, quote: text(item.quote) || undefined, verified: false }] : [];
+    }
+    return [];
+  }).slice(0, 30);
   return {
+    evidenceVersion,
     summary,
-    timelineEvents: list(payload.timelineEvents).map((item) => text(item)).filter(Boolean).slice(0, 20),
+    timelineEvents: list(payload.timelineEvents).map((item) => isJsonRecord(item) ? text(item.event) : text(item)).filter(Boolean).slice(0, 20),
+    timelineEvidence: timelineEvidence.length ? timelineEvidence : undefined,
     characterUpdates: list(payload.characterUpdates).map((item) => record(item)).flatMap((item) => {
       const name = text(item.name);
       const state = text(item.state);
       return name && state ? [{
-        name,
-        state,
+        name, state,
         location: text(item.location) || undefined,
         physical: text(item.physical) || undefined,
         emotion: text(item.emotion) || undefined,
         knowledge: list(item.knowledge).map((entry) => text(entry)).filter(Boolean).slice(0, 100),
         inventory: list(item.inventory).map((entry) => text(entry)).filter(Boolean).slice(0, 100),
         goal: text(item.goal) || undefined,
+        quote: text(item.quote) || undefined,
+        verified: false,
       }] : [];
     }).slice(0, 20),
-    openedThreads: list(payload.openedThreads).map((item) => text(item)).filter(Boolean).slice(0, 20),
-    resolvedThreads: list(payload.resolvedThreads).map((item) => text(item)).filter(Boolean).slice(0, 20),
-    establishedFacts: list(payload.establishedFacts).map((item) => text(item)).filter(Boolean).slice(0, 30),
+    openedThreads: list(payload.openedThreads).map((item) => isJsonRecord(item) ? text(item.title) : text(item)).filter(Boolean).slice(0, 20),
+    resolvedThreads: list(payload.resolvedThreads).map((item) => isJsonRecord(item) ? text(item.title) : text(item)).filter(Boolean).slice(0, 20),
+    threadEvidence: threadEvidence.length ? threadEvidence : undefined,
+    establishedFacts: list(payload.establishedFacts).map((item) => isJsonRecord(item) ? text(item.fact) : text(item)).filter(Boolean).slice(0, 30),
+    factEvidence: factEvidence.length ? factEvidence : undefined,
     outlineEvidence: list(payload.outlineEvidence).filter(isJsonRecord).flatMap((item) => {
       const label = text(item.label);
       if (!label) return [];
@@ -1176,9 +1312,7 @@ export function parseChapterMemory(value: string): ChapterMemory {
       return [{
         title,
         status: ["planted", "advanced", "resolved"].includes(text(item.status)) ? text(item.status) as "planted" | "advanced" | "resolved" : "advanced",
-        evidence: text(item.evidence),
-        quote: text(item.quote),
-        verified: false,
+        evidence: text(item.evidence), quote: text(item.quote), verified: false,
       }];
     }).slice(0, 30),
   };
@@ -1198,8 +1332,32 @@ export function applyChapterMemory(
   const chapter = workspace.chapters.find((item) => item.id === chapterId);
   if (!chapter) return workspace;
   const chapterNumber = chapter.number;
+  const evidenceRequired = memory.evidenceVersion === 1;
+  const knownCharacterNames = new Set(workspace.characters.map((item) => item.name));
+  const timelineEvidence = (memory.timelineEvidence || []).map((entry) => ({ ...entry, verified: verifyQuotedEvidence(chapter.content, entry.quote) }));
+  const threadEvidence = (memory.threadEvidence || []).map((entry) => ({ ...entry, verified: verifyQuotedEvidence(chapter.content, entry.quote) }));
+  const factEvidence = (memory.factEvidence || []).map((entry) => ({ ...entry, verified: verifyQuotedEvidence(chapter.content, entry.quote) }));
+  const characterUpdates = memory.characterUpdates
+    .map((entry) => ({ ...entry, verified: verifyQuotedEvidence(chapter.content, entry.quote) }))
+    .filter((entry) => knownCharacterNames.has(entry.name) && (!evidenceRequired || entry.verified));
+  const reliableTimeline = evidenceRequired
+    ? timelineEvidence.filter((entry) => entry.verified).map((entry) => entry.event)
+    : memory.timelineEvents;
+  const reliableOpenedThreads = evidenceRequired
+    ? threadEvidence.filter((entry) => entry.verified && entry.status === "opened").map((entry) => entry.title)
+    : memory.openedThreads;
+  const reliableResolvedThreads = evidenceRequired
+    ? threadEvidence.filter((entry) => entry.verified && entry.status === "resolved").map((entry) => entry.title)
+    : memory.resolvedThreads;
+  const reliableFacts = evidenceRequired
+    ? factEvidence.filter((entry) => entry.verified).map((entry) => entry.fact)
+    : memory.establishedFacts;
   const verifiedMemory: ChapterMemory = {
     ...memory,
+    timelineEvents: reliableTimeline, timelineEvidence,
+    characterUpdates,
+    openedThreads: reliableOpenedThreads, resolvedThreads: reliableResolvedThreads, threadEvidence,
+    establishedFacts: reliableFacts, factEvidence,
     outlineEvidence: (memory.outlineEvidence || []).map((entry) => ({ ...entry, verified: verifyQuotedEvidence(chapter.content, entry.quote) })),
     foreshadowUpdates: (memory.foreshadowUpdates || []).map((entry) => ({ ...entry, verified: verifyQuotedEvidence(chapter.content, entry.quote) })),
   };
@@ -1209,55 +1367,35 @@ export function applyChapterMemory(
   const previousSummaries = workspace.canon.chapterSummaries.filter((item) => item.chapterId !== chapterId);
   const updatedNames = new Set(memory.characterUpdates.map((item) => item.name));
   const previousCharacterStates = workspace.canon.characterStates.filter((item) => !(item.chapterNumber === chapterNumber && updatedNames.has(item.name)));
-  const foreshadowUpdates = memory.foreshadowUpdates || [];
+  const foreshadowUpdates = evidenceRequired ? (memory.foreshadowUpdates || []).filter((item) => item.verified) : (memory.foreshadowUpdates || []);
   const resolvedTitles = new Set([...memory.resolvedThreads, ...foreshadowUpdates.filter((item) => item.status === "resolved").map((item) => item.title)]);
   const updatedThreads = workspace.canon.threads.map((item) => resolvedTitles.has(item.title) ? {
-    ...item,
-    status: "resolved" as const,
-    resolvedChapter: chapterNumber,
+    ...item, status: "resolved" as const, resolvedChapter: chapterNumber,
   } : item);
   const knownThreadTitles = new Set(updatedThreads.map((item) => item.title));
   const openedThreadTitles = [...memory.openedThreads, ...foreshadowUpdates.filter((item) => item.status !== "resolved").map((item) => item.title)];
   const canon: CanonLedger = {
     ...workspace.canon,
     revision: nextRevision,
-    chapterSummaries: [...previousSummaries, { chapterId, chapterNumber, summary: memory.summary }]
-      .sort((a, b) => a.chapterNumber - b.chapterNumber),
+    chapterSummaries: [...previousSummaries, { chapterId, chapterNumber, summary: memory.summary }].sort((a, b) => a.chapterNumber - b.chapterNumber),
     timeline: [...workspace.canon.timeline.filter((item) => item.chapterNumber !== chapterNumber), ...memory.timelineEvents.map((event, index) => ({
-      id: `timeline-${nextRevision}-${chapterNumber}-${index + 1}`,
-      chapterNumber,
-      event,
+      id: `timeline-${nextRevision}-${chapterNumber}-${index + 1}`, chapterNumber, event,
     }))],
     characterStates: [...previousCharacterStates, ...memory.characterUpdates.map((item) => ({
-      characterId: characterIds.get(item.name),
-      name: item.name,
-      state: item.state,
-      chapterNumber,
-      location: item.location,
-      physical: item.physical,
-      emotion: item.emotion,
-      knowledge: item.knowledge,
-      inventory: item.inventory,
-      goal: item.goal,
+      characterId: characterIds.get(item.name), name: item.name, state: item.state, chapterNumber,
+      location: item.location, physical: item.physical, emotion: item.emotion, knowledge: item.knowledge, inventory: item.inventory, goal: item.goal,
     }))],
     threads: [...updatedThreads, ...openedThreadTitles.filter((title) => !knownThreadTitles.has(title)).map((title, index) => ({
-      id: `thread-${nextRevision}-${chapterNumber}-${index + 1}`,
-      title,
-      status: "open" as const,
-      openedChapter: chapterNumber,
+      id: `thread-${nextRevision}-${chapterNumber}-${index + 1}`, title, status: "open" as const, openedChapter: chapterNumber,
     }))],
     facts: [...workspace.canon.facts.filter((item) => item.chapterNumber !== chapterNumber), ...memory.establishedFacts.map((fact, index) => ({
-      id: `fact-${nextRevision}-${chapterNumber}-${index + 1}`,
-      chapterNumber,
-      fact,
+      id: `fact-${nextRevision}-${chapterNumber}-${index + 1}`, chapterNumber, fact,
     }))],
   };
   return {
     ...workspace,
     chapters: workspace.chapters.map((item) => item.id === chapterId ? {
-      ...item,
-      memory,
-      revision: (item.revision || 0) + 1,
+      ...item, memory, revision: (item.revision || 0) + 1,
       generation: item.generation ? { ...item.generation, status: "generated" } : item.generation,
     } : item),
     canon,
@@ -1284,7 +1422,7 @@ export function buildRollingAuditPrompt(workspace: WorkspaceData, throughChapter
 ${JSON.stringify({ project: workspace.project, world: workspace.world, characters: workspace.characters, relationships: workspace.relationships })}
 
 【第 ${throughChapter} 章之前的事实账本】
-${JSON.stringify(compactCanonBeforeChapter(workspace, throughChapter))}
+${JSON.stringify(canonContextBeforeChapter(workspace, throughChapter).verified)}
 
 【上一章结尾】
 ${previousChapter?.content.slice(-6000) || "无"}
@@ -1325,8 +1463,13 @@ export function parseRollingAudit(value: string, runId: string, defaultChapterNu
 export function evaluateChapterQuality(workspace: WorkspaceData, chapterNumber: number) {
   const chapter = workspace.chapters.find((item) => item.number === chapterNumber);
   if (!chapter) throw new Error(`找不到第 ${chapterNumber} 章`);
-  const lengthRatio = chapter.content.replace(/\s+/g, "").length / Math.max(1, chapter.targetWords);
-  const length = clamp(lengthRatio * 100, 0, 100);
+  const actualLength = chapter.content.replace(/\s+/g, "").length;
+  const lengthRange = chapterDraftWordRange(chapter.targetWords);
+  const length = actualLength < lengthRange.minimum
+    ? clamp(actualLength / Math.max(1, lengthRange.minimum) * 100, 0, 100)
+    : actualLength > lengthRange.maximum
+      ? clamp(lengthRange.maximum / actualLength * 100, 0, 100)
+      : 100;
   const outlineFields = chapter.chapterOutline ? [
     chapter.chapterOutline.objective,
     chapter.chapterOutline.opening,
@@ -1388,20 +1531,80 @@ export function buildChapterQualityIssues(workspace: WorkspaceData, chapterNumbe
   const chapter = workspace.chapters.find((item) => item.number === chapterNumber);
   if (!chapter) return [];
   const actualLength = chapter.content.replace(/\s+/g, "").length;
-  const minimumLength = Math.max(300, Math.floor(chapter.targetWords * 0.7));
-  if (actualLength >= minimumLength) return [];
+  const range = chapterDraftWordRange(chapter.targetWords);
+  if (actualLength >= range.minimum && actualLength <= range.maximum) return [];
+  const tooShort = actualLength < range.minimum;
   return [{
     id: `quality-${runId}-${chapterNumber}-${chapter.revision || 0}-length`,
-    severity: "错误",
-    category: "情节",
-    title: "章节正文长度未达到验收线",
-    description: `本章目标 ${chapter.targetWords} 字，当前约 ${actualLength} 字；低于自动验收线 ${minimumLength} 字，可能存在情节、场景或转折未充分展开。`,
-    location: `第 ${chapterNumber} 章`,
+    severity: "\u9519\u8bef",
+    category: "\u60c5\u8282",
+    title: tooShort ? "\u7ae0\u8282\u6b63\u6587\u5b57\u6570\u504f\u5c11" : "\u7ae0\u8282\u6b63\u6587\u5b57\u6570\u8fc7\u591a",
+    description: `\u672c\u7ae0\u76ee\u6807 ${chapter.targetWords} \u5b57\uff0c\u5141\u8bb8\u8303\u56f4 ${range.minimum}\u2014${range.maximum} \u5b57\uff0c\u5f53\u524d\u7ea6 ${actualLength} \u5b57\u3002`,
+    location: `\u7b2c ${chapterNumber} \u7ae0`,
     resolved: false,
     chapterNumber,
-    evidence: `当前正文约 ${actualLength} 字`,
-    suggestedFix: "在不改变既定剧情的前提下补足场景行动、人物反应、因果过渡和章末钩子，再重新审校。",
+    evidence: `\u5f53\u524d\u6b63\u6587\u7ea6 ${actualLength} \u5b57`,
+    suggestedFix: tooShort
+      ? "\u5728\u4e0d\u6539\u53d8\u65e2\u5b9a\u5267\u60c5\u7684\u524d\u63d0\u4e0b\u8865\u8db3\u573a\u666f\u884c\u52a8\u3001\u4eba\u7269\u53cd\u5e94\u3001\u56e0\u679c\u8fc7\u6e21\u548c\u7ae0\u672b\u94a9\u5b50\u3002"
+      : "\u5220\u9664\u91cd\u590d\u89e3\u91ca\u3001\u65e0\u6548\u5bf9\u8bdd\u548c\u8fc7\u5ea6\u63cf\u5199\uff0c\u4fdd\u7559\u7ae0\u7eb2\u5173\u952e\u884c\u52a8\u3001\u8f6c\u6298\u4e0e\u94a9\u5b50\u3002",
     source: "local",
+  }];
+}
+
+export function buildChapterPlanDeviationIssues(workspace: WorkspaceData, chapterNumber: number, runId: string): ConsistencyIssue[] {
+  const chapter = workspace.chapters.find((item) => item.number === chapterNumber);
+  if (!chapter?.chapterOutline || !chapter.memory) return [];
+  const evidence = chapter.memory.outlineEvidence || [];
+  const issues: ConsistencyIssue[] = [];
+  const required = [
+    { key: "objective" as const, label: "\u7ae0\u8282\u76ee\u6807", expected: chapter.chapterOutline.objective },
+    { key: "opening" as const, label: "\u5f00\u573a", expected: chapter.chapterOutline.opening },
+    { key: "turningPoint" as const, label: "\u6838\u5fc3\u8f6c\u6298", expected: chapter.chapterOutline.turningPoint },
+    { key: "endingHook" as const, label: "\u7ae0\u672b\u94a9\u5b50", expected: chapter.chapterOutline.endingHook },
+  ].filter((item) => item.expected?.trim());
+  for (const item of required) {
+    const executed = evidence.some((entry) => entry.key === item.key && entry.verified && entry.status === "executed" && entry.score >= 60);
+    if (!executed) issues.push({
+      id: `plan-${runId}-${chapterNumber}-${item.key}`, severity: "\u9519\u8bef", category: "\u60c5\u8282",
+      title: `\u672c\u7ae0${item.label}\u672a\u88ab\u6b63\u6587\u8bc1\u636e\u8bc1\u660e`,
+      description: `\u7ae0\u7eb2\u8981\u6c42\u201c${item.expected}\u201d\uff0c\u4f46\u7ae0\u8282\u8bb0\u5fc6\u4e2d\u6ca1\u6709\u627e\u5230\u53ef\u6838\u5bf9\u7684\u5df2\u6267\u884c\u539f\u6587\u3002`,
+      location: `\u7b2c ${chapterNumber} \u7ae0`, resolved: false, chapterNumber,
+      suggestedFix: `\u4ee5\u6700\u5c0f\u6539\u52a8\u8865\u8db3${item.label}\uff0c\u4e0d\u6539\u53d8\u5176\u4ed6\u5df2\u5b8c\u6210\u5267\u60c5\u3002`, source: "local",
+    });
+  }
+  const executedScenes = evidence.filter((entry) => entry.key === "scene" && entry.verified && entry.status === "executed" && entry.score >= 60).length;
+  if (chapter.chapterOutline.scenes.length && executedScenes < chapter.chapterOutline.scenes.length) {
+    issues.push({
+      id: `plan-${runId}-${chapterNumber}-scenes`, severity: "\u9519\u8bef", category: "\u60c5\u8282", title: "\u7ae0\u7eb2\u573a\u666f\u6267\u884c\u4e0d\u5b8c\u6574",
+      description: `\u8ba1\u5212 ${chapter.chapterOutline.scenes.length} \u4e2a\u573a\u666f\uff0c\u53ea\u6709 ${executedScenes} \u4e2a\u573a\u666f\u627e\u5230\u5df2\u9a8c\u8bc1\u7684\u6b63\u6587\u8bc1\u636e\u3002`,
+      location: `\u7b2c ${chapterNumber} \u7ae0`, resolved: false, chapterNumber, suggestedFix: "\u8865\u8db3\u7f3a\u5931\u573a\u666f\u7684\u884c\u52a8\u3001\u51b2\u7a81\u548c\u56e0\u679c\u8fc7\u6e21\u3002", source: "local",
+    });
+  }
+  const foreshadowUpdates = chapter.memory.foreshadowUpdates || [];
+  for (const task of foreshadowTasksForChapter(workspace, chapterNumber)) {
+    const expectedStatus = task.action === "plant" ? "planted" : task.action === "resolve" ? "resolved" : "advanced";
+    const executed = foreshadowUpdates.some((entry) => entry.title === task.title && entry.status === expectedStatus && entry.verified);
+    if (!executed) issues.push({
+      id: `plan-${runId}-${chapterNumber}-foreshadow-${task.title}`, severity: "\u9519\u8bef", category: "\u60c5\u8282", title: `\u4f0f\u7b14\u4efb\u52a1\u672a\u6267\u884c\uff1a${task.title}`,
+      description: `\u672c\u7ae0\u5e94\u5bf9\u201c${task.title}\u201d\u6267\u884c ${task.action}\uff0c\u4f46\u672a\u627e\u5230\u5339\u914d\u6b63\u6587\u539f\u53e5\u3002`,
+      location: `\u7b2c ${chapterNumber} \u7ae0`, resolved: false, chapterNumber, suggestedFix: task.instruction || "\u6309\u672c\u7ae0\u4f0f\u7b14\u8ba1\u5212\u505a\u6700\u5c0f\u8865\u5199\u3002", source: "local",
+    });
+  }
+  return issues;
+}
+
+export function buildMemoryEvidenceIssues(workspace: WorkspaceData, chapterNumber: number, runId: string): ConsistencyIssue[] {
+  const chapter = workspace.chapters.find((item) => item.number === chapterNumber);
+  const memory = chapter?.memory;
+  if (!memory || memory.evidenceVersion !== 1) return [];
+  const rejected = [
+    ...(memory.timelineEvidence || []), ...(memory.threadEvidence || []), ...(memory.factEvidence || []), ...(memory.characterUpdates || []),
+  ].filter((entry) => entry.verified === false).length;
+  if (!rejected) return [];
+  return [{
+    id: `memory-evidence-${runId}-${chapterNumber}`, severity: "\u8b66\u544a", category: "\u65f6\u95f4\u7ebf", title: "\u5df2\u62e6\u622a\u65e0\u6b63\u6587\u8bc1\u636e\u7684\u7ae0\u8282\u8bb0\u5fc6",
+    description: `\u6709 ${rejected} \u6761\u6a21\u578b\u63d0\u53d6\u7684\u4e8b\u5b9e\u3001\u4eba\u7269\u72b6\u6001\u6216\u7ebf\u7d22\u65e0\u6cd5\u4e0e\u6b63\u6587\u539f\u53e5\u5339\u914d\uff0c\u5df2\u963b\u6b62\u5b83\u4eec\u8fdb\u5165\u540e\u7eed\u4e8b\u5b9e\u8d26\u672c\u3002`,
+    location: `\u7b2c ${chapterNumber} \u7ae0\u8bb0\u5fc6`, resolved: false, chapterNumber, suggestedFix: "\u53ef\u91cd\u5efa\u672c\u7ae0\u8bb0\u5fc6\uff0c\u6216\u4eba\u5de5\u786e\u8ba4\u6b63\u6587\u540e\u518d\u5199\u5165\u4e8b\u5b9e\u3002", source: "local",
   }];
 }
 
@@ -1428,6 +1631,7 @@ export function replaceChapterAuditIssues(
 }
 
 export function buildConsistencyRepairPrompt(workspace: WorkspaceData, issue: ConsistencyIssue, chapter: Chapter) {
+  const wordRange = chapterDraftWordRange(chapter.targetWords);
   return `你是长篇小说修订编辑。请对第 ${chapter.number} 章做最小必要修订，解决指定一致性问题，不得改写无关剧情、文风、人物声音或章末钩子。
 
 只输出合法 JSON：
@@ -1437,13 +1641,14 @@ export function buildConsistencyRepairPrompt(workspace: WorkspaceData, issue: Co
 1. 必须保留完整章节，不能只输出差异片段。
 2. 只修复指定问题，不擅自增加新设定或提前泄露后续剧情。
 3. 继续完成本章章纲和伏笔任务。
-4. revisedContent 不要包含 Markdown 代码块或修订说明。
+4. revisedContent 字数必须保持在 ${wordRange.minimum}—${wordRange.maximum} 字之间，允许相对目标字数上下浮动 10%，不能因修复无限扩写。
+5. revisedContent 不要包含 Markdown 代码块或修订说明。
 
 【待修复问题】
 ${JSON.stringify(issue)}
 
 【本章之前的事实】
-${JSON.stringify(compactCanonBeforeChapter(workspace, chapter.number))}
+${JSON.stringify(canonContextBeforeChapter(workspace, chapter.number).verified)}
 
 【本章章纲】
 ${JSON.stringify(chapter.chapterOutline || { summary: chapter.summary })}

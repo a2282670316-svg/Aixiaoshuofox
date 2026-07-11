@@ -37,6 +37,8 @@ import {
   buildBlueprintWorldPrompt,
   buildChapterMemoryPrompt,
   buildChapterQualityIssues,
+  buildChapterPlanDeviationIssues,
+  buildMemoryEvidenceIssues,
   buildCharacterContinuityIssues,
   buildConsistencyRepairPrompt,
   buildRollingAuditPrompt,
@@ -57,6 +59,7 @@ import {
   reserveModelRequest,
   restartBlueprintDraft,
   unresolvedChapterErrors,
+  validateGeneratedChapterDraft,
   rewindNovelFromChapter,
 } from "@/lib/auto-novel";
 import type { BlueprintStagePayload } from "@/lib/auto-novel";
@@ -132,8 +135,9 @@ function chapterWorkflowStage(chapter?: Chapter) {
   if (status === "audited") return "审校完成，等待修复或验收";
   if (status === "generated" && chapter.memory) return "事实记忆已完成，等待审校";
   if (status === "generated") return "正文已完成，等待事实记忆";
-  if (status === "generating") return `正文第 ${chapter.generation?.completedSegments || 0} 段已保存`;
-  return chapter.content.trim() ? "已有草稿，等待续写" : "等待正文生成";
+  if (status === "generating") return "整章正文已保存，等待建立事实记忆";
+  if (chapter.content.trim() && !validateGeneratedChapterDraft(chapter, chapter.content).length) return "完整正文已存在，等待记忆与审校";
+  return chapter.content.trim() ? "已有草稿，等待整章重写" : "等待整章正文生成";
 }
 
 function nextRunId() {
@@ -187,8 +191,7 @@ export default function AutoNovelStudio({
   const automation = workspace.automation;
   const isRunning = activePhases.includes(automation.phase) && !(automation.phase === "planning" && !aiBusy);
   const generatedCount = workspace.chapters.filter((item) => automation.generatedChapterIds.includes(item.id)).length;
-  const estimatedSegments = Math.max(1, Math.ceil(automation.chapterWords / 2200));
-  const estimatedCalls = 6 + automation.targetChapters * (estimatedSegments + 1) + Math.ceil(automation.targetChapters / 5);
+  const estimatedCalls = 6 + automation.targetChapters * 2 + Math.ceil(automation.targetChapters / 5);
   const writingEstimate = estimateWritingRange(workspace);
   const scheduledWorkspace: WorkspaceData = {
     ...workspace,
@@ -465,7 +468,7 @@ export default function AutoNovelStudio({
         generation: {
           runId,
           status: chapter.generation?.status || "planned",
-          completedSegments: chapter.generation?.completedSegments || 0,
+          completedSegments: chapter.content.trim() && !validateGeneratedChapterDraft(chapter, chapter.content).length ? 1 : 0,
           baseRevision: chapter.revision || 0,
         },
       }),
@@ -489,65 +492,55 @@ export default function AutoNovelStudio({
         if (stopRequested.current || runTokenRef.current !== runId) break;
         if (working.automation.generatedChapterIds.includes(item.id)) continue;
 
-        const segments = Math.max(1, Math.ceil(item.targetWords / 2200));
-        const resumingCurrent = working.automation.currentChapterNumber === item.number;
-        let startSegment = resumingCurrent ? working.automation.currentSegment : 0;
-        let draft = resumingCurrent ? item.content : "";
-        if (!resumingCurrent && item.content.trim()) {
-          startSegment = Math.min(segments - 1, Math.floor(countCharacters(item.content) / Math.ceil(item.targetWords / segments)));
-          draft = item.content;
+        const hasCompleteDraft = Boolean(item.content.trim()) && (item.generation?.completedSegments || 0) >= 1 && !validateGeneratedChapterDraft(item, item.content).length;
+        if (!hasCompleteDraft) {
+        const target = working.chapters.find((chapter) => chapter.id === item.id) || item;
+        const previousDraft = item.content;
+        controllerRef.current = new AbortController();
+        const prompt = buildAutomatedChapterPrompt(working, target, { existingDraft: previousDraft });
+        let generated = await requestText(prompt, controllerRef.current.signal);
+        if (runTokenRef.current !== runId || stopRequested.current) break;
+        let guardIssues = validateGeneratedChapterDraft(target, generated);
+        if (guardIssues.length) {
+          generated = await requestText(`${prompt}\n\n\u4e0a\u4e00\u6b21\u6574\u7ae0\u8f93\u51fa\u672a\u901a\u8fc7\u672c\u5730\u68c0\u67e5\uff1a${guardIssues.join("\uff1b")}\u3002\n\u8bf7\u91cd\u5199\u5b8c\u6574\u7ae0\u8282\uff0c\u4fdd\u7559\u6709\u6548\u60c5\u8282\uff0c\u540c\u65f6\u4e25\u683c\u628a\u6b63\u6587\u538b\u7f29\u6216\u8865\u8db3\u5230\u89c4\u5b9a\u5b57\u6570\u8303\u56f4\u5185\u3002\u53ea\u8f93\u51fa\u4fee\u6b63\u540e\u7684\u5b8c\u6574\u5c0f\u8bf4\u6b63\u6587\u3002\n\n\u3010\u672a\u901a\u8fc7\u7684\u6574\u7ae0\u6b63\u6587\u3011\n${generated.slice(0, 40_000)}`, controllerRef.current.signal);
+          guardIssues = validateGeneratedChapterDraft(target, generated);
+          if (guardIssues.length) throw new Error(`\u7b2c ${item.number} \u7ae0\u6574\u7ae0\u91cd\u8bd5\u540e\u4ecd\u672a\u901a\u8fc7\u5b57\u6570\u6216\u683c\u5f0f\u68c0\u67e5\uff1a${guardIssues.join("\uff1b")}`);
         }
-
-        for (let segmentIndex = startSegment; segmentIndex < segments; segmentIndex += 1) {
-          if (stopRequested.current || runTokenRef.current !== runId) break;
-          const target = working.chapters.find((chapter) => chapter.id === item.id) || item;
-          controllerRef.current = new AbortController();
-          const prompt = buildAutomatedChapterPrompt(working, target, {
-            index: segmentIndex,
-            total: segments,
-            existingDraft: draft,
-          });
-          const generated = await requestText(prompt, controllerRef.current.signal);
-          if (runTokenRef.current !== runId || stopRequested.current) break;
-          const minimumSegmentLength = Math.max(300, Math.floor(item.targetWords / segments * .45));
-          if (countCharacters(generated) < minimumSegmentLength) {
-            throw new Error(`第 ${item.number} 章第 ${segmentIndex + 1} 段只有 ${countCharacters(generated)} 字，低于最低要求 ${minimumSegmentLength} 字，任务已暂停，请重试`);
-          }
-          draft = `${draft.trim()}${draft.trim() ? "\n\n" : ""}${generated.trim()}`;
-          const isDraftComplete = segmentIndex === segments - 1;
-          working = {
-            ...working,
-            chapters: working.chapters.map((chapter) => chapter.id === item.id ? {
-              ...chapter,
-              content: draft,
-              status: isDraftComplete ? "修订中" : "草稿",
-              updatedAt: new Date().toISOString(),
-              generation: {
-                runId,
-                status: "generating",
-                completedSegments: segmentIndex + 1,
-                baseRevision: chapter.generation?.baseRevision ?? chapter.revision ?? 0,
-              },
-            } : chapter),
-            automation: {
-              ...working.automation,
-              phase: "writing",
-              currentChapterNumber: item.number,
-              currentSegment: segmentIndex + 1,
-              usage: usageRef.current,
-              updatedAt: new Date().toISOString(),
+        if (runTokenRef.current !== runId || stopRequested.current) break;
+        const draft = generated.trim();
+        working = {
+          ...working,
+          chapters: working.chapters.map((chapter) => chapter.id === item.id ? {
+            ...chapter,
+            content: draft,
+            status: "\u4fee\u8ba2\u4e2d",
+            updatedAt: new Date().toISOString(),
+            generation: {
+              runId,
+              status: "generating",
+              completedSegments: 1,
+              baseRevision: chapter.generation?.baseRevision ?? chapter.revision ?? 0,
             },
-          };
-          setWorkspace(working);
-          await onDurableCheckpoint?.(working, {
-            stepKey: `${runId}:chapter:${item.number}:segment:${segmentIndex + 1}`,
-            kind: "chapter_segment",
-            chapterNumber: item.number,
-            segmentNumber: segmentIndex + 1,
-            status: "completed",
-            outputExcerpt: generated.slice(-1500),
-            contextHash: `canon:${working.canon.revision}:chapter:${target.revision || 0}`,
-          });
+          } : chapter),
+          automation: {
+            ...working.automation,
+            phase: "writing",
+            currentChapterNumber: item.number,
+            currentSegment: 1,
+            usage: usageRef.current,
+            updatedAt: new Date().toISOString(),
+          },
+        };
+        setWorkspace(working);
+        await onDurableCheckpoint?.(working, {
+          stepKey: `${runId}:chapter:${item.number}:draft:1`,
+          kind: "chapter_segment",
+          chapterNumber: item.number,
+          segmentNumber: 1,
+          status: "completed",
+          outputExcerpt: generated.slice(-1500),
+          contextHash: `canon:${working.canon.revision}:chapter:${target.revision || 0}`,
+        });
         }
 
         if (stopRequested.current || runTokenRef.current !== runId) break;
@@ -599,6 +592,8 @@ export default function AutoNovelStudio({
           if (stopRequested.current || runTokenRef.current !== runId) break;
           const auditIssues = [
             ...buildChapterQualityIssues(working, item.number, runId),
+            ...buildChapterPlanDeviationIssues(working, item.number, runId),
+            ...buildMemoryEvidenceIssues(working, item.number, runId),
             ...buildCharacterContinuityIssues(working, item.number),
             ...aiAuditIssues,
           ];
@@ -1209,7 +1204,7 @@ export default function AutoNovelStudio({
         <label className="auto-brief"><span>我有一点想法（可选）</span><textarea value={automation.brief} disabled={isRunning} onChange={(event) => patchAutomation({ brief: event.target.value })} placeholder="例如：想写带民俗元素的悬疑；或者什么都不填，直接生成。" /></label>
         <div className="auto-number-grid">
           <label><span>章节数</span><input type="number" min="4" max="60" disabled={isRunning} value={automation.targetChapters} onChange={(event) => { const targetChapters = Math.min(60, Math.max(4, Number(event.target.value) || 4)); patchAutomation({ targetChapters, targetWords: targetChapters * automation.chapterWords }); }} /><small>4—60 章</small></label>
-          <label><span>每章目标字数</span><input type="number" min="1200" max="12000" step="100" disabled={isRunning} value={automation.chapterWords} onChange={(event) => { const chapterWords = Math.min(12000, Math.max(1200, Number(event.target.value) || 1200)); patchAutomation({ chapterWords, targetWords: automation.targetChapters * chapterWords }); }} /><small>按约 2,200 字分段生成</small></label>
+          <label><span>每章目标字数</span><input type="number" min="1200" max="12000" step="100" disabled={isRunning} value={automation.chapterWords} onChange={(event) => { const chapterWords = Math.min(12000, Math.max(1200, Number(event.target.value) || 1200)); patchAutomation({ chapterWords, targetWords: automation.targetChapters * chapterWords }); }} /><small>整章一次生成，允许目标字数上下浮动 10%</small></label>
           <label><span>全书目标字数</span><input type="number" readOnly value={automation.targetChapters * automation.chapterWords} /><small>预计至少 {estimatedCalls} 次模型调用</small></label>
           <label><span>最大模型调用</span><input type="number" min="10" max="1000" disabled={isRunning} value={automation.maxRequests} onChange={(event) => patchAutomation({ maxRequests: Math.min(1000, Math.max(10, Number(event.target.value) || 10)) })} /><small>达到上限自动暂停</small></label>
           <label><span>最大 Token 预算</span><input type="number" min="10000" max="100000000" step="10000" disabled={isRunning} value={automation.maxTokens} onChange={(event) => patchAutomation({ maxTokens: Math.min(100000000, Math.max(10000, Number(event.target.value) || 10000)) })} /><small>当前已用 {automation.usage.totalTokens.toLocaleString("zh-CN")}</small></label>
@@ -1246,7 +1241,7 @@ export default function AutoNovelStudio({
           <label><span>从第几章开始</span><select disabled={isRunning || backgroundActive} value={writingEstimate.range.fromChapter} onChange={(event) => updateWritingRange(Number(event.target.value), Math.max(Number(event.target.value), writingEstimate.range.toChapter))}>{[...workspace.chapters].sort((a, b) => a.number - b.number).map((item) => <option key={item.id} value={item.number}>第 {item.number} 章 · {item.title}</option>)}</select></label>
           <label><span>写到第几章</span><select disabled={isRunning || backgroundActive} value={writingEstimate.range.toChapter} onChange={(event) => updateWritingRange(Math.min(writingEstimate.range.fromChapter, Number(event.target.value)), Number(event.target.value))}>{[...workspace.chapters].sort((a, b) => a.number - b.number).map((item) => <option key={item.id} value={item.number}>第 {item.number} 章 · {item.title}</option>)}</select></label>
           <div className="auto-scheduler-stat"><span><FileText size={15} />待生成章节</span><b>{writingEstimate.pendingChapters.length}</b><small>共 {writingEstimate.chapters.length} 章在范围内</small></div>
-          <div className="auto-scheduler-stat"><span><PenLine size={15} />剩余正文分段</span><b>{writingEstimate.remainingSegments}</b><small>按每段约 2,200 字估算</small></div>
+          <div className="auto-scheduler-stat"><span><PenLine size={15} />剩余整章正文</span><b>{writingEstimate.remainingSegments}</b><small>每章只调用一次正文生成</small></div>
           <div className="auto-scheduler-stat"><span><Zap size={15} />最低模型调用</span><b>{writingEstimate.minimumRequests}</b><small>当前还有 {writingEstimate.remainingRequestBudget} 次预算</small></div>
         </div>
         <div className={`auto-scheduler-health ${writingEstimate.errors.length ? "has-error" : "is-ready"}`}>

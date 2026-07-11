@@ -67,6 +67,9 @@ import { buildUserPrompt } from "@/lib/prompts";
 import {
   applyChapterMemory,
   buildChapterMemoryPrompt,
+  buildChapterQualityIssues,
+  buildChapterPlanDeviationIssues,
+  buildMemoryEvidenceIssues,
   buildCharacterContinuityIssues,
   buildConsistencyRepairPrompt,
   buildRepairDependencyQueue,
@@ -166,11 +169,11 @@ function Empty({ icon, title, text, action }: { icon: ReactNode; title: string; 
 }
 
 function ChapterAcceptance({ chapter, issues, busy, onRebuild, onDiff }: { chapter: Chapter; issues: ConsistencyIssue[]; busy: boolean; onRebuild: () => void; onDiff: () => void }) {
-  const segments = Math.max(1, Math.ceil(chapter.targetWords / 2200));
-  const completedSegments = Math.min(segments, chapter.generation?.completedSegments || 0);
+  const segments = 1;
+  const completedSegments = Math.min(1, chapter.generation?.completedSegments || 0);
   const chapterIssues = issues.filter((issue) => !issue.resolved && issue.chapterNumber === chapter.number);
   const errors = chapterIssues.filter((issue) => issue.severity === "错误").length;
-  const length = countWords(chapter.content); const lengthPassed = length >= chapter.targetWords * 0.7; const status = chapter.generation?.status;
+  const length = countWords(chapter.content); const lengthPassed = length >= chapter.targetWords * 0.9 && length <= chapter.targetWords * 1.1; const status = chapter.generation?.status;
   const stages = [
     { label: "正文", done: completedSegments >= segments || lengthPassed, detail: `${length.toLocaleString("zh-CN")} / ${chapter.targetWords.toLocaleString("zh-CN")} 字` },
     { label: "记忆", done: Boolean(chapter.memory), detail: chapter.memory ? "事实已写入账本" : "等待提取事实" },
@@ -181,7 +184,7 @@ function ChapterAcceptance({ chapter, issues, busy, onRebuild, onDiff }: { chapt
   const resumeAt = status === "blocked" ? "人工处理错误" : status === "audited" && errors ? "自动修复" : !chapter.memory ? "事实记忆" : !["audited", "accepted"].includes(status || "") ? "逐章审校" : status === "accepted" ? "已完成" : "正文生成";
   const scores = chapter.quality ? [["总分", chapter.quality.overall], ["字数", chapter.quality.length], ["章纲", chapter.quality.outline], ["一致性", chapter.quality.continuity], ["伏笔", chapter.quality.foreshadow], ["文风", chapter.quality.style]] as const : [];
   return <section className={`chapter-acceptance-card ${status === "blocked" ? "is-blocked" : status === "accepted" ? "is-accepted" : ""}`}>
-    <header><div><span>WRITING LOOP</span><h3>章节闭环验收</h3></div><div className="chapter-acceptance-actions"><strong>恢复点：{resumeAt}</strong><button disabled={busy || !chapter.content.trim()} onClick={onRebuild}><RefreshCw size={13} />重建记忆并复审</button>{chapter.repairReview && <button onClick={onDiff}><History size={13} />修复前后对比</button>}</div></header>
+    <header><div><span>WRITING LOOP</span><h3>章节闭环验收</h3></div><div className="chapter-acceptance-actions"><strong>恢复点：{resumeAt}</strong><button disabled={busy || !chapter.content.trim()} onClick={onRebuild}><RefreshCw size={13} />一键重建本章记忆并复审</button>{chapter.repairReview && <button onClick={onDiff}><History size={13} />修复前后对比</button>}</div></header>
     <div className="chapter-acceptance-steps">{stages.map((stage) => <div key={stage.label} className={stage.done ? "done" : "pending"}><i>{stage.done ? <Check size={13} /> : <span />}</i><b>{stage.label}</b><small>{stage.detail}</small></div>)}</div>
     {scores.length > 0 && <div className="chapter-quality-scores">{scores.map(([label, score]) => <div key={label}><span>{label}</span><b>{score}</b><i><em style={{ width: `${score}%` }} /></i></div>)}</div>}
     {!lengthPassed && <p className="chapter-acceptance-warning"><CircleAlert size={14} />正文尚未达到 70% 验收线，不能计为真正完成。</p>}
@@ -860,7 +863,8 @@ export default function Home() {
         working = reserveAIRequestUsage(working);
         setWorkspace(working);
         const payload = await callAIText(buildRollingAuditPrompt(working, chapter.number), 8192);
-        const issues = [...parseRollingAudit(payload.text!, id(`manual-audit-${chapter.number}`), chapter.number), ...buildCharacterContinuityIssues(working, chapter.number)];
+        const auditRunId = id(`manual-audit-${chapter.number}`);
+        const issues = [...buildChapterPlanDeviationIssues(working, chapter.number, auditRunId), ...buildMemoryEvidenceIssues(working, chapter.number, auditRunId), ...parseRollingAudit(payload.text!, auditRunId, chapter.number), ...buildCharacterContinuityIssues(working, chapter.number)];
         working = applyAITokenUsage({
           ...working,
           issues: [...working.issues, ...issues],
@@ -918,7 +922,8 @@ export default function Home() {
     working = reserveAIRequestUsage(working);
     setWorkspace(working);
     const auditPayload = await callAIText(buildRollingAuditPrompt(working, chapter.number), 8192);
-    const newIssues = parseRollingAudit(auditPayload.text!, id("repair-audit"), chapter.number);
+    const auditRunId = id("repair-audit");
+    const newIssues = [...buildChapterQualityIssues(working, chapter.number, auditRunId), ...buildChapterPlanDeviationIssues(working, chapter.number, auditRunId), ...buildMemoryEvidenceIssues(working, chapter.number, auditRunId), ...buildCharacterContinuityIssues(working, chapter.number), ...parseRollingAudit(auditPayload.text!, auditRunId, chapter.number)];
     working = applyAITokenUsage(replaceChapterAuditIssues(working, chapter.number, newIssues), auditPayload.usage);
     const quality = evaluateChapterQuality(working, chapter.number);
     const accepted = !newIssues.some((entry) => entry.severity === "错误") && quality.length >= 70 && quality.overall >= 70;
@@ -927,7 +932,7 @@ export default function Home() {
       ...working,
       chapters: working.chapters.map((item) => item.id === chapter.id ? {
         ...item, quality, status: accepted ? "已完成" : "修订中",
-        generation: item.generation ? { ...item.generation, status: accepted ? "accepted" : "blocked", acceptedAt: accepted ? finishedAt : undefined } : { runId: working.automation.runId || `manual-${Date.now()}`, status: accepted ? "accepted" : "blocked", completedSegments: Math.max(1, Math.ceil(item.targetWords / 2200)), baseRevision: item.revision || 0, repairAttempts: 1, acceptedAt: accepted ? finishedAt : undefined },
+        generation: item.generation ? { ...item.generation, status: accepted ? "accepted" : "blocked", acceptedAt: accepted ? finishedAt : undefined } : { runId: working.automation.runId || `manual-${Date.now()}`, status: accepted ? "accepted" : "blocked", completedSegments: 1, baseRevision: item.revision || 0, repairAttempts: 1, acceptedAt: accepted ? finishedAt : undefined },
       } : item),
       canon: { ...working.canon, lastAuditedChapter: Math.max(working.canon.lastAuditedChapter, chapter.number) },
       automation: {
@@ -969,10 +974,10 @@ export default function Home() {
       working = applyAITokenUsage(applyChapterMemory(working, chapter.id, parseChapterMemory(memoryPayload.text!)), memoryPayload.usage);
       setAuditProgress(`正在复审第 ${chapter.number} 章`); working = reserveAIRequestUsage(working); setWorkspace(working);
       const auditPayload = await callAIText(buildRollingAuditPrompt(working, chapter.number), 8192);
-      const newIssues = parseRollingAudit(auditPayload.text!, id("resync-audit"), chapter.number);
+      const auditRunId = id("resync-audit"); const newIssues = [...buildChapterQualityIssues(working, chapter.number, auditRunId), ...buildChapterPlanDeviationIssues(working, chapter.number, auditRunId), ...buildMemoryEvidenceIssues(working, chapter.number, auditRunId), ...buildCharacterContinuityIssues(working, chapter.number), ...parseRollingAudit(auditPayload.text!, auditRunId, chapter.number)];
       working = applyAITokenUsage(replaceChapterAuditIssues(working, chapter.number, newIssues), auditPayload.usage);
       const quality = evaluateChapterQuality(working, chapter.number); const accepted = !newIssues.some((item) => item.severity === "错误") && quality.length >= 70 && quality.overall >= 70; const finishedAt = new Date().toISOString();
-      working = { ...working, chapters: working.chapters.map((item) => item.id === chapter.id ? { ...item, quality, status: accepted ? "已完成" : "修订中", generation: item.generation ? { ...item.generation, status: accepted ? "accepted" : "blocked", acceptedAt: accepted ? finishedAt : undefined } : { runId: working.automation.runId || `manual-${Date.now()}`, status: accepted ? "accepted" : "blocked", completedSegments: Math.max(1, Math.ceil(item.targetWords / 2200)), baseRevision: item.revision || 0, acceptedAt: accepted ? finishedAt : undefined } } : item), automation: { ...working.automation, generatedChapterIds: accepted ? [...new Set([...working.automation.generatedChapterIds, chapter.id])] : working.automation.generatedChapterIds.filter((value) => value !== chapter.id), taskLog: (working.automation.taskLog || []).map((task) => task.id === taskId ? { ...task, status: "completed" as const, finishedAt } : task) } };
+      working = { ...working, chapters: working.chapters.map((item) => item.id === chapter.id ? { ...item, quality, status: accepted ? "已完成" : "修订中", generation: item.generation ? { ...item.generation, status: accepted ? "accepted" : "blocked", acceptedAt: accepted ? finishedAt : undefined } : { runId: working.automation.runId || `manual-${Date.now()}`, status: accepted ? "accepted" : "blocked", completedSegments: 1, baseRevision: item.revision || 0, acceptedAt: accepted ? finishedAt : undefined } } : item), automation: { ...working.automation, generatedChapterIds: accepted ? [...new Set([...working.automation.generatedChapterIds, chapter.id])] : working.automation.generatedChapterIds.filter((value) => value !== chapter.id), taskLog: (working.automation.taskLog || []).map((task) => task.id === taskId ? { ...task, status: "completed" as const, finishedAt } : task) } };
       setWorkspace(working); notify(accepted ? "本章记忆已重建并通过复审" : "记忆已重建，复审仍有问题需要处理");
     } catch (error) { setWorkspace({ ...working, automation: { ...working.automation, taskLog: (working.automation.taskLog || []).map((task) => task.id === taskId ? { ...task, status: "failed" as const, finishedAt: new Date().toISOString(), error: error instanceof Error ? error.message : "重建失败" } : task) } }); notify(error instanceof Error ? error.message : "重建失败"); }
     finally { setAuditProgress(""); setRebuildingChapterId(""); setAiBusy(false); }
@@ -1284,6 +1289,7 @@ export default function Home() {
     const severity = (value: ConsistencyIssue["severity"]) => openIssues.filter((item) => item.severity === value).length;
     const openThreads = workspace.canon.threads.filter((item) => item.status === "open");
     const latestCharacterStates = [...workspace.canon.characterStates].sort((a, b) => b.chapterNumber - a.chapterNumber).slice(0, 4);
+    const memoryChapters = [...workspace.chapters].filter((item) => item.content.trim()).sort((a, b) => a.number - b.number);
     return (
       <div className="view">
         <Heading eyebrow="CONTINUITY AUDIT" title="一致性检查" description="把疑点变成可处理的清单，区分真正冲突与有意伏笔。">
@@ -1304,6 +1310,14 @@ export default function Home() {
             <div><h3>人物最新状态</h3>{latestCharacterStates.length ? latestCharacterStates.map((item, index) => <p key={`${item.name}-${item.chapterNumber}-${index}`}><b>{item.name}</b><span>{item.state}</span><small>第 {item.chapterNumber} 章</small></p>) : <em>完成章节后，AI 会在这里沉淀人物状态。</em>}</div>
             <div><h3>待回收线索</h3>{openThreads.length ? openThreads.slice(0, 4).map((item) => <p key={item.id}><b>{item.title}</b><span>尚未解决</span><small>始于第 {item.openedChapter} 章</small></p>) : <em>当前没有未收束线索。</em>}</div>
           </div>
+        </section>
+        <section className="memory-maintenance card">
+          <div className="card-heading"><div><span>MEMORY MAINTENANCE</span><h2>章节记忆维护</h2></div><small>旧记忆重建后才会进入可信事实账本</small></div>
+          <div className="memory-maintenance-list">{memoryChapters.length ? memoryChapters.map((item) => {
+            const evidenceBacked = item.memory?.evidenceVersion === 1;
+            const pendingIssues = openIssues.filter((issue) => issue.chapterNumber === item.number).length;
+            return <article key={item.id} className={item.id === chapterId ? "is-current" : ""}><button className="memory-chapter-link" onClick={() => { setChapterId(item.id); setActive("章节"); }}><b>第 {item.number} 章 · {item.title}</b><small>{evidenceBacked ? "已有正文证据记忆" : item.memory ? "旧版记忆，建议重建" : "尚未建立记忆"}{pendingIssues ? ` · ${pendingIssues} 项待处理` : ""}</small></button><span className={evidenceBacked ? "memory-trust trusted" : "memory-trust pending"}>{evidenceBacked ? "已验证" : "待重建"}</span><button className="primary-button compact" disabled={aiBusy || rebuildingChapterId === item.id} onClick={() => void rebuildChapterMemoryAndAudit(item)}>{rebuildingChapterId === item.id ? <RefreshCw className="spin" size={15} /> : <RefreshCw size={15} />}{rebuildingChapterId === item.id ? "正在重建并复审" : "一键重建本章记忆并复审"}</button></article>;
+          }) : <Empty icon={<BrainCircuit />} title="还没有可重建的章节" text="章节有正文后，会在这里显示记忆重建入口。" />}</div>
         </section>
         <section className="audit-list card"><div className="card-heading"><div><span>审校结果</span><h2>待确认内容</h2></div><small>{openIssues.length} 项</small></div>{openIssues.length ? openIssues.map((item) => <article className="issue-row" key={item.id}><span className={`issue-icon severity-${item.severity}`}><CircleAlert size={17} /></span><div className="issue-content"><div><i className={`severity-label severity-${item.severity}`}>{item.severity}</i><i>{item.category}</i><small>{item.location}</small>{item.source && <i>{item.source === "ai" ? "AI 逐章检查" : "规则扫描"}</i>}</div><h3>{item.title}</h3><p>{item.description}</p>{item.evidence && <p className="issue-evidence"><b>正文证据：</b>{item.evidence}</p>}{item.suggestedFix && <p className="issue-suggestion"><b>修复建议：</b>{item.suggestedFix}</p>}</div><div className="issue-actions"><button className="primary-button compact" disabled={aiBusy || !resolveIssueChapterNumber(item) || !workspace.chapters.some((entry) => entry.number === resolveIssueChapterNumber(item) && entry.content.trim())} title={!resolveIssueChapterNumber(item) ? "该问题涉及全书或多个章节，需要先定位到单章" : "自动保存旧稿、修订正文、重建记忆并再次检查"} onClick={() => repairConsistencyIssue(item)}>{repairingIssueId === item.id ? <RefreshCw className="spin" size={15} /> : <WandSparkles size={15} />}{repairingIssueId === item.id ? "正在修复" : resolveIssueChapterNumber(item) ? "AI 一键修复" : "需先定位章节"}</button><button className="secondary-button compact" disabled={aiBusy} onClick={() => setWorkspace((current) => ({ ...current, issues: current.issues.map((issue) => issue.id === item.id ? { ...issue, resolved: true } : issue) }))}><Check size={15} />标记已处理</button></div></article>) : <Empty icon={<ShieldCheck />} title="当前没有待处理问题" text="运行逐章 AI 检查后，会按章节给出正文证据和一键修复入口。" />}</section>
       </div>
