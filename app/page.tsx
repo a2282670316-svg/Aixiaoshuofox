@@ -78,14 +78,18 @@ import {
   detectAIStage,
   evaluateChapterQuality,
   latestCharacterTracking,
+  MAX_AUTOMATED_REPAIR_ATTEMPTS,
   parseChapterMemory,
   parseConsistencyRepair,
   parseRollingAudit,
   removeChapterFromCanon,
   replaceChapterAuditIssues,
+  stabilizeRepairAuditIssues,
+  validateGeneratedChapterDraft,
 } from "@/lib/auto-novel";
 import { cloneWorkspace, createBlankWorkspace, mergeAutomationWorkspace, normalizeWorkspaceData, pruneWorkspaceHistory } from "@/lib/workspace";
 import { MAX_STAGE_OUTPUT_TOKENS } from "@/lib/ai-limits";
+import { GPT55_STAGE_PRESETS, resolveStageRequestOptions } from "@/lib/ai-stage-config";
 import { readPersistentValue, removePersistentValue, writePersistentValue } from "@/lib/browser-storage";
 import { reconcileInterruptedTasks } from "@/lib/workspace-recovery";
 import type {
@@ -173,7 +177,7 @@ function ChapterAcceptance({ chapter, issues, busy, onRebuild, onDiff }: { chapt
   const completedSegments = Math.min(1, chapter.generation?.completedSegments || 0);
   const chapterIssues = issues.filter((issue) => !issue.resolved && issue.chapterNumber === chapter.number);
   const errors = chapterIssues.filter((issue) => issue.severity === "错误").length;
-  const length = countWords(chapter.content); const lengthPassed = length >= chapter.targetWords * 0.9 && length <= chapter.targetWords * 1.1; const status = chapter.generation?.status;
+  const length = countWords(chapter.content); const lengthPassed = length >= chapter.targetWords; const status = chapter.generation?.status;
   const stages = [
     { label: "正文", done: completedSegments >= segments || lengthPassed, detail: `${length.toLocaleString("zh-CN")} / ${chapter.targetWords.toLocaleString("zh-CN")} 字` },
     { label: "记忆", done: Boolean(chapter.memory), detail: chapter.memory ? "事实已写入账本" : "等待提取事实" },
@@ -187,7 +191,7 @@ function ChapterAcceptance({ chapter, issues, busy, onRebuild, onDiff }: { chapt
     <header><div><span>WRITING LOOP</span><h3>章节闭环验收</h3></div><div className="chapter-acceptance-actions"><strong>恢复点：{resumeAt}</strong><button disabled={busy || !chapter.content.trim()} onClick={onRebuild}><RefreshCw size={13} />一键重建本章记忆并复审</button>{chapter.repairReview && <button onClick={onDiff}><History size={13} />修复前后对比</button>}</div></header>
     <div className="chapter-acceptance-steps">{stages.map((stage) => <div key={stage.label} className={stage.done ? "done" : "pending"}><i>{stage.done ? <Check size={13} /> : <span />}</i><b>{stage.label}</b><small>{stage.detail}</small></div>)}</div>
     {scores.length > 0 && <div className="chapter-quality-scores">{scores.map(([label, score]) => <div key={label}><span>{label}</span><b>{score}</b><i><em style={{ width: `${score}%` }} /></i></div>)}</div>}
-    {!lengthPassed && <p className="chapter-acceptance-warning"><CircleAlert size={14} />正文尚未达到 70% 验收线，不能计为真正完成。</p>}
+    {!lengthPassed && <p className="chapter-acceptance-warning"><CircleAlert size={14} />{"\u6b63\u6587\u5c11\u4e8e\u76ee\u6807\u5b57\u6570\uff0c\u4e0d\u80fd\u8ba1\u4e3a\u771f\u6b63\u5b8c\u6210\uff1b\u8d85\u8fc7\u76ee\u6807\u5b57\u6570\u53ef\u4ee5\u6b63\u5e38\u9a8c\u6536\u3002"}</p>}
     {errors > 0 && <p className="chapter-acceptance-warning"><CircleAlert size={14} />仍有 {errors} 项严重错误，闭环会先修复或暂停，不会直接写下一章。</p>}
   </section>;
 }
@@ -235,6 +239,8 @@ export default function Home() {
   const activeCloudRevisionRef = useRef<number | null>(null);
   const cloudBootstrappedRef = useRef(false);
   const cloudSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const workspaceRef = useRef(workspace);
+  workspaceRef.current = workspace;
   const aiConfigured = Boolean(config.baseUrl.trim() && config.model.trim());
 
   useEffect(() => {
@@ -347,14 +353,33 @@ export default function Home() {
     if (!hydrated || !activeCloudProjectId || !backgroundActive) return;
     const sync = async () => {
       try {
-        const response = await fetch(`/api/automation/background?projectId=${encodeURIComponent(activeCloudProjectId)}`);
+        const encodedProjectId = encodeURIComponent(activeCloudProjectId);
+        const summaryResponse = await fetch(`/api/automation/background?projectId=${encodedProjectId}&summary=1`);
+        const summary = await summaryResponse.json() as {
+          project?: { revision?: number };
+          automation?: { phase?: string } | null;
+          active?: { status?: string } | null;
+          configuration?: BackgroundConfiguration;
+          error?: string;
+        };
+        if (!summaryResponse.ok || !summary.project) throw new Error(summary.error || "读取后台进度失败");
+        if (summary.configuration) setBackgroundConfiguration(summary.configuration);
+        const responseActive = ["queued", "processing", "in_progress"].includes(summary.active?.status || "");
+        const revisionChanged = Boolean(summary.project.revision && summary.project.revision !== activeCloudRevisionRef.current);
+        const needsFullSync = revisionChanged || !responseActive || summary.automation?.phase !== "writing";
+        if (!needsFullSync) {
+          setBackgroundActive(true);
+          return;
+        }
+
+        const response = await fetch(`/api/automation/background?projectId=${encodedProjectId}`);
         const payload = await response.json() as { project?: { workspace?: unknown; revision?: number }; active?: { status?: string } | null; configuration?: BackgroundConfiguration; error?: string };
         if (!response.ok || !payload.project?.workspace) throw new Error(payload.error || "读取后台进度失败");
         const next = normalizeWorkspaceData(payload.project.workspace, DEMO_WORKSPACE, { preserveWritingPhase: true });
         setWorkspace((current) => mergeAutomationWorkspace(current, next));
         if (payload.project.revision) activeCloudRevisionRef.current = payload.project.revision;
         if (payload.configuration) setBackgroundConfiguration(payload.configuration);
-        const stillActive = ["queued", "processing"].includes(payload.active?.status || "") && next.automation.phase === "writing";
+        const stillActive = ["queued", "processing", "in_progress"].includes(payload.active?.status || "") && next.automation.phase === "writing";
         setBackgroundActive(stillActive);
         if (!stillActive && ["completed", "paused"].includes(next.automation.phase)) {
           setToast(next.automation.phase === "completed" ? "云端已完成全书初稿" : "云端已完成所选章节范围");
@@ -372,7 +397,7 @@ export default function Home() {
 
   useEffect(() => {
     if (!hydrated) return;
-    const saveDelay = ["writing", "paused", "error", "completed"].includes(workspace.automation.phase) ? 0 : 350;
+    const saveDelay = workspace.automation.phase === "writing" ? 180 : 500;
     const timer = window.setTimeout(() => {
       void writePersistentValue(WORKSPACE_KEY, pruneWorkspaceHistory(workspace)).catch(() => {
         window.setTimeout(() => setToast("浏览器存储空间不足，请立即导出完整备份"), 0);
@@ -380,6 +405,15 @@ export default function Home() {
     }, saveDelay);
     return () => window.clearTimeout(timer);
   }, [workspace, hydrated]);
+
+  useEffect(() => {
+    if (!hydrated) return;
+    const flushWorkspace = () => {
+      void writePersistentValue(WORKSPACE_KEY, pruneWorkspaceHistory(workspaceRef.current));
+    };
+    window.addEventListener("pagehide", flushWorkspace);
+    return () => window.removeEventListener("pagehide", flushWorkspace);
+  }, [hydrated]);
 
   useEffect(() => {
     if (!hydrated) return;
@@ -414,7 +448,7 @@ export default function Home() {
   const chapter = workspace.chapters.find((item) => item.id === chapterId) ?? workspace.chapters[0];
   const character = workspace.characters.find((item) => item.id === characterId) ?? workspace.characters[0];
   const totalWords = workspace.chapters.reduce((sum, item) => sum + countWords(item.content), 0);
-  const completed = workspace.chapters.filter((item) => item.status === "已完成" && (item.generation?.status === "accepted" || countWords(item.content) >= item.targetWords * 0.7)).length;
+  const completed = workspace.chapters.filter((item) => item.status === "\u5df2\u5b8c\u6210" && (item.generation?.status === "accepted" || countWords(item.content) >= item.targetWords)).length;
   const unresolved = workspace.issues.filter((item) => !item.resolved).length;
 
   const notify = (message: string) => {
@@ -549,6 +583,29 @@ export default function Home() {
       notify("云端后台写作已暂停");
     } catch (error) {
       notify(error instanceof Error ? error.message : "暂停后台写作失败");
+    } finally {
+      setBackgroundBusy(false);
+    }
+  };
+
+  const cancelBackgroundWriting = async () => {
+    const projectId = activeCloudProjectIdRef.current;
+    if (!projectId) return notify("\u8bf7\u5148\u4fdd\u5b58\u4e3a\u4e91\u7aef\u4f5c\u54c1");
+    if (!window.confirm("\u786e\u5b9a\u53d6\u6d88\u5f53\u524d\u4e91\u7aef\u540e\u53f0\u4efb\u52a1\u5417\uff1f\u5df2\u5b8c\u6210\u7684\u7ae0\u8282\u548c\u68c0\u67e5\u70b9\u4f1a\u4fdd\u7559\uff0c\u5f53\u524d\u6a21\u578b\u8bf7\u6c42\u4e0e\u540e\u7eed\u6392\u961f\u4f1a\u505c\u6b62\u3002")) return;
+    setBackgroundBusy(true);
+    try {
+      const response = await fetch("/api/automation/background", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ projectId, action: "cancel" }),
+      });
+      const payload = await response.json().catch(() => ({})) as { workspace?: unknown; error?: string };
+      if (!response.ok) throw new Error(payload.error || "\u53d6\u6d88\u540e\u53f0\u4efb\u52a1\u5931\u8d25");
+      if (payload.workspace) setWorkspace(normalizeWorkspaceData(payload.workspace, DEMO_WORKSPACE));
+      setBackgroundActive(false);
+      notify("\u4e91\u7aef\u540e\u53f0\u4efb\u52a1\u5df2\u53d6\u6d88\uff0c\u5df2\u5b8c\u6210\u5185\u5bb9\u5df2\u4fdd\u7559");
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "\u53d6\u6d88\u540e\u53f0\u4efb\u52a1\u5931\u8d25");
     } finally {
       setBackgroundBusy(false);
     }
@@ -770,13 +827,18 @@ export default function Home() {
     setAiBusy(true);
     setAssistantOpen(true);
     try {
+      const prompt = buildUserPrompt(task, instruction, workspace, targetChapterId);
+      const stage = detectAIStage(prompt);
+      const stageConfig = workspace.automation.stageModels?.[stage];
       const response = await fetch("/api/ai", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           ...config,
-          prompt: buildUserPrompt(task, instruction, workspace, targetChapterId),
-          maxOutputTokens: 16_384,
+          ...resolveStageRequestOptions(stageConfig, config.temperature, 16_384),
+          model: stageConfig?.model?.trim() || config.model,
+          stage,
+          prompt,
         }),
       });
       const payload = await response.json() as { text?: string; error?: string; usage?: Record<string, unknown> };
@@ -794,10 +856,18 @@ export default function Home() {
   };
 
   const callAIText = async (prompt: string, maxOutputTokens = 16_384) => {
+    const stage = detectAIStage(prompt);
+    const stageConfig = workspace.automation.stageModels?.[stage];
     const response = await fetch("/api/ai", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ...config, model: workspace.automation.stageModels?.[detectAIStage(prompt)]?.model?.trim() || config.model, prompt, maxOutputTokens: workspace.automation.stageModels?.[detectAIStage(prompt)]?.maxOutputTokens || maxOutputTokens }),
+      body: JSON.stringify({
+        ...config,
+        ...resolveStageRequestOptions(stageConfig, config.temperature, maxOutputTokens),
+        model: stageConfig?.model?.trim() || config.model,
+        stage,
+        prompt,
+      }),
     });
     const payload = await response.json().catch(() => ({})) as { text?: string; error?: string; usage?: Record<string, unknown> };
     if (!response.ok || !payload.text) throw new Error(payload.error || "AI 请求失败");
@@ -864,7 +934,7 @@ export default function Home() {
         setWorkspace(working);
         const payload = await callAIText(buildRollingAuditPrompt(working, chapter.number), 8192);
         const auditRunId = id(`manual-audit-${chapter.number}`);
-        const issues = [...buildChapterPlanDeviationIssues(working, chapter.number, auditRunId), ...buildMemoryEvidenceIssues(working, chapter.number, auditRunId), ...parseRollingAudit(payload.text!, auditRunId, chapter.number), ...buildCharacterContinuityIssues(working, chapter.number)];
+        const issues = [...buildChapterPlanDeviationIssues(working, chapter.number, auditRunId), ...buildMemoryEvidenceIssues(working, chapter.number, auditRunId), ...parseRollingAudit(payload.text!, auditRunId, chapter.number, chapter.content), ...buildCharacterContinuityIssues(working, chapter.number)];
         working = applyAITokenUsage({
           ...working,
           issues: [...working.issues, ...issues],
@@ -894,6 +964,7 @@ export default function Home() {
     const chapterNumber = issue.chapterNumber;
     const chapter = chapterNumber ? source.chapters.find((item) => item.number === chapterNumber) : undefined;
     if (!chapter?.content.trim()) throw new Error("该问题没有可定位的章节正文");
+    const repairBaselineIssues = [...source.issues.filter((entry) => entry.chapterNumber === chapter.number && entry.severity === "\u9519\u8bef"), issue];
     let working = source;
     const taskId = id("task");
     working = { ...working, automation: { ...working.automation, taskLog: [{ id: taskId, runId: working.automation.runId, kind: "repair", label: `修复第 ${chapter.number} 章`, status: "running" as const, chapterNumber: chapter.number, startedAt: new Date().toISOString() }, ...(working.automation.taskLog || [])].slice(0, 500) } };
@@ -901,15 +972,36 @@ export default function Home() {
     working = reserveAIRequestUsage(working);
     setWorkspace(working);
     const repairOutputTokens = Math.min(32_768, Math.max(16_384, Math.ceil(chapter.content.replace(/\s+/g, "").length * 2 + 2_048)));
-    const repairPayload = await callAIText(buildConsistencyRepairPrompt(working, issue, chapter), repairOutputTokens);
-    const repair = parseConsistencyRepair(repairPayload.text!);
+    const repairPrompt = buildConsistencyRepairPrompt(working, issue, chapter);
+    const repairUsages = [] as NonNullable<Awaited<ReturnType<typeof callAIText>>["usage"]>[];
+    let repairPayload = await callAIText(repairPrompt, repairOutputTokens);
+    if (repairPayload.usage) repairUsages.push(repairPayload.usage);
+    const parseValidatedRepair = (value: string) => {
+      const parsed = parseConsistencyRepair(value, chapter.content);
+      const validationIssues = validateGeneratedChapterDraft(chapter, parsed.revisedContent);
+      if (validationIssues.length) throw new Error(`\u4fee\u590d\u540e\u7684\u5b8c\u6574\u6b63\u6587\u672a\u901a\u8fc7\u68c0\u67e5\uff1a${validationIssues.join("\uff1b")}`);
+      return parsed;
+    };
+    let repair;
+    try {
+      repair = parseValidatedRepair(repairPayload.text!);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "\u4fee\u590d\u7ed3\u679c\u683c\u5f0f\u9519\u8bef";
+      working = reserveAIRequestUsage(working);
+      setWorkspace(working);
+      repairPayload = await callAIText(`\u8bf7\u4fee\u6b63\u4e0b\u9762\u7684\u4fee\u590d\u7ed3\u679c\u3002\u5fc5\u987b\u8fd4\u56de\u5408\u6cd5 JSON\uff0c\u4f7f\u7528 edits \u6570\u7ec4\u8fd4\u56de\u5c40\u90e8\u66ff\u6362\uff1boldText \u5fc5\u987b\u662f\u539f\u6587\u4e2d\u552f\u4e00\u7684\u7cbe\u786e\u6587\u672c\uff0c\u4e0d\u8981\u8fd4\u56de\u5b8c\u6574\u7ae0\u8282\u3001Markdown \u6216\u89e3\u91ca\u3002\n\n\u3010\u9519\u8bef\u3011\n${reason}\n\n\u3010\u539f\u4fee\u590d\u4efb\u52a1\u3011\n${repairPrompt}\n\n\u3010\u5f85\u4fee\u6b63\u8f93\u51fa\u3011\n${repairPayload.text}`, repairOutputTokens);
+      if (repairPayload.usage) repairUsages.push(repairPayload.usage);
+      repair = parseValidatedRepair(repairPayload.text!);
+    }
+    const repairAttempts = (chapter.generation?.repairAttempts || 0) + 1;
     const versionId = id("version");
+    working = repairUsages.reduce((state, usage) => applyAITokenUsage(state, usage), working);
     working = removeChapterFromCanon(working, chapter.number);
-    working = applyAITokenUsage({
+    working = {
       ...working,
-      chapters: working.chapters.map((item) => item.id === chapter.id ? { ...item, content: repair.revisedContent, status: "修订中", memory: undefined, quality: undefined, revision: (item.revision || 0) + 1, updatedAt: new Date().toISOString(), repairReview: { beforeVersionId: versionId, changeSummary: repair.changeSummary, createdAt: new Date().toISOString(), status: "pending" } } : item),
-      versions: [{ id: versionId, chapterId: chapter.id, title: chapter.title, content: chapter.content, createdAt: new Date().toISOString(), note: `AI 修复前存档：${issue.title}` }, ...working.versions],
-    }, repairPayload.usage);
+      chapters: working.chapters.map((item) => item.id === chapter.id ? { ...item, content: repair.revisedContent, status: "\u4fee\u8ba2\u4e2d", memory: undefined, quality: undefined, revision: (item.revision || 0) + 1, updatedAt: new Date().toISOString(), repairReview: { beforeVersionId: versionId, changeSummary: repair.changeSummary, createdAt: new Date().toISOString(), status: "pending" } } : item),
+      versions: [{ id: versionId, chapterId: chapter.id, title: chapter.title, content: chapter.content, createdAt: new Date().toISOString(), note: `AI \u4fee\u590d\u524d\u5b58\u6863\uff1a${issue.title}` }, ...working.versions],
+    };
 
     setAuditProgress(`正在重建第 ${chapter.number} 章事实记忆`);
     working = reserveAIRequestUsage(working);
@@ -917,22 +1009,37 @@ export default function Home() {
     const revisedChapter = working.chapters.find((item) => item.id === chapter.id)!;
     const memoryPayload = await callAIText(buildChapterMemoryPrompt(working, revisedChapter), 8192);
     working = applyAITokenUsage(applyChapterMemory(working, chapter.id, parseChapterMemory(memoryPayload.text!)), memoryPayload.usage);
+    const memoryCheckRunId = id("memory-check");
+    const memoryCheckIssues = [
+      ...buildMemoryEvidenceIssues(working, chapter.number, memoryCheckRunId),
+      ...buildChapterPlanDeviationIssues(working, chapter.number, memoryCheckRunId),
+    ];
+    const remainingAfterMemory = working.automation.maxRequests - working.automation.usage.requestCount;
+    if (memoryCheckIssues.length && remainingAfterMemory >= 2) {
+      setAuditProgress(`\u6b63\u5728\u6821\u6b63\u7b2c ${chapter.number} \u7ae0\u8bb0\u5fc6\u8bc1\u636e`);
+      working = reserveAIRequestUsage(working);
+      setWorkspace(working);
+      const retryMemoryPayload = await callAIText(`${buildChapterMemoryPrompt(working, revisedChapter)}\n\n\u4e0a\u4e00\u6b21\u8bb0\u5fc6\u63d0\u53d6\u5b58\u5728\u4ee5\u4e0b\u8bc1\u636e\u6216\u7ae0\u7eb2\u8986\u76d6\u95ee\u9898\uff1a\n${memoryCheckIssues.map((entry) => `- ${entry.title}\uff1a${entry.description}`).join("\n")}\n\n\u8bf7\u91cd\u65b0\u8fd4\u56de\u5b8c\u6574 JSON\u3002quote \u5fc5\u987b\u9010\u5b57\u590d\u5236\u6b63\u6587\u4e2d\u8fde\u7eed\u539f\u53e5\uff1b\u5982\u6b63\u6587\u786e\u5b9e\u6ca1\u6709\u6267\u884c\u67d0\u9879\u7ae0\u7eb2\uff0c\u5c06\u5176 status \u8bbe\u4e3a missing\uff0c\u4e0d\u5f97\u7f16\u9020\u8bc1\u636e\u3002`, 8192);
+      const cleanedForMemoryRetry = removeChapterFromCanon(working, chapter.number);
+      working = applyAITokenUsage(applyChapterMemory(cleanedForMemoryRetry, chapter.id, parseChapterMemory(retryMemoryPayload.text!)), retryMemoryPayload.usage);
+    }
 
     setAuditProgress(`正在复查第 ${chapter.number} 章`);
     working = reserveAIRequestUsage(working);
     setWorkspace(working);
     const auditPayload = await callAIText(buildRollingAuditPrompt(working, chapter.number), 8192);
     const auditRunId = id("repair-audit");
-    const newIssues = [...buildChapterQualityIssues(working, chapter.number, auditRunId), ...buildChapterPlanDeviationIssues(working, chapter.number, auditRunId), ...buildMemoryEvidenceIssues(working, chapter.number, auditRunId), ...buildCharacterContinuityIssues(working, chapter.number), ...parseRollingAudit(auditPayload.text!, auditRunId, chapter.number)];
+    const rawIssues = [...buildChapterQualityIssues(working, chapter.number, auditRunId), ...buildChapterPlanDeviationIssues(working, chapter.number, auditRunId), ...buildMemoryEvidenceIssues(working, chapter.number, auditRunId), ...buildCharacterContinuityIssues(working, chapter.number), ...parseRollingAudit(auditPayload.text!, auditRunId, chapter.number, working.chapters.find((item) => item.number === chapter.number)?.content || chapter.content)];
+    const newIssues = stabilizeRepairAuditIssues(repairBaselineIssues, rawIssues);
     working = applyAITokenUsage(replaceChapterAuditIssues(working, chapter.number, newIssues), auditPayload.usage);
     const quality = evaluateChapterQuality(working, chapter.number);
-    const accepted = !newIssues.some((entry) => entry.severity === "错误") && quality.length >= 70 && quality.overall >= 70;
+    const accepted = !newIssues.some((entry) => entry.severity === "错误") && quality.length >= 100 && quality.overall >= 70;
     const finishedAt = new Date().toISOString();
     working = {
       ...working,
       chapters: working.chapters.map((item) => item.id === chapter.id ? {
         ...item, quality, status: accepted ? "已完成" : "修订中",
-        generation: item.generation ? { ...item.generation, status: accepted ? "accepted" : "blocked", acceptedAt: accepted ? finishedAt : undefined } : { runId: working.automation.runId || `manual-${Date.now()}`, status: accepted ? "accepted" : "blocked", completedSegments: 1, baseRevision: item.revision || 0, repairAttempts: 1, acceptedAt: accepted ? finishedAt : undefined },
+        generation: item.generation ? { ...item.generation, status: accepted ? "accepted" : "audited", repairAttempts, acceptedAt: accepted ? finishedAt : undefined } : { runId: working.automation.runId || `manual-${Date.now()}`, status: accepted ? "accepted" : "audited", completedSegments: 1, baseRevision: item.revision || 0, repairAttempts, acceptedAt: accepted ? finishedAt : undefined },
       } : item),
       canon: { ...working.canon, lastAuditedChapter: Math.max(working.canon.lastAuditedChapter, chapter.number) },
       automation: {
@@ -944,6 +1051,39 @@ export default function Home() {
     return { working, accepted, newIssues };
   };
 
+  const repairChapterUntilStable = async (source: WorkspaceData, issue: ConsistencyIssue) => {
+    let working = source;
+    let currentIssue = issue;
+    let result: Awaited<ReturnType<typeof repairIssueAgainst>> | undefined;
+    let passes = 0;
+    while (passes < MAX_AUTOMATED_REPAIR_ATTEMPTS) {
+      const remainingRequests = working.automation.maxRequests - working.automation.usage.requestCount;
+      if (remainingRequests < 3) break;
+      result = await repairIssueAgainst(working, currentIssue);
+      working = result.working;
+      passes += 1;
+      if (result.accepted) return { ...result, passes };
+      const remainingErrors = result.newIssues.filter((entry) => entry.severity === "\u9519\u8bef");
+      const chapterNumber = currentIssue.chapterNumber;
+      const chapter = chapterNumber ? working.chapters.find((item) => item.number === chapterNumber) : undefined;
+      const quality = chapter?.quality;
+      currentIssue = remainingErrors.length ? {
+        ...remainingErrors[0],
+        chapterNumber,
+        title: `\u7b2c ${chapterNumber} \u7ae0\u7b2c ${passes + 1} \u8f6e\u81ea\u52a8\u4fee\u590d\uff08${remainingErrors.length} \u9879\uff09`,
+        description: remainingErrors.map((entry, index) => `${index + 1}. ${entry.title}\uff1a${entry.description}`).join("\n"),
+        suggestedFix: remainingErrors.map((entry) => entry.suggestedFix).filter(Boolean).join("\uff1b"),
+      } : {
+        ...currentIssue,
+        chapterNumber,
+        title: `\u7b2c ${chapterNumber} \u7ae0\u7efc\u5408\u8d28\u91cf\u7ee7\u7eed\u4fee\u590d`,
+        description: `\u5f53\u524d\u8d28\u91cf ${quality?.overall || 0} \u5206\u3002${(quality?.notes || []).join("\uff1b")}`,
+        suggestedFix: (quality?.notes || []).join("\uff1b"),
+      };
+    }
+    return { ...(result || { working, accepted: false, newIssues: [] }), working, passes };
+  };
+
   const repairConsistencyIssue = async (issue: ConsistencyIssue) => {
     const chapterNumber = resolveIssueChapterNumber(issue);
     const chapter = chapterNumber ? workspace.chapters.find((item) => item.number === chapterNumber) : undefined;
@@ -953,9 +1093,9 @@ export default function Home() {
     if (!window.confirm(`AI 将修订第 ${chapter.number} 章，并重建记忆、复审和生成差异记录。是否继续？`)) return;
     setAiBusy(true); setRepairingIssueId(issue.id); createBackup(workspace, `AI 修复第 ${chapter.number} 章前自动备份`);
     try {
-      const result = await repairIssueAgainst(workspace, { ...issue, chapterNumber: chapter.number });
+      const result = await repairChapterUntilStable(workspace, { ...issue, chapterNumber: chapter.number });
       setWorkspace(result.working); setDiffChapterId(chapter.id);
-      notify(result.accepted ? `第 ${chapter.number} 章已修复并通过验收` : `第 ${chapter.number} 章修复后仍需人工确认`);
+      notify(result.accepted ? `\u7b2c ${chapter.number} \u7ae0\u7ecf\u8fc7 ${result.passes} \u8f6e\u4fee\u590d\u5e76\u901a\u8fc7\u9a8c\u6536` : `\u7b2c ${chapter.number} \u7ae0\u5df2\u81ea\u52a8\u4fee\u590d ${result.passes} \u8f6e\uff0c\u4ecd\u6709\u8bc1\u636e\u660e\u786e\u7684\u95ee\u9898\u9700\u8981\u786e\u8ba4`);
     } catch (error) { setWorkspace((current) => ({ ...current, automation: { ...current.automation, taskLog: (current.automation.taskLog || []).map((task) => task.status === "running" ? { ...task, status: "failed" as const, finishedAt: new Date().toISOString(), error: error instanceof Error ? error.message : "修复失败" } : task) } })); notify(error instanceof Error ? error.message : "AI 一键修复失败"); }
     finally { setAuditProgress(""); setRepairingIssueId(""); setAiBusy(false); }
   };
@@ -974,9 +1114,9 @@ export default function Home() {
       working = applyAITokenUsage(applyChapterMemory(working, chapter.id, parseChapterMemory(memoryPayload.text!)), memoryPayload.usage);
       setAuditProgress(`正在复审第 ${chapter.number} 章`); working = reserveAIRequestUsage(working); setWorkspace(working);
       const auditPayload = await callAIText(buildRollingAuditPrompt(working, chapter.number), 8192);
-      const auditRunId = id("resync-audit"); const newIssues = [...buildChapterQualityIssues(working, chapter.number, auditRunId), ...buildChapterPlanDeviationIssues(working, chapter.number, auditRunId), ...buildMemoryEvidenceIssues(working, chapter.number, auditRunId), ...buildCharacterContinuityIssues(working, chapter.number), ...parseRollingAudit(auditPayload.text!, auditRunId, chapter.number)];
+      const auditRunId = id("resync-audit"); const newIssues = [...buildChapterQualityIssues(working, chapter.number, auditRunId), ...buildChapterPlanDeviationIssues(working, chapter.number, auditRunId), ...buildMemoryEvidenceIssues(working, chapter.number, auditRunId), ...buildCharacterContinuityIssues(working, chapter.number), ...parseRollingAudit(auditPayload.text!, auditRunId, chapter.number, working.chapters.find((item) => item.number === chapter.number)?.content || chapter.content)];
       working = applyAITokenUsage(replaceChapterAuditIssues(working, chapter.number, newIssues), auditPayload.usage);
-      const quality = evaluateChapterQuality(working, chapter.number); const accepted = !newIssues.some((item) => item.severity === "错误") && quality.length >= 70 && quality.overall >= 70; const finishedAt = new Date().toISOString();
+      const quality = evaluateChapterQuality(working, chapter.number); const accepted = !newIssues.some((item) => item.severity === "错误") && quality.length >= 100 && quality.overall >= 70; const finishedAt = new Date().toISOString();
       working = { ...working, chapters: working.chapters.map((item) => item.id === chapter.id ? { ...item, quality, status: accepted ? "已完成" : "修订中", generation: item.generation ? { ...item.generation, status: accepted ? "accepted" : "blocked", acceptedAt: accepted ? finishedAt : undefined } : { runId: working.automation.runId || `manual-${Date.now()}`, status: accepted ? "accepted" : "blocked", completedSegments: 1, baseRevision: item.revision || 0, acceptedAt: accepted ? finishedAt : undefined } } : item), automation: { ...working.automation, generatedChapterIds: accepted ? [...new Set([...working.automation.generatedChapterIds, chapter.id])] : working.automation.generatedChapterIds.filter((value) => value !== chapter.id), taskLog: (working.automation.taskLog || []).map((task) => task.id === taskId ? { ...task, status: "completed" as const, finishedAt } : task) } };
       setWorkspace(working); notify(accepted ? "本章记忆已重建并通过复审" : "记忆已重建，复审仍有问题需要处理");
     } catch (error) { setWorkspace({ ...working, automation: { ...working.automation, taskLog: (working.automation.taskLog || []).map((task) => task.id === taskId ? { ...task, status: "failed" as const, finishedAt: new Date().toISOString(), error: error instanceof Error ? error.message : "重建失败" } : task) } }); notify(error instanceof Error ? error.message : "重建失败"); }
@@ -992,7 +1132,7 @@ export default function Home() {
     try {
       for (const { chapterNumber, issues, dependsOn, affectedChapters } of queue) {
         const combined: ConsistencyIssue = { ...issues[0], chapterNumber, title: `\u7b2c ${chapterNumber} \u7ae0\u9519\u8bef\u4fee\u590d\u961f\u5217\uff08${issues.length} \u9879\uff09`, description: [...issues.map((item, index) => `${index + 1}. ${item.title}\uff1a${item.description}`), ...(dependsOn.length ? [`\u4f9d\u8d56\u5148\u4fee\u7ae0\u8282\uff1a${dependsOn.join("\u3001")}`] : []), ...(affectedChapters.length ? [`\u4fee\u590d\u540e\u9700\u91cd\u65b0\u68c0\u67e5\uff1a${affectedChapters.join("\u3001")}`] : [])].join("\n"), suggestedFix: issues.map((item) => item.suggestedFix).filter(Boolean).join("\uff1b") };
-        const result = await repairIssueAgainst(working, combined); working = result.working; setWorkspace(working);
+        const result = await repairChapterUntilStable(working, combined); working = result.working; setWorkspace(working);
         if (!result.accepted) { haltedAt = chapterNumber; break; }
       }
       setWorkspace(working); notify(haltedAt ? `修复队列停在第 ${haltedAt} 章，复审仍未通过` : "全书错误修复队列已完成");
@@ -1043,8 +1183,8 @@ export default function Home() {
       if (item.status === "已完成" && !item.content.trim()) {
         issues.push({ id: id("local"), severity: "错误", category: "情节", title: "已完成章节没有正文", description: "请补充正文或更改章节状态。", location: `第 ${item.number} 章`, resolved: false, chapterNumber: item.number, source: "local" });
       }
-      else if (item.status === "已完成" && countWords(item.content) < item.targetWords * 0.7) {
-        issues.push({ id: id("local"), severity: "错误", category: "情节", title: `第 ${item.number} 章正文过短`, description: `本章目标 ${item.targetWords} 字，当前约 ${countWords(item.content)} 字，尚未达到 70% 验收线。`, location: `第 ${item.number} 章`, resolved: false, chapterNumber: item.number, source: "local", suggestedFix: "补足场景、转折与章末钩子后重新审校" });
+      else if (item.status === "\u5df2\u5b8c\u6210" && countWords(item.content) < item.targetWords) {
+        issues.push({ id: id("local"), severity: "\u9519\u8bef", category: "\u60c5\u8282", title: `\u7b2c ${item.number} \u7ae0\u6b63\u6587\u5b57\u6570\u4e0d\u8db3`, description: `\u672c\u7ae0\u76ee\u6807 ${item.targetWords} \u5b57\uff0c\u5f53\u524d\u7ea6 ${countWords(item.content)} \u5b57\uff0c\u5c1a\u672a\u8fbe\u5230\u76ee\u6807\u5b57\u6570\u3002`, location: `\u7b2c ${item.number} \u7ae0`, resolved: false, chapterNumber: item.number, source: "local", suggestedFix: "\u8865\u8db3\u573a\u666f\u3001\u8f6c\u6298\u4e0e\u7ae0\u672b\u94a9\u5b50\u540e\u91cd\u65b0\u5ba1\u6821" });
       }
       if (item.pov && !workspace.characters.some((person) => person.name === item.pov)) {
         issues.push({ id: id("local"), severity: "警告", category: "人物", title: `视角人物“${item.pov}”没有人物卡`, description: "请建立人物卡或更正视角字段。", location: `第 ${item.number} 章`, resolved: false, chapterNumber: item.number, source: "local", suggestedFix: "统一视角姓名与人物档案" });
@@ -1341,7 +1481,7 @@ export default function Home() {
 
   const renderView = () => {
     if (active === "创作台") return renderDashboard();
-    if (active === "AI 全书") return <AutoNovelStudio workspace={workspace} config={config} setWorkspace={setWorkspace} aiBusy={aiBusy} setAiBusy={setAiBusy} notify={notify} onNeedConfig={() => { setSettingsTab("AI"); setSettingsOpen(true); }} onBackup={createBackup} onOpenChapter={(targetId) => { setChapterId(targetId); setActive("章节"); }} onDurableCheckpoint={persistDurableCheckpoint} durableProjectId={activeCloudProjectId || undefined} backgroundConfigured={backgroundConfiguration.apiKey && Boolean(backgroundConfiguration.model)} backgroundActive={backgroundActive} backgroundBusy={backgroundBusy} backgroundModel={backgroundConfiguration.model} onStartBackground={startBackgroundWriting} onPauseBackground={pauseBackgroundWriting} />;
+    if (active === "AI 全书") return <AutoNovelStudio workspace={workspace} config={config} setWorkspace={setWorkspace} aiBusy={aiBusy} setAiBusy={setAiBusy} notify={notify} onNeedConfig={() => { setSettingsTab("AI"); setSettingsOpen(true); }} onBackup={createBackup} onOpenChapter={(targetId) => { setChapterId(targetId); setActive("章节"); }} onDurableCheckpoint={persistDurableCheckpoint} durableProjectId={activeCloudProjectId || undefined} backgroundConfigured={backgroundConfiguration.apiKey && Boolean(backgroundConfiguration.model)} backgroundActive={backgroundActive} backgroundBusy={backgroundBusy} backgroundModel={backgroundConfiguration.model} onStartBackground={startBackgroundWriting} onPauseBackground={pauseBackgroundWriting} onCancelBackground={cancelBackgroundWriting} />;
     if (active === "灵感") return renderIdeas();
     if (active === "世界观") return renderWorld();
     if (active === "人物") return renderCharacters();
@@ -1387,7 +1527,7 @@ export default function Home() {
       {projectLibraryOpen && <div className="modal-backdrop" onMouseDown={(event) => { if (event.currentTarget === event.target) setProjectLibraryOpen(false); }}><section className="project-library-modal" role="dialog" aria-modal="true" aria-label="作品库"><header><div><LibraryBig size={19} /><span><b>我的作品库</b><small>本地编辑、云端保存与任务恢复</small></span></div><button className="icon-button" aria-label="关闭作品库" onClick={() => setProjectLibraryOpen(false)}><X size={18} /></button></header><div className="project-library-actions"><button className="primary-button" onClick={createNewProject}><Plus size={16} />新建作品</button><button className="secondary-button" disabled={cloudBusy} onClick={() => void saveCloudProject(workspace)}><Cloud size={16} />保存当前作品</button><button className="secondary-button" disabled={cloudBusy} onClick={() => void saveCloudProject(workspace, true)}><Copy size={16} />复制为新作品</button><button className="icon-button" aria-label="刷新云端作品" disabled={cloudBusy} onClick={() => void loadCloudProjects()}><RefreshCw className={cloudBusy ? "spin" : ""} size={16} /></button></div>{cloudError && <div className="project-cloud-error"><CircleAlert size={16} />{cloudError}</div>}<div className="project-library-current"><span><BookOpen size={18} /></span><div><small>当前浏览器作品</small><b>《{workspace.project.title}》</b><p>{workspace.project.genre} · {workspace.chapters.length} 章 · {activeCloudProjectId ? "已关联云端" : "仅保存在本机"}</p></div></div><div className="project-library-list"><div className="section-bar"><div><h2>云端作品</h2><span>{cloudProjects.length} 部</span></div><small>{cloudBusy ? "正在同步…" : "按最近更新排序"}</small></div>{cloudProjects.length ? cloudProjects.map((project) => <article key={project.id} className={activeCloudProjectId === project.id ? "active" : ""}><button className="project-open-button" onClick={() => void openCloudProject(project.id)}><span><BookOpen size={17} /></span><div><b>《{project.title}》</b><small>{project.genre || "题材待定"} · {project.status} · {dateLabel(project.updatedAt)}</small></div>{activeCloudProjectId === project.id ? <i>当前</i> : <ChevronRight size={16} />}</button><button className="icon-button project-delete-button" aria-label={`删除《${project.title}》`} onClick={() => void removeCloudProject(project)}><Trash2 size={15} /></button></article>) : <Empty icon={<Cloud />} title="还没有云端作品" text="保存当前作品后，可跨设备恢复并持久保存自动写作检查点。" />}</div></section></div>}
 
       {settingsOpen && <div className="modal-backdrop" onMouseDown={(event) => { if (event.currentTarget === event.target) setSettingsOpen(false); }}><section className="settings-modal" role="dialog" aria-modal="true" aria-label="工作台设置"><header><div><Settings2 size={19} /><span><b>工作台设置</b><small>AI、作品与本地数据</small></span></div><button className="icon-button" aria-label="关闭设置" onClick={() => setSettingsOpen(false)}><X size={18} /></button></header><div className="settings-layout"><nav><button className={settingsTab === "AI" ? "active" : ""} onClick={() => setSettingsTab("AI")}><BrainCircuit size={17} />AI 模型</button><button className={settingsTab === "作品" ? "active" : ""} onClick={() => setSettingsTab("作品")}><BookOpen size={17} />作品信息</button><button className={settingsTab === "数据" ? "active" : ""} onClick={() => setSettingsTab("数据")}><Archive size={17} />数据管理</button></nav><div className="settings-content">
-        {settingsTab === "AI" && <><div className="settings-title"><h2>连接 OpenAI 兼容模型</h2><p>支持 HTTP/HTTPS、Chat Completions 与 Responses；密钥不会写入项目源码。</p></div><div className="form-grid"><label><span>接口地址</span><input value={config.baseUrl} onChange={(event) => setConfig((current) => ({ ...current, baseUrl: event.target.value }))} placeholder="http://127.0.0.1:11434/v1" /><small>可填写 /v1、/chat/completions 或 /responses；本地地址需本地运行本站</small></label><label><span>接口模式</span><select value={config.apiMode} onChange={(event) => setConfig((current) => ({ ...current, apiMode: event.target.value as AIConfig["apiMode"] }))}><option value="auto">自动识别（推荐）</option><option value="chat">Chat Completions</option><option value="responses">Responses API</option></select><small>自动模式遇到 Chat 404 时会改用 Responses</small></label><label><span>API Key（可选）</span><input type="password" value={config.apiKey} onChange={(event) => setConfig((current) => ({ ...current, apiKey: event.target.value }))} autoComplete="off" /><small>Ollama 等无鉴权接口可以留空</small></label><label><span>模型名称</span><input value={config.model} onChange={(event) => setConfig((current) => ({ ...current, model: event.target.value }))} /></label><section className="stage-model-settings"><div><b>分阶段模型</b><small>留空时使用上方默认模型；可为正文、记忆、审校和修复分别指定模型。</small></div><div>{stageModelOptions.map(([stage, label]) => <label key={stage}><span>{label}</span><input value={workspace.automation.stageModels?.[stage]?.model || ""} placeholder={config.model || "使用默认模型"} onChange={(event) => setWorkspace((current) => ({ ...current, automation: { ...current.automation, stageModels: { ...current.automation.stageModels, [stage]: { ...current.automation.stageModels?.[stage], model: event.target.value } } } }))} /><input type="number" min={256} max={MAX_STAGE_OUTPUT_TOKENS} value={workspace.automation.stageModels?.[stage]?.maxOutputTokens || ""} placeholder="输出 Token" onChange={(event) => setWorkspace((current) => ({ ...current, automation: { ...current.automation, stageModels: { ...current.automation.stageModels, [stage]: { ...current.automation.stageModels?.[stage], maxOutputTokens: event.target.value ? Number(event.target.value) : undefined } } } }))} /></label>)}</div></section><label><span>创作温度 · {config.temperature.toFixed(1)}</span><input type="range" min="0" max="2" step="0.1" value={config.temperature} onChange={(event) => setConfig((current) => ({ ...current, temperature: Number(event.target.value) }))} /></label><label className="check-label"><input type="checkbox" checked={config.rememberKey} onChange={(event) => setConfig((current) => ({ ...current, rememberKey: event.target.checked }))} /><span><b>在此浏览器中记住密钥</b><small>关闭时，仅保留到本次会话结束。</small></span></label></div><div className="settings-callout"><ShieldCheck size={17} /><span>Responses 请求只发送合法的文本输入，不会把 output_text 作为输入类型；公网 HTTP 建议改用 HTTPS。</span></div><button className="secondary-button" disabled={aiBusy || !config.baseUrl || !config.model} onClick={() => runAI("自由对话", "只回复：连接成功。")}><Zap size={16} />测试连接</button></>}
+        {settingsTab === "AI" && <><div className="settings-title"><h2>连接 OpenAI 兼容模型</h2><p>支持 HTTP/HTTPS、Chat Completions 与 Responses；密钥不会写入项目源码。</p></div><div className="form-grid"><label><span>接口地址</span><input value={config.baseUrl} onChange={(event) => setConfig((current) => ({ ...current, baseUrl: event.target.value }))} placeholder="http://127.0.0.1:11434/v1" /><small>可填写 /v1、/chat/completions 或 /responses；本地地址需本地运行本站</small></label><label><span>接口模式</span><select value={config.apiMode} onChange={(event) => setConfig((current) => ({ ...current, apiMode: event.target.value as AIConfig["apiMode"] }))}><option value="auto">自动识别（推荐）</option><option value="chat">Chat Completions</option><option value="responses">Responses API</option></select><small>自动模式遇到 Chat 404 时会改用 Responses</small></label><label><span>API Key（可选）</span><input type="password" value={config.apiKey} onChange={(event) => setConfig((current) => ({ ...current, apiKey: event.target.value }))} autoComplete="off" /><small>Ollama 等无鉴权接口可以留空</small></label><label><span>模型名称</span><input value={config.model} onChange={(event) => setConfig((current) => ({ ...current, model: event.target.value }))} /></label><section className="stage-model-settings"><div className="stage-model-heading"><span><b>分阶段模型与生成参数</b><small>模型和 Token 留空时继承默认值；温度、推理强度、详细度可以按任务分别控制。</small></span><button type="button" className="secondary-button" onClick={() => setWorkspace((current) => ({ ...current, automation: { ...current.automation, stageModels: Object.fromEntries(stageModelOptions.map(([stage]) => [stage, { ...current.automation.stageModels?.[stage], ...GPT55_STAGE_PRESETS[stage] }])) } }))}>应用 GPT-5.5 推荐值</button></div><div className="stage-model-grid">{stageModelOptions.map(([stage, label]) => { const stageConfig = workspace.automation.stageModels?.[stage]; const updateStage = (patch: Partial<NonNullable<typeof stageConfig>>) => setWorkspace((current) => ({ ...current, automation: { ...current.automation, stageModels: { ...current.automation.stageModels, [stage]: { ...current.automation.stageModels?.[stage], ...patch } } } })); return <article className="stage-model-row" key={stage}><strong>{label}</strong><label><small>模型</small><input value={stageConfig?.model || ""} placeholder={config.model || "使用默认模型"} onChange={(event) => updateStage({ model: event.target.value })} /></label><label><small>输出 Token</small><input type="number" min={256} max={MAX_STAGE_OUTPUT_TOKENS} value={stageConfig?.maxOutputTokens || ""} placeholder="继承默认" onChange={(event) => updateStage({ maxOutputTokens: event.target.value ? Number(event.target.value) : undefined })} /></label><label><small>温度</small><input type="number" min={0} max={2} step={0.1} value={stageConfig?.temperature ?? ""} placeholder={config.temperature.toFixed(1)} onChange={(event) => updateStage({ temperature: event.target.value === "" ? undefined : Number(event.target.value) })} /></label><label><small>推理强度</small><select value={stageConfig?.reasoningEffort || ""} onChange={(event) => updateStage({ reasoningEffort: event.target.value ? event.target.value as NonNullable<typeof stageConfig>["reasoningEffort"] : undefined })}><option value="">模型默认</option><option value="none">不推理</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="xhigh">超高</option></select></label><label><small>输出详细度</small><select value={stageConfig?.verbosity || ""} onChange={(event) => updateStage({ verbosity: event.target.value ? event.target.value as NonNullable<typeof stageConfig>["verbosity"] : undefined })}><option value="">模型默认</option><option value="low">简洁</option><option value="medium">适中</option><option value="high">详细</option></select></label></article>; })}</div></section><label><span>默认温度（阶段未单独设置时） · {config.temperature.toFixed(1)}</span><input type="range" min="0" max="2" step="0.1" value={config.temperature} onChange={(event) => setConfig((current) => ({ ...current, temperature: Number(event.target.value) }))} /></label><label className="check-label"><input type="checkbox" checked={config.rememberKey} onChange={(event) => setConfig((current) => ({ ...current, rememberKey: event.target.checked }))} /><span><b>在此浏览器中记住密钥</b><small>关闭时，仅保留到本次会话结束。</small></span></label></div><div className="settings-callout"><ShieldCheck size={17} /><span>Responses 请求只发送合法的文本输入，不会把 output_text 作为输入类型；公网 HTTP 建议改用 HTTPS。</span></div><button className="secondary-button" disabled={aiBusy || !config.baseUrl || !config.model} onClick={() => runAI("自由对话", "只回复：连接成功。")}><Zap size={16} />测试连接</button></>}
         {settingsTab === "作品" && <><div className="settings-title"><h2>作品信息</h2><p>这些内容会作为全局约束带入每一次 AI 创作。</p></div><div className="form-grid two-col"><label><span>书名</span><input value={workspace.project.title} onChange={(event) => setWorkspace((current) => ({ ...current, project: { ...current.project, title: event.target.value } }))} /></label><label><span>题材</span><input value={workspace.project.genre} onChange={(event) => setWorkspace((current) => ({ ...current, project: { ...current.project, genre: event.target.value } }))} /></label><label className="full"><span>一句话梗概</span><textarea value={workspace.project.premise} onChange={(event) => setWorkspace((current) => ({ ...current, project: { ...current.project, premise: event.target.value } }))} /></label><label className="full"><span>主题表达</span><textarea value={workspace.project.theme} onChange={(event) => setWorkspace((current) => ({ ...current, project: { ...current.project, theme: event.target.value } }))} /></label><label><span>目标字数</span><input type="number" value={workspace.project.targetWords} onChange={(event) => setWorkspace((current) => ({ ...current, project: { ...current.project, targetWords: Number(event.target.value) } }))} /></label><label><span>目标章节</span><input type="number" value={workspace.project.targetChapters} onChange={(event) => setWorkspace((current) => ({ ...current, project: { ...current.project, targetChapters: Number(event.target.value) } }))} /></label><label className="full"><span>叙事视角</span><input value={workspace.project.pointOfView} onChange={(event) => setWorkspace((current) => ({ ...current, project: { ...current.project, pointOfView: event.target.value } }))} /></label><label className="full"><span>文风约束</span><textarea value={workspace.project.writingStyle} onChange={(event) => setWorkspace((current) => ({ ...current, project: { ...current.project, writingStyle: event.target.value } }))} /></label></div></>}
         {settingsTab === "数据" && <>
           <div className="settings-title"><h2>本地数据管理</h2><p>导出完整备份后，可以在另一台设备恢复。</p></div>

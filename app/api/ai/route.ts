@@ -1,13 +1,17 @@
 import { NextResponse } from "next/server";
 import { resolveAIEndpoint, type AIEndpointMode } from "@/lib/ai-endpoint";
 import { DEFAULT_STAGE_OUTPUT_TOKENS, MAX_STAGE_OUTPUT_TOKENS, MIN_STAGE_OUTPUT_TOKENS } from "@/lib/ai-limits";
+import type { AIStage } from "@/lib/types";
 
 type AIRequestBody = {
   baseUrl?: string;
   apiKey?: string;
   model?: string;
   apiMode?: AIEndpointMode;
+  stage?: AIStage;
   temperature?: number;
+  reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh";
+  verbosity?: "low" | "medium" | "high";
   maxOutputTokens?: number;
   prompt?: string;
 };
@@ -15,6 +19,41 @@ type AIRequestBody = {
 const MAX_REQUEST_BYTES = 1_000_000;
 const MAX_RESPONSE_BYTES = 12_000_000;
 const UPSTREAM_TIMEOUT_MS = 600_000;
+
+const AI_RATE_WINDOW_MS = 60_000;
+const AI_RATE_LIMIT = 30;
+const AI_CONCURRENCY_LIMIT = 3;
+type RateState = { windowStartedAt: number; requests: number; active: number };
+const aiRateStates = new Map<string, RateState>();
+
+function requestIdentity(request: Request) {
+  const owner = request.headers.get("oai-authenticated-user-email")?.trim().toLowerCase();
+  if (owner) return `owner:${owner}`;
+  const forwarded = request.headers.get("cf-connecting-ip") || request.headers.get("x-forwarded-for")?.split(",")[0];
+  return `ip:${forwarded?.trim() || "unknown"}`;
+}
+
+function reserveAIRequestSlot(request: Request) {
+  const now = Date.now();
+  const key = requestIdentity(request);
+  const previous = aiRateStates.get(key);
+  const state = !previous || now - previous.windowStartedAt >= AI_RATE_WINDOW_MS
+    ? { windowStartedAt: now, requests: 0, active: previous?.active || 0 }
+    : previous;
+  if (state.requests >= AI_RATE_LIMIT) return { error: "AI 请求过于频繁，请稍后再试", status: 429 } as const;
+  if (state.active >= AI_CONCURRENCY_LIMIT) return { error: "同时运行的 AI 请求过多，请等待当前任务完成", status: 429 } as const;
+  state.requests += 1;
+  state.active += 1;
+  aiRateStates.set(key, state);
+  return {
+    release: () => {
+      const current = aiRateStates.get(key);
+      if (!current) return;
+      current.active = Math.max(0, current.active - 1);
+      if (!current.active && Date.now() - current.windowStartedAt > AI_RATE_WINDOW_MS * 2) aiRateStates.delete(key);
+    },
+  } as const;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -119,6 +158,15 @@ export async function POST(request: Request) {
   if (!Number.isFinite(temperature) || temperature < 0 || temperature > 2) {
     return NextResponse.json({ error: "创作温度必须是 0 到 2 之间的数字" }, { status: 400 });
   }
+  if (body.stage !== undefined && !["ideation", "blueprint", "chapter", "memory", "audit", "repair"].includes(body.stage)) {
+    return NextResponse.json({ error: "AI 任务阶段无效" }, { status: 400 });
+  }
+  if (body.reasoningEffort !== undefined && !["none", "low", "medium", "high", "xhigh"].includes(body.reasoningEffort)) {
+    return NextResponse.json({ error: "推理强度无效" }, { status: 400 });
+  }
+  if (body.verbosity !== undefined && !["low", "medium", "high"].includes(body.verbosity)) {
+    return NextResponse.json({ error: "输出详细度无效" }, { status: 400 });
+  }
   if (body.apiMode !== undefined && !["auto", "chat", "responses"].includes(body.apiMode)) {
     return NextResponse.json({ error: "接口模式无效" }, { status: 400 });
   }
@@ -139,7 +187,11 @@ export async function POST(request: Request) {
     );
   }
 
+  const slot = reserveAIRequestSlot(request);
+  if ("error" in slot) return NextResponse.json({ error: slot.error }, { status: slot.status });
+
   try {
+    const upstreamSignal = AbortSignal.any([request.signal, AbortSignal.timeout(UPSTREAM_TIMEOUT_MS)]);
     const callUpstream = (url: string, mode: "chat" | "responses") => fetch(url, {
       method: "POST",
       headers: {
@@ -151,9 +203,14 @@ export async function POST(request: Request) {
         ...(mode === "responses" ? {
           instructions: "你是严谨、尊重作者意图的中文长篇小说创作助手。",
           input: prompt,
+          ...(body.temperature !== undefined ? { temperature } : {}),
+          ...(body.reasoningEffort ? { reasoning: { effort: body.reasoningEffort } } : {}),
+          ...(body.verbosity ? { text: { verbosity: body.verbosity } } : {}),
           max_output_tokens: maxOutputTokens,
         } : {
           temperature,
+          ...(body.reasoningEffort ? { reasoning_effort: body.reasoningEffort } : {}),
+          ...(body.verbosity ? { verbosity: body.verbosity } : {}),
           max_tokens: maxOutputTokens,
           messages: [
             { role: "system", content: "你是严谨、尊重作者意图的中文长篇小说创作助手。" },
@@ -162,7 +219,7 @@ export async function POST(request: Request) {
         }),
       }),
       redirect: "manual",
-      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+      signal: upstreamSignal,
     });
     let selectedMode = endpoint.mode;
     let upstream = await callUpstream(endpoint.url, selectedMode);
@@ -221,12 +278,17 @@ export async function POST(request: Request) {
       usage: isRecord(payload.usage) ? payload.usage : undefined,
     });
   } catch (error) {
-    const timedOut = error instanceof Error && ["TimeoutError", "AbortError"].includes(error.name);
-    const message = timedOut
-      ? "模型在 10 分钟内没有完成响应。请求已安全停止；建议降低单章字数或最大输出 Token 后重试。"
-      : error instanceof Error && error.message === "模型响应过大"
-        ? error.message
-        : "无法连接模型接口";
-    return NextResponse.json({ error: message }, { status: timedOut ? 504 : 502 });
+    const cancelled = request.signal.aborted;
+    const timedOut = !cancelled && error instanceof Error && ["TimeoutError", "AbortError"].includes(error.name);
+    const message = cancelled
+      ? "AI 请求已取消"
+      : timedOut
+        ? "模型在 10 分钟内没有完成响应。请求已安全停止；建议降低单章字数或最大输出 Token 后重试。"
+        : error instanceof Error && error.message === "模型响应过大"
+          ? error.message
+          : "无法连接模型接口";
+    return NextResponse.json({ error: message }, { status: cancelled ? 499 : timedOut ? 504 : 502 });
+  } finally {
+    slot.release();
   }
 }

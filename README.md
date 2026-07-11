@@ -45,9 +45,8 @@ npm run dev
 生产验证：
 
 ```bash
-npm run lint
-npm exec -- tsc --noEmit
-npm test
+npm run check
+npm run security:audit
 ```
 
 数据库结构变更后生成迁移：
@@ -94,7 +93,7 @@ https://你的站点/api/openai/webhook
 第三方接口不会触发 OpenAI 官方 Webhook。请在 `.env.local` 中配置：
 
 ```text
-BACKGROUND_AI_BASE_URL=http://122.51.68.58:8317/v1
+BACKGROUND_AI_BASE_URL=https://your-provider.example/v1
 BACKGROUND_AI_API_KEY=第三方接口密钥
 BACKGROUND_AI_MODEL=gpt-5.5
 BACKGROUND_WORKER_SECRET=至少32位随机字符串

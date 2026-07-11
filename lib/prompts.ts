@@ -26,7 +26,7 @@ function compactChapter(chapter: Chapter) {
   };
 }
 
-export function buildNovelContext(workspace: WorkspaceData, chapterId?: string) {
+function buildNovelContext(workspace: WorkspaceData, chapterId?: string) {
   const currentChapter = workspace.chapters.find((chapter) => chapter.id === chapterId);
   const targetNumber = currentChapter?.number;
   const nearbyChapters = currentChapter

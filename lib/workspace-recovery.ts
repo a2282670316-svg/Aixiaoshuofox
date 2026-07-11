@@ -1,4 +1,4 @@
-import type { AutomationRecoveryRun, GenerationRecoveryStep, WorkspaceData } from "@/lib/types";
+import type { GenerationRecoveryStep, WorkspaceData } from "@/lib/types";
 
 const STALE_TASK_AGE_MS = 30 * 60 * 1000;
 
@@ -81,9 +81,4 @@ export function recoverWorkspaceFromStep(workspace: WorkspaceData, step: Generat
       updatedAt: now,
     },
   };
-}
-
-export function latestRecoverableStep(run?: AutomationRecoveryRun) {
-  if (!run) return undefined;
-  return run.steps.find((step) => step.status === "failed") || run.steps[0];
 }

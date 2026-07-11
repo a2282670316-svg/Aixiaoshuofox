@@ -1,0 +1,39 @@
+﻿name: Release source packages
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify source
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.13.0
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - name: Build source archives
+        shell: bash
+        run: |
+          mkdir -p release
+          git archive --format=zip --prefix="Aixiaoshuofox-${GITHUB_REF_NAME}/" --output="release/Aixiaoshuofox-${GITHUB_REF_NAME}-source.zip" "${GITHUB_REF_NAME}"
+          git archive --format=tar.gz --prefix="Aixiaoshuofox-${GITHUB_REF_NAME}/" --output="release/Aixiaoshuofox-${GITHUB_REF_NAME}-source.tar.gz" "${GITHUB_REF_NAME}"
+          cd release
+          sha256sum *.zip *.tar.gz > SHA256SUMS.txt
+      - name: Create release and upload source packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1 || gh release create "${GITHUB_REF_NAME}" --generate-notes --title "${GITHUB_REF_NAME}"
+          gh release upload "${GITHUB_REF_NAME}" release/* --clobber

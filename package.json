@@ -1,6 +1,6 @@
 {
   "name": "novel-forge",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "private": true,
   "engines": {
     "node": ">=22.13.0"
@@ -14,7 +14,13 @@
     "validate:artifact": "node scripts/validate-artifact.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "db:generate": "drizzle-kit generate",
-    "background:worker": "node --env-file-if-exists=.env.local scripts/background-worker.mjs"
+    "background:worker": "node --env-file-if-exists=.env.local scripts/background-worker.mjs",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm run lint && npm run analyze && npm test",
+    "security:audit": "npm audit --omit=dev --registry=https://registry.npmjs.org",
+    "analyze:unused": "knip --no-progress",
+    "analyze:duplicates": "jscpd app lib db worker --min-lines 8 --min-tokens 60 --threshold 2 --reporters console",
+    "analyze": "npm run analyze:unused && npm run analyze:duplicates"
   },
   "dependencies": {
     "drizzle-orm": "0.45.2",
@@ -36,6 +42,8 @@
     "drizzle-kit": "0.31.10",
     "eslint": "9.39.4",
     "eslint-config-next": "16.2.10",
+    "jscpd": "5.0.12",
+    "knip": "6.26.0",
     "react-server-dom-webpack": "19.2.7",
     "tailwindcss": "4.3.2",
     "tsx": "^4.23.0",

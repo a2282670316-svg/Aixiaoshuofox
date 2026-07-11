@@ -15,7 +15,7 @@ function isPrivateIpv4(hostname: string) {
     || a >= 224;
 }
 
-export function isPrivateAIHostname(rawHostname: string) {
+function isPrivateAIHostname(rawHostname: string) {
   const hostname = rawHostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
   if (!hostname) return true;
   if (hostname === "localhost" || hostname.endsWith(".localhost") || hostname.endsWith(".local") || hostname.endsWith(".internal") || hostname.endsWith(".lan")) return true;

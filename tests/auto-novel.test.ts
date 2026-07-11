@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   buildAutomatedChapterPrompt,
+  applyConsistencyRepairEdits,
   chapterDraftWordRange,
   buildCharacterContinuityIssues,
   buildRepairDependencyQueue,
@@ -12,8 +13,10 @@ import {
   chapterSegmentObligations,
   applyChapterMemory,
   canonBeforeChapter,
+  cancelAutomationRun,
   canonContextBeforeChapter,
   compactCanonBeforeChapter,
+  consistencyIssueFingerprint,
   foreshadowTasksForChapter,
   createAutomationState,
   detectAIStage,
@@ -31,6 +34,7 @@ import {
   removeChapterFromCanon,
   replaceChapterAuditIssues,
   restartBlueprintDraft,
+  stabilizeRepairAuditIssues,
   unresolvedChapterErrors,
   rewindNovelFromChapter,
   validateGeneratedChapterDraft,
@@ -329,6 +333,7 @@ test("commits chapter memory into the long-form canon ledger", () => {
   assert.equal(updated.canon.chapterSummaries.length, 1);
   assert.equal(updated.canon.characterStates[0].name, "林岚");
   assert.equal(updated.canon.threads[0].status, "open");
+  assert.equal(updated.canon.facts[0].level, "ai_verified");
   assert.equal(updated.chapters[0].memory?.summary, memory.summary);
 });
 
@@ -552,14 +557,46 @@ test("parses structured chapter audit evidence and a full AI repair", () => {
   const issues = parseRollingAudit(JSON.stringify({ issues: [{
     severity: "错误", category: "人物", title: "知情范围冲突", description: "角色提前知道未来信息",
     chapterNumber: 2, evidence: "角色直接说出尚未发现的档案编号", suggestedFix: "改成猜测而不是确认", location: "第2章中段",
-  }] }), "run-structured", 2);
+  }] }), "run-structured", 2, "\u4ed6\u7ffb\u5f00\u6587\u4ef6\uff0c\u89d2\u8272\u76f4\u63a5\u8bf4\u51fa\u5c1a\u672a\u53d1\u73b0\u7684\u6863\u6848\u7f16\u53f7\uff0c\u6240\u6709\u4eba\u90fd\u6123\u4f4f\u4e86\u3002");
   assert.equal(issues[0].chapterNumber, 2);
   assert.equal(issues[0].source, "ai");
   assert.match(issues[0].evidence || "", /档案编号/);
+  const unsupported = parseRollingAudit(JSON.stringify({ issues: [{ severity: "\u9519\u8bef", category: "\u4eba\u7269", title: "\u65e0\u8bc1\u636e\u9519\u8bef", description: "\u6a21\u578b\u731c\u6d4b", evidence: "\u6b63\u6587\u4e2d\u4e0d\u5b58\u5728\u7684\u53e5\u5b50" }] }), "run-unverified", 2, "\u5b9e\u9645\u6b63\u6587\u6ca1\u6709\u8fd9\u6bb5\u5185\u5bb9");
+  assert.equal(unsupported.length, 0);
 
   const repair = parseConsistencyRepair(JSON.stringify({ revisedContent: "修".repeat(400), changeSummary: "收窄角色知情范围" }));
   assert.equal(repair.changeSummary, "收窄角色知情范围");
   assert.throws(() => parseConsistencyRepair(JSON.stringify({ revisedContent: "太短", changeSummary: "无" })), /过短/);
+});
+
+test("applies only bounded unique repair patches", () => {
+  const original = `opening\nThe brass key remained locked in the drawer.\n${"ending detail ".repeat(40)}`;
+  const payload = JSON.stringify({ edits: [{ oldText: "The brass key remained locked in the drawer.", newText: "The brass key had already been removed from the drawer.", reason: "align inventory" }], changeSummary: "one local replacement" });
+  const repair = parseConsistencyRepair(payload, original);
+  assert.match(repair.revisedContent, /already been removed/);
+  assert.match(repair.revisedContent, /ending detail/);
+  assert.equal(repair.edits.length, 1);
+  assert.throws(() => applyConsistencyRepairEdits("repeat phrase repeat phrase", [{ oldText: "repeat phrase", newText: "changed", reason: "ambiguous" }]), /oldText/);
+  assert.throws(() => applyConsistencyRepairEdits("a".repeat(1000) + " unique target", [{ oldText: "a".repeat(400), newText: "replacement", reason: "too broad" }]), /oldText/);
+});
+
+test("creates stable fingerprints for the same continuity issue", () => {
+  const base = { chapterNumber: 12, category: "\u4eba\u7269" as const, title: "Knowledge conflict", evidence: "archive code" };
+  const first = consistencyIssueFingerprint(base);
+  const second = consistencyIssueFingerprint({ ...base, title: "\u4fee\u590d\u540e\u65b0\u53d1\u73b0\uff08\u5f85\u4e8c\u6b21\u786e\u8ba4\uff09\uff1aKnowledge conflict" });
+  assert.equal(first, second);
+});
+
+test("keeps repair scope stable and parks newly discovered AI errors for confirmation", () => {
+  const baseline = { ...DEMO_WORKSPACE.issues[0], severity: "\u9519\u8bef" as const, category: "\u4eba\u7269" as const, source: "ai" as const, title: "\u89d2\u8272\u77e5\u60c5\u8303\u56f4\u51b2\u7a81", description: "\u89d2\u8272\u63d0\u524d\u77e5\u9053\u6863\u6848\u7f16\u53f7", evidence: "\u6863\u6848\u7f16\u53f7" };
+  const related = { ...baseline, id: "related", title: "\u4eba\u7269\u77e5\u60c5\u8303\u56f4\u4ecd\u7136\u51b2\u7a81", description: "\u4ed6\u4ecd\u7136\u63d0\u524d\u8bf4\u51fa\u6863\u6848\u7f16\u53f7" };
+  const novel = { ...baseline, id: "novel", category: "\u65f6\u95f4\u7ebf" as const, title: "\u65b0\u7684\u65f6\u95f4\u51b2\u7a81", description: "\u4fee\u590d\u540e\u5ba1\u6821\u9996\u6b21\u63d0\u51fa", evidence: "\u51cc\u6668\u4e09\u70b9" };
+  const local = { ...novel, id: "local", source: "local" as const };
+  const stabilized = stabilizeRepairAuditIssues([baseline], [related, novel, local]);
+  assert.equal(stabilized[0].severity, "\u9519\u8bef");
+  assert.equal(stabilized[1].severity, "\u8b66\u544a");
+  assert.match(stabilized[1].title, /\u5f85\u4e8c\u6b21\u786e\u8ba4/);
+  assert.equal(stabilized[2].severity, "\u9519\u8bef");
 });
 
 test("removes one chapter from canon before rebuilding it", () => {
@@ -591,10 +628,9 @@ test("blocks chapter acceptance when the final draft is materially too short", (
   assert.equal(issues[0].severity, "错误");
   const audited = replaceChapterAuditIssues(workspace, 1, issues);
   assert.equal(unresolvedChapterErrors(audited, 1).length, 1);
-  const longChapter = { ...chapter, content: "长".repeat(2201) };
+  const longChapter = { ...chapter, content: "L".repeat(5000) };
   const longIssues = buildChapterQualityIssues({ ...workspace, chapters: [longChapter] }, 1, "quality-long");
-  assert.equal(longIssues.length, 1);
-  assert.match(longIssues[0].title, /过多/);
+  assert.equal(longIssues.length, 0);
 });
 
 test("re-audit resolves stale chapter issues before adding the new result", () => {
@@ -646,12 +682,17 @@ test("calculates chapter quality and tracks foreshadows and character state", ()
 });
 
 test("normalizes stage models, task logs, quality and repair review", () => {
-  const source: WorkspaceData = { ...DEMO_WORKSPACE, chapters: [{ ...DEMO_WORKSPACE.chapters[0], quality: { overall: 88, length: 90, outline: 80, continuity: 92, foreshadow: 100, style: 85, evaluatedAt: new Date().toISOString(), notes: [] }, repairReview: { beforeVersionId: "v1", changeSummary: "修复冲突", createdAt: new Date().toISOString(), status: "pending" } }], automation: { ...DEMO_WORKSPACE.automation, stageModels: { audit: { model: "audit-model", maxOutputTokens: 4096 } }, taskLog: [{ id: "task-1", kind: "audit", label: "审校", status: "completed", startedAt: new Date().toISOString() }] } };
+  const source: WorkspaceData = { ...DEMO_WORKSPACE, chapters: [{ ...DEMO_WORKSPACE.chapters[0], quality: { overall: 88, length: 90, outline: 80, continuity: 92, foreshadow: 100, style: 85, evaluatedAt: new Date().toISOString(), notes: [] }, repairReview: { beforeVersionId: "v1", changeSummary: "修复冲突", createdAt: new Date().toISOString(), status: "pending" } }], automation: { ...DEMO_WORKSPACE.automation, stageModels: { audit: { model: "audit-model", maxOutputTokens: 4096, temperature: 0.1, reasoningEffort: "high", verbosity: "medium" } }, taskLog: [{ id: "task-1", kind: "audit", label: "审校", status: "completed", startedAt: new Date().toISOString() }] } };
+  source.chapters[0].generation = { runId: "draft-retry", status: "planned", completedSegments: 0, baseRevision: 0, draftAttempts: 3 };
   const normalized = normalizeWorkspaceData(source, DEMO_WORKSPACE);
   assert.equal(normalized.chapters[0].quality?.overall, 88);
   assert.equal(normalized.chapters[0].repairReview?.status, "pending");
   assert.equal(normalized.automation.stageModels?.audit?.model, "audit-model");
+  assert.equal(normalized.automation.stageModels?.audit?.temperature, 0.1);
+  assert.equal(normalized.automation.stageModels?.audit?.reasoningEffort, "high");
+  assert.equal(normalized.automation.stageModels?.audit?.verbosity, "medium");
   assert.equal(normalized.automation.taskLog?.[0].status, "completed");
+  assert.equal(normalized.chapters[0].generation?.draftAttempts, 3);
 });
 
 
@@ -853,16 +894,38 @@ test("keeps legacy unsupported canon out of verified writing context", () => {
   assert.equal(rebuilt.verified.facts.length, 1);
 });
 
-test("generates one complete chapter within a ten percent word range", () => {
+test("requires the full target word count but accepts chapters over target", () => {
   const target = structuredClone(DEMO_WORKSPACE.chapters[0]);
   target.targetWords = 4000;
-  assert.deepEqual(chapterDraftWordRange(target.targetWords), { minimum: 3600, maximum: 4400 });
-  assert.equal(validateGeneratedChapterDraft(target, "A".repeat(3599)).length, 1);
-  assert.equal(validateGeneratedChapterDraft(target, "A".repeat(3600)).length, 0);
-  assert.equal(validateGeneratedChapterDraft(target, "A".repeat(4400)).length, 0);
-  assert.equal(validateGeneratedChapterDraft(target, "A".repeat(4401)).length, 1);
+  assert.deepEqual(chapterDraftWordRange(target.targetWords), { minimum: 4000, recommendedMaximum: 4800 });
+  assert.equal(validateGeneratedChapterDraft(target, "A".repeat(3999)).length, 1);
+  assert.equal(validateGeneratedChapterDraft(target, "A".repeat(4000)).length, 0);
+  assert.equal(validateGeneratedChapterDraft(target, "A".repeat(4800)).length, 0);
+  assert.equal(validateGeneratedChapterDraft(target, "A".repeat(8000)).length, 0);
   const prompt = buildAutomatedChapterPrompt(DEMO_WORKSPACE, target, { existingDraft: "old partial draft" });
-  assert.match(prompt, /3600/);
-  assert.match(prompt, /4400/);
+  assert.match(prompt, /4000/);
+  assert.match(prompt, /4800/);
+  assert.match(prompt, /allowOverTarget/);
   assert.match(prompt, /whole_chapter_single_pass/);
+});
+
+test("cancels an automation run without deleting completed chapters", () => {
+  const workspace = structuredClone(DEMO_WORKSPACE);
+  workspace.automation.runId = "active-run";
+  workspace.automation.phase = "writing";
+  workspace.automation.lastError = "old error";
+  workspace.automation.taskLog = [
+    { id: "running", kind: "chapter_segment", label: "running", status: "running", startedAt: "2026-07-12T00:00:00.000Z" },
+    { id: "queued", kind: "chapter_memory", label: "queued", status: "queued", startedAt: "2026-07-12T00:00:00.000Z" },
+    { id: "done", kind: "rolling_audit", label: "done", status: "completed", startedAt: "2026-07-12T00:00:00.000Z" },
+  ];
+  const originalContent = workspace.chapters[0].content;
+  const cancelled = cancelAutomationRun(workspace, "2026-07-12T01:00:00.000Z");
+  assert.equal(cancelled.automation.phase, "paused");
+  assert.equal(cancelled.automation.runId, "");
+  assert.equal(cancelled.automation.lastError, undefined);
+  assert.equal(cancelled.automation.taskLog?.[0].status, "cancelled");
+  assert.equal(cancelled.automation.taskLog?.[1].status, "cancelled");
+  assert.equal(cancelled.automation.taskLog?.[2].status, "completed");
+  assert.equal(cancelled.chapters[0].content, originalContent);
 });

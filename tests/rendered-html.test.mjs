@@ -129,7 +129,7 @@ test("uses valid Responses API text input and parses output text", async () => {
       new Request("http://localhost/api/ai", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ baseUrl: "http://127.0.0.1:11434/v1/responses", apiKey: "", model: "qwen3", apiMode: "auto", prompt: "测试" }),
+        body: JSON.stringify({ baseUrl: "http://127.0.0.1:11434/v1/responses", apiKey: "", model: "qwen3", apiMode: "auto", temperature: 0.2, reasoningEffort: "high", verbosity: "medium", prompt: "测试" }),
       }),
       env,
       context,
@@ -137,7 +137,9 @@ test("uses valid Responses API text input and parses output text", async () => {
     assert.equal(response.status, 200);
     assert.equal(requestBody.input, "测试");
     assert.equal(requestBody.output_text, undefined);
-    assert.equal(requestBody.temperature, undefined);
+    assert.equal(requestBody.temperature, 0.2);
+    assert.equal(requestBody.reasoning.effort, "high");
+    assert.equal(requestBody.text.verbosity, "medium");
     assert.equal(requestBody.max_output_tokens, 16384);
     assert.equal((await response.json()).text, "连接成功");
   } finally {

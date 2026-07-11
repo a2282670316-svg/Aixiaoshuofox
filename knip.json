@@ -1,0 +1,20 @@
+{
+  "$schema": "https://unpkg.com/knip@5/schema.json",
+  "entry": [
+    "app/**/*.{ts,tsx}",
+    "worker/index.ts",
+    "scripts/**/*.mjs",
+    "tests/**/*.{ts,mjs}"
+  ],
+  "project": [
+    "**/*.{ts,tsx,mjs}",
+    "!dist/**",
+    "!.next/**",
+    "!.vinext/**"
+  ],
+  "ignoreDependencies": [
+    "cloudflare",
+    "tailwindcss"
+  ],
+  "ignoreExportsUsedInFile": true
+}

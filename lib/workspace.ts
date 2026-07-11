@@ -247,6 +247,7 @@ export function normalizeWorkspaceData(
       completedSegments: numberValue(rawGeneration.completedSegments, 0, 0, 20),
       baseRevision: numberValue(rawGeneration.baseRevision, 0, 0, 1_000_000),
       repairAttempts: numberValue(rawGeneration.repairAttempts, 0, 0, 10),
+      draftAttempts: numberValue(rawGeneration.draftAttempts, 0, 0, 1_000),
       acceptedAt: typeof rawGeneration.acceptedAt === "string" ? rawGeneration.acceptedAt.slice(0, 100) : undefined,
     } : undefined;
     return {
@@ -305,6 +306,7 @@ export function normalizeWorkspaceData(
     evidence: typeof item.evidence === "string" ? item.evidence.slice(0, 10_000) : undefined,
     suggestedFix: typeof item.suggestedFix === "string" ? item.suggestedFix.slice(0, 10_000) : undefined,
     source: enumValue(item.source, ["local", "ai"] as const, "local"),
+    fingerprint: typeof item.fingerprint === "string" ? item.fingerprint.slice(0, 200) : undefined,
   }));
 
   const materialIds = new Set<string>();
@@ -399,7 +401,13 @@ export function normalizeWorkspaceData(
     stageModels: Object.fromEntries(Object.entries(record(rawAutomation.stageModels)).flatMap(([stage, value]) => {
       if (!["ideation", "blueprint", "chapter", "memory", "audit", "repair"].includes(stage)) return [];
       const config = record(value);
-      return [[stage, { model: typeof config.model === "string" ? config.model.slice(0, 300) : undefined, maxOutputTokens: typeof config.maxOutputTokens === "number" ? numberValue(config.maxOutputTokens, 16_384, 256, MAX_STAGE_OUTPUT_TOKENS) : undefined }]];
+      return [[stage, {
+        model: typeof config.model === "string" ? config.model.slice(0, 300) : undefined,
+        maxOutputTokens: typeof config.maxOutputTokens === "number" ? numberValue(config.maxOutputTokens, 16_384, 256, MAX_STAGE_OUTPUT_TOKENS) : undefined,
+        temperature: typeof config.temperature === "number" && Number.isFinite(config.temperature) ? Math.min(2, Math.max(0, Math.round(config.temperature * 10) / 10)) : undefined,
+        reasoningEffort: ["none", "low", "medium", "high", "xhigh"].includes(String(config.reasoningEffort)) ? config.reasoningEffort : undefined,
+        verbosity: ["low", "medium", "high"].includes(String(config.verbosity)) ? config.verbosity : undefined,
+      }]];
     })),
     taskLog: objects(rawAutomation.taskLog, 500).map((item, index) => ({
       id: stringValue(item.id, "task-" + (index + 1), 200),
@@ -454,6 +462,8 @@ export function normalizeWorkspaceData(
       id: stringValue(item.id, `fact-${index + 1}`, 200),
       chapterNumber: numberValue(item.chapterNumber, 1, 1, 9999),
       fact: stringValue(item.fact, "", 4000),
+      level: enumValue(item.level, ["author", "text", "ai_verified", "inferred"] as const, "inferred"),
+      evidence: typeof item.evidence === "string" ? item.evidence.slice(0, 2000) : undefined,
     })),
     lastAuditedChapter: numberValue(rawCanon.lastAuditedChapter, 0, 0, 9999),
   };

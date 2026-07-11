@@ -2,6 +2,8 @@ import { NextResponse } from "next/server";
 import {
   backgroundConfiguration,
   backgroundRunStatus,
+  backgroundRunSummary,
+  cancelBackgroundRun,
   enqueueNextBackgroundStep,
   pauseBackgroundRun,
 } from "@/lib/background-novel";
@@ -10,9 +12,12 @@ import { isRecord, readJsonBody, rejectCrossOrigin, requestOwner } from "@/app/a
 export async function GET(request: Request) {
   const ownerId = requestOwner(request);
   if (!ownerId) return NextResponse.json({ error: "请先登录后使用云端后台写作" }, { status: 401 });
-  const projectId = new URL(request.url).searchParams.get("projectId")?.trim();
+  const url = new URL(request.url);
+  const projectId = url.searchParams.get("projectId")?.trim();
   if (!projectId) return NextResponse.json({ configuration: backgroundConfiguration() });
-  const status = await backgroundRunStatus(ownerId, projectId);
+  const status = url.searchParams.get("summary") === "1"
+    ? await backgroundRunSummary(ownerId, projectId)
+    : await backgroundRunStatus(ownerId, projectId);
   if (!status) return NextResponse.json({ error: "找不到作品" }, { status: 404 });
   return NextResponse.json(status);
 }
@@ -33,7 +38,7 @@ export async function POST(request: Request) {
   const body = rawBody;
   const projectId = typeof body.projectId === "string" ? body.projectId.trim() : "";
   const action = body.action;
-  if (!projectId || !["start", "retry", "pause"].includes(String(action))) {
+  if (!projectId || !["start", "retry", "pause", "cancel"].includes(String(action))) {
     return NextResponse.json({ error: "作品编号或操作无效" }, { status: 400 });
   }
 
@@ -41,6 +46,10 @@ export async function POST(request: Request) {
     if (action === "pause") {
       const workspace = await pauseBackgroundRun(ownerId, projectId);
       return NextResponse.json({ status: "paused", workspace });
+    }
+    if (action === "cancel") {
+      const workspace = await cancelBackgroundRun(ownerId, projectId);
+      return NextResponse.json({ status: "cancelled", workspace });
     }
     const configuration = backgroundConfiguration();
     if (!configuration.apiKey || !configuration.model) {

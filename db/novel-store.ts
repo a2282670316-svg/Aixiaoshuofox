@@ -25,6 +25,38 @@ export type GenerationStepInput = {
 };
 
 let schemaReady: Promise<void> | null = null;
+const WORKSPACE_COMPRESSION_THRESHOLD = 100_000;
+const COMPRESSED_WORKSPACE_PREFIX = "gzip:";
+
+function bytesToBase64(bytes: Uint8Array) {
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+  }
+  return btoa(binary);
+}
+
+function base64ToBytes(value: string) {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return bytes;
+}
+
+async function encodeWorkspace(workspace: WorkspaceData) {
+  const json = JSON.stringify(workspace);
+  if (json.length < WORKSPACE_COMPRESSION_THRESHOLD || typeof CompressionStream === "undefined") return json;
+  const compressed = new Blob([new TextEncoder().encode(json)]).stream().pipeThrough(new CompressionStream("gzip"));
+  return COMPRESSED_WORKSPACE_PREFIX + bytesToBase64(new Uint8Array(await new Response(compressed).arrayBuffer()));
+}
+
+async function decodeWorkspace(value: string): Promise<WorkspaceData> {
+  if (!value.startsWith(COMPRESSED_WORKSPACE_PREFIX)) return JSON.parse(value) as WorkspaceData;
+  if (typeof DecompressionStream === "undefined") throw new Error("Compressed workspace is not supported by this runtime");
+  const bytes = base64ToBytes(value.slice(COMPRESSED_WORKSPACE_PREFIX.length));
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
+  return JSON.parse(await new Response(stream).text()) as WorkspaceData;
+}
 
 export function ensureNovelSchema() {
   if (schemaReady) return schemaReady;
@@ -157,7 +189,7 @@ export async function getProject(ownerId: string, projectId: string) {
     title: String(row.title),
     genre: String(row.genre),
     status: String(row.status),
-    workspace: JSON.parse(String(row.workspace_json)) as WorkspaceData,
+    workspace: await decodeWorkspace(String(row.workspace_json)),
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
     revision: Number(row.revision) || 1,
@@ -173,7 +205,7 @@ export async function saveProject(
   await ensureNovelSchema();
   const db = getD1();
   const now = new Date().toISOString();
-  const serialized = JSON.stringify(workspace);
+  const serialized = await encodeWorkspace(workspace);
   if (expectedRevision === undefined) {
     const result = await db.prepare(`INSERT OR IGNORE INTO projects
       (id, owner_id, title, genre, status, workspace_json, revision, created_at, updated_at)
@@ -204,7 +236,7 @@ export async function saveSnapshot(ownerId: string, projectId: string, label: st
   const id = crypto.randomUUID();
   await getD1().prepare(`INSERT INTO workspace_snapshots
     (id, project_id, owner_id, label, workspace_json, created_at) VALUES (?, ?, ?, ?, ?, ?)`)
-    .bind(id, projectId, ownerId, label.slice(0, 200), JSON.stringify(workspace), new Date().toISOString())
+    .bind(id, projectId, ownerId, label.slice(0, 200), await encodeWorkspace(workspace), new Date().toISOString())
     .run();
   await getD1().prepare(`DELETE FROM workspace_snapshots WHERE id IN (
     SELECT id FROM workspace_snapshots WHERE project_id = ? AND owner_id = ?
@@ -282,6 +314,15 @@ export async function saveAutomationCheckpoint(
         step.error?.slice(0, 4000) ?? null, JSON.stringify(run.usage), now, now));
   }
   await db.batch(statements);
+  await db.batch([
+    db.prepare(`DELETE FROM automation_runs WHERE id IN (
+      SELECT id FROM automation_runs WHERE project_id = ? AND owner_id = ?
+      ORDER BY updated_at DESC LIMIT -1 OFFSET 20
+    )`).bind(projectId, ownerId),
+    db.prepare(`DELETE FROM background_responses
+      WHERE status IN ('completed', 'failed', 'cancelled') AND julianday(updated_at) < julianday('now', '-90 days')`),
+    db.prepare(`DELETE FROM webhook_events WHERE julianday(received_at) < julianday('now', '-90 days')`),
+  ]);
   return { projectId, runId: run.runId, revision: savedProject.revision, updatedAt: now };
 }
 

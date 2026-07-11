@@ -138,6 +138,7 @@ export interface Chapter {
     completedSegments: number;
     baseRevision: number;
     repairAttempts?: number;
+    draftAttempts?: number;
     acceptedAt?: string;
   };
 }
@@ -174,6 +175,8 @@ export interface ChapterMemory {
   }>;
 }
 
+export type CanonFactLevel = "author" | "text" | "ai_verified" | "inferred";
+
 export interface CanonLedger {
   revision: number;
   chapterSummaries: Array<{ chapterId: string; chapterNumber: number; summary: string }>;
@@ -191,7 +194,7 @@ export interface CanonLedger {
     goal?: string;
   }>;
   threads: Array<{ id: string; title: string; status: "open" | "resolved"; openedChapter: number; resolvedChapter?: number }>;
-  facts: Array<{ id: string; chapterNumber: number; fact: string }>;
+  facts: Array<{ id: string; chapterNumber: number; fact: string; level?: CanonFactLevel; evidence?: string }>;
   lastAuditedChapter: number;
 }
 
@@ -207,6 +210,7 @@ export interface ConsistencyIssue {
   evidence?: string;
   suggestedFix?: string;
   source?: "local" | "ai";
+  fingerprint?: string;
 }
 
 export interface Material {
@@ -274,9 +278,15 @@ export interface WritingRange {
 
 export type AIStage = "ideation" | "blueprint" | "chapter" | "memory" | "audit" | "repair";
 
+export type AIReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh";
+export type AIVerbosity = "low" | "medium" | "high";
+
 export interface StageModelConfig {
   model?: string;
   maxOutputTokens?: number;
+  temperature?: number;
+  reasoningEffort?: AIReasoningEffort;
+  verbosity?: AIVerbosity;
 }
 
 export interface AutomationTaskLog {
