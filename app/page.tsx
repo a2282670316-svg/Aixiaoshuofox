@@ -78,6 +78,13 @@ import type {
 } from "@/lib/types";
 
 const WORKSPACE_KEY = "novel-forge-workspace-v2";
+function isBackgroundWorkspace(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const project = (value as { project?: unknown }).project;
+  return Boolean(project && typeof project === "object" && !Array.isArray(project)
+    && (project as { status?: unknown }).status === "AI 后台创作中");
+}
+
 const CONFIG_KEY = "novel-forge-ai-config-v1";
 const SESSION_KEY = "novel-forge-ai-session-key";
 const BACKUP_KEY = "novel-forge-workspace-backups-v1";
@@ -260,7 +267,9 @@ export default function Home() {
       .then(async (response) => {
         const payload = await response.json().catch(() => ({})) as { project?: { workspace?: unknown; revision?: number }; error?: string };
         if (!response.ok || !payload.project?.workspace) throw new Error(payload.error || "云端恢复失败");
-        const restored = normalizeWorkspaceData(payload.project.workspace, DEMO_WORKSPACE);
+        const restored = normalizeWorkspaceData(payload.project.workspace, DEMO_WORKSPACE, {
+          preserveWritingPhase: isBackgroundWorkspace(payload.project.workspace),
+        });
         setWorkspace(restored);
         if (payload.project.revision) activeCloudRevisionRef.current = payload.project.revision;
         setBackgroundActive(restored.project.status === "AI 后台创作中" && restored.automation.phase === "writing");
@@ -286,14 +295,14 @@ export default function Home() {
         const response = await fetch(`/api/automation/background?projectId=${encodeURIComponent(activeCloudProjectId)}`);
         const payload = await response.json() as { project?: { workspace?: unknown; revision?: number }; active?: { status?: string } | null; configuration?: BackgroundConfiguration; error?: string };
         if (!response.ok || !payload.project?.workspace) throw new Error(payload.error || "读取后台进度失败");
-        const next = normalizeWorkspaceData(payload.project.workspace, DEMO_WORKSPACE);
+        const next = normalizeWorkspaceData(payload.project.workspace, DEMO_WORKSPACE, { preserveWritingPhase: true });
         setWorkspace(next);
         if (payload.project.revision) activeCloudRevisionRef.current = payload.project.revision;
         if (payload.configuration) setBackgroundConfiguration(payload.configuration);
         const stillActive = ["queued", "processing"].includes(payload.active?.status || "") && next.automation.phase === "writing";
         setBackgroundActive(stillActive);
-        if (!stillActive && next.automation.phase === "completed") {
-          setToast("云端已完成全书初稿");
+        if (!stillActive && ["completed", "paused"].includes(next.automation.phase)) {
+          setToast(next.automation.phase === "completed" ? "云端已完成全书初稿" : "云端已完成所选章节范围");
           if (toastTimer.current) window.clearTimeout(toastTimer.current);
           toastTimer.current = window.setTimeout(() => setToast(""), 2300);
         }
@@ -459,11 +468,12 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ projectId, action: "start" }),
       });
-      const payload = await response.json().catch(() => ({})) as { workspace?: unknown; error?: string };
+      const payload = await response.json().catch(() => ({})) as { workspace?: unknown; status?: string; error?: string };
       if (!response.ok) throw new Error(payload.error || "启动云端后台写作失败");
-      if (payload.workspace) setWorkspace(normalizeWorkspaceData(payload.workspace, DEMO_WORKSPACE));
-      setBackgroundActive(true);
-      notify("云端后台写作已启动，现在可以关闭网页");
+      if (payload.workspace) setWorkspace(normalizeWorkspaceData(payload.workspace, DEMO_WORKSPACE, { preserveWritingPhase: true }));
+      const active = payload.status === "queued";
+      setBackgroundActive(active);
+      notify(active ? "云端后台写作已启动，现在可以关闭网页" : "所选写作范围已经完成");
     } catch (error) {
       notify(error instanceof Error ? error.message : "启动云端后台写作失败");
     } finally {
@@ -500,7 +510,9 @@ export default function Home() {
       const response = await fetch(`/api/projects?id=${encodeURIComponent(projectId)}`);
       const payload = await response.json().catch(() => ({})) as { project?: { workspace?: unknown; revision?: number }; error?: string };
       if (!response.ok || !payload.project?.workspace) throw new Error(payload.error || "读取云端作品失败");
-      const next = normalizeWorkspaceData(payload.project.workspace, DEMO_WORKSPACE);
+      const next = normalizeWorkspaceData(payload.project.workspace, DEMO_WORKSPACE, {
+        preserveWritingPhase: isBackgroundWorkspace(payload.project.workspace),
+      });
       createBackup(workspace, "切换云端作品前自动备份");
       setWorkspace(next);
       setBackgroundActive(next.project.status === "AI 后台创作中" && next.automation.phase === "writing");

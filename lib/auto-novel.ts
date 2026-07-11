@@ -12,6 +12,7 @@ import type {
   Relationship,
   StorySeed,
   WorkspaceData,
+  WritingRange,
   WorldEntry,
 } from "./types";
 
@@ -62,6 +63,69 @@ export function restartBlueprintDraft(
     ...(completedStage >= 2 && draft.world ? { world: draft.world } : {}),
     ...(completedStage >= 3 && draft.outline ? { outline: draft.outline } : {}),
     ...(completedStage >= 4 && draft.foreshadows ? { foreshadows: draft.foreshadows } : {}),
+  };
+}
+
+export type WritingRangeEstimate = {
+  range: WritingRange;
+  chapters: Chapter[];
+  pendingChapters: Chapter[];
+  remainingSegments: number;
+  minimumRequests: number;
+  remainingRequestBudget: number;
+  missingPredecessorNumbers: number[];
+  errors: string[];
+};
+
+export function resolveWritingRange(workspace: WorkspaceData): WritingRange {
+  const ordered = [...workspace.chapters].sort((a, b) => a.number - b.number);
+  const first = ordered[0]?.number || 1;
+  const last = ordered.at(-1)?.number || first;
+  const requestedFrom = workspace.automation.writingRange?.fromChapter ?? first;
+  const requestedTo = workspace.automation.writingRange?.toChapter ?? last;
+  const fromChapter = Math.min(last, Math.max(first, Math.round(requestedFrom)));
+  const toChapter = Math.min(last, Math.max(first, Math.round(requestedTo)));
+  return {
+    fromChapter: Math.min(fromChapter, toChapter),
+    toChapter: Math.max(fromChapter, toChapter),
+  };
+}
+
+export function estimateWritingRange(workspace: WorkspaceData): WritingRangeEstimate {
+  const range = resolveWritingRange(workspace);
+  const ordered = [...workspace.chapters].sort((a, b) => a.number - b.number);
+  const chapters = ordered.filter((chapter) => chapter.number >= range.fromChapter && chapter.number <= range.toChapter);
+  const pendingChapters = chapters.filter((chapter) => !workspace.automation.generatedChapterIds.includes(chapter.id));
+  const remainingSegments = pendingChapters.reduce((total, chapter) => {
+    const segments = Math.max(1, Math.ceil(chapter.targetWords / 2200));
+    return total + Math.max(0, segments - Math.min(segments, chapter.generation?.completedSegments || 0));
+  }, 0);
+  const auditRequests = chapters.filter((chapter) =>
+    (chapter.number % 5 === 0 || chapter.number === range.toChapter)
+    && (!workspace.automation.generatedChapterIds.includes(chapter.id) || workspace.canon.lastAuditedChapter < chapter.number)
+  ).length;
+  const minimumRequests = remainingSegments + pendingChapters.length + auditRequests;
+  const missingPredecessorNumbers = ordered
+    .filter((chapter) => chapter.number < range.fromChapter && !chapter.content.trim())
+    .map((chapter) => chapter.number);
+  const remainingRequestBudget = Math.max(0, workspace.automation.maxRequests - workspace.automation.usage.requestCount);
+  const errors: string[] = [];
+  if (!chapters.length) errors.push("所选写作范围没有可用章节");
+  if (missingPredecessorNumbers.length) {
+    errors.push(`第 ${missingPredecessorNumbers.join("、")} 章尚无正文，不能跳过前文直接生成后续章节`);
+  }
+  if (minimumRequests > remainingRequestBudget) {
+    errors.push(`所选范围至少需要 ${minimumRequests} 次模型调用，当前仅剩 ${remainingRequestBudget} 次预算`);
+  }
+  return {
+    range,
+    chapters,
+    pendingChapters,
+    remainingSegments,
+    minimumRequests,
+    remainingRequestBudget,
+    missingPredecessorNumbers,
+    errors,
   };
 }
 
@@ -126,6 +190,10 @@ export function rewindNovelFromChapter(
       currentChapterNumber: chapterNumber,
       currentSegment: 0,
       generatedChapterIds: workspace.automation.generatedChapterIds.filter((id) => !affectedIds.has(id)),
+      writingRange: {
+        fromChapter: chapterNumber,
+        toChapter: Math.max(chapterNumber, ...workspace.chapters.map((chapter) => chapter.number)),
+      },
       lastError: undefined,
       updatedAt: now,
     },

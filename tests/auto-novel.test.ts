@@ -5,6 +5,7 @@ import {
   buildBlueprintChaptersPrompt,
   applyChapterMemory,
   createAutomationState,
+  estimateWritingRange,
   parseChapterMemory,
   parseBlueprintStage,
   parseNovelBlueprint,
@@ -379,4 +380,80 @@ test("rewinds writing from a chapter without keeping future canon", () => {
 
 test("rejects rewinding to a chapter that does not exist", () => {
   assert.throws(() => rewindNovelFromChapter(DEMO_WORKSPACE, 999, "new-run"), /没有找到第 999 章/);
+});
+
+
+test("estimates a persisted chapter writing range and its minimum request budget", () => {
+  const settings = createAutomationState({
+    targetChapters: 4,
+    targetWords: 16000,
+    chapterWords: 4000,
+    maxRequests: 30,
+    writingRange: { fromChapter: 2, toChapter: 3 },
+  });
+  const parsed = parseNovelBlueprint(blueprintJson(), seed, settings);
+  const firstChapter = parsed.chapters[0];
+  const workspace: WorkspaceData = {
+    ...parsed,
+    chapters: parsed.chapters.map((chapter) => chapter.id === firstChapter.id ? { ...chapter, content: "已完成的前置章节" } : chapter),
+    automation: {
+      ...settings,
+      generatedChapterIds: [firstChapter.id],
+      usage: { requestCount: 5, inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+    },
+  };
+
+  const estimate = estimateWritingRange(workspace);
+  assert.deepEqual(estimate.range, { fromChapter: 2, toChapter: 3 });
+  assert.equal(estimate.chapters.length, 2);
+  assert.equal(estimate.pendingChapters.length, 2);
+  assert.equal(estimate.remainingSegments, 4);
+  assert.equal(estimate.minimumRequests, 7);
+  assert.equal(estimate.remainingRequestBudget, 25);
+  assert.deepEqual(estimate.errors, []);
+});
+
+test("blocks a writing range that skips empty predecessors or exceeds request budget", () => {
+  const settings = createAutomationState({
+    targetChapters: 4,
+    targetWords: 16000,
+    chapterWords: 4000,
+    maxRequests: 6,
+    writingRange: { fromChapter: 3, toChapter: 4 },
+  });
+  const parsed = parseNovelBlueprint(blueprintJson(), seed, settings);
+  const workspace: WorkspaceData = { ...parsed, automation: settings };
+  const estimate = estimateWritingRange(workspace);
+
+  assert.deepEqual(estimate.missingPredecessorNumbers, [1, 2]);
+  assert.equal(estimate.errors.length, 2);
+  assert.match(estimate.errors[0], /不能跳过前文/);
+  assert.match(estimate.errors[1], /仅剩 6 次预算/);
+});
+
+test("normalizes an imported writing range to existing chapter bounds", () => {
+  const normalized = normalizeWorkspaceData({
+    ...DEMO_WORKSPACE,
+    automation: {
+      ...DEMO_WORKSPACE.automation,
+      writingRange: { fromChapter: 999, toChapter: -5 },
+    },
+  }, DEMO_WORKSPACE);
+
+  assert.deepEqual(normalized.automation.writingRange, {
+    fromChapter: normalized.chapters[0].number,
+    toChapter: normalized.chapters.at(-1)!.number,
+  });
+});
+
+
+test("preserves an active background writing phase only when explicitly requested", () => {
+  const source = {
+    ...DEMO_WORKSPACE,
+    project: { ...DEMO_WORKSPACE.project, status: "AI 后台创作中" },
+    automation: { ...DEMO_WORKSPACE.automation, phase: "writing" },
+  };
+
+  assert.equal(normalizeWorkspaceData(source, DEMO_WORKSPACE).automation.phase, "paused");
+  assert.equal(normalizeWorkspaceData(source, DEMO_WORKSPACE, { preserveWritingPhase: true }).automation.phase, "writing");
 });

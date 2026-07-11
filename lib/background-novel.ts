@@ -7,6 +7,7 @@ import {
   buildAutomatedChapterPrompt,
   buildChapterMemoryPrompt,
   buildRollingAuditPrompt,
+  estimateWritingRange,
   parseChapterMemory,
   parseRollingAudit,
 } from "@/lib/auto-novel";
@@ -100,10 +101,12 @@ function updateUsage(workspace: WorkspaceData, usage: { input_tokens?: number; o
 
 function prepareWritingWorkspace(source: WorkspaceData): WorkspaceData {
   const runId = source.automation.runId || `auto-${Date.now()}-${crypto.randomUUID()}`;
+  const schedule = estimateWritingRange(source);
+  if (schedule.errors.length) throw new Error(schedule.errors[0]);
   return {
     ...source,
     project: { ...source.project, status: "AI 后台创作中" },
-    chapters: source.chapters.map((chapter) => source.automation.generatedChapterIds.includes(chapter.id) ? chapter : {
+    chapters: source.chapters.map((chapter) => source.automation.generatedChapterIds.includes(chapter.id) || chapter.number < schedule.range.fromChapter || chapter.number > schedule.range.toChapter ? chapter : {
       ...chapter,
       revision: chapter.revision || 0,
       generation: {
@@ -126,11 +129,12 @@ function prepareWritingWorkspace(source: WorkspaceData): WorkspaceData {
 function nextBackgroundStep(workspace: WorkspaceData): BackgroundStep | null {
   const runId = workspace.automation.runId;
   if (!runId) throw new Error("自动创作缺少运行编号");
-  const ordered = [...workspace.chapters].sort((a, b) => a.number - b.number);
+  const schedule = estimateWritingRange(workspace);
+  const ordered = schedule.chapters;
 
   for (const chapter of ordered) {
     const generated = workspace.automation.generatedChapterIds.includes(chapter.id);
-    const shouldAudit = chapter.number % 5 === 0 || chapter.number === ordered.at(-1)?.number;
+    const shouldAudit = chapter.number % 5 === 0 || chapter.number === schedule.range.toChapter;
     if (generated) {
       if (shouldAudit && workspace.canon.lastAuditedChapter < chapter.number) {
         return {
@@ -172,22 +176,24 @@ function nextBackgroundStep(workspace: WorkspaceData): BackgroundStep | null {
 
 async function finishRun(ownerId: string, projectId: string, workspace: WorkspaceData) {
   const runId = workspace.automation.runId;
+  const schedule = estimateWritingRange(workspace);
+  const allGenerated = workspace.chapters.every((chapter) => workspace.automation.generatedChapterIds.includes(chapter.id));
   const finished: WorkspaceData = {
     ...workspace,
-    project: { ...workspace.project, status: "初稿完成" },
-    outline: workspace.outline.map((item) => ({ ...item, status: "已完成" })),
+    project: { ...workspace.project, status: allGenerated ? "初稿完成" : "创作中" },
+    outline: allGenerated ? workspace.outline.map((item) => ({ ...item, status: "已完成" })) : workspace.outline,
     automation: {
       ...workspace.automation,
-      phase: "completed",
-      currentChapterNumber: workspace.chapters.length,
+      phase: allGenerated ? "completed" : "paused",
+      currentChapterNumber: allGenerated ? workspace.chapters.length : schedule.range.toChapter,
       currentSegment: 0,
       lastError: undefined,
       updatedAt: new Date().toISOString(),
     },
   };
   await saveAutomationCheckpoint(ownerId, projectId, finished, {
-    stepKey: `${runId}:completed`,
-    kind: "run_completed",
+    stepKey: `${runId}:${allGenerated ? "completed" : `range-completed:${schedule.range.fromChapter}-${schedule.range.toChapter}`}`,
+    kind: allGenerated ? "run_completed" : "range_completed",
     status: "completed",
   });
   return finished;
@@ -249,7 +255,7 @@ export async function enqueueNextBackgroundStep(ownerId: string, projectId: stri
   const step = nextBackgroundStep(workspace);
   if (!step) {
     workspace = await finishRun(ownerId, projectId, workspace);
-    return { status: "completed", workspace };
+    return { status: workspace.automation.phase === "completed" ? "completed" : "range_completed", workspace };
   }
   const submitted = await submitStep(ownerId, projectId, workspace, step);
   return { status: "queued", workspace, ...submitted };

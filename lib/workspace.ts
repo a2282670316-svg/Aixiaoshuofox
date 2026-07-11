@@ -87,6 +87,7 @@ function normalizeSeeds(value: unknown): StorySeed[] {
 export function normalizeWorkspaceData(
   value: unknown,
   fallback: WorkspaceData,
+  options: { preserveWritingPhase?: boolean } = {},
 ): WorkspaceData {
   const source = record(value);
   const rawProject = record(source.project);
@@ -234,6 +235,11 @@ export function normalizeWorkspaceData(
 
   const rawAutomation = record(source.automation);
   const rawUsage = record(rawAutomation.usage);
+  const rawWritingRange = record(rawAutomation.writingRange);
+  const firstChapterNumber = chapters[0]?.number || 1;
+  const lastChapterNumber = chapters.at(-1)?.number || firstChapterNumber;
+  const rangeFrom = numberValue(rawWritingRange.fromChapter, firstChapterNumber, firstChapterNumber, lastChapterNumber);
+  const rangeTo = numberValue(rawWritingRange.toChapter, lastChapterNumber, firstChapterNumber, lastChapterNumber);
   const rawBlueprintDraft = record(rawAutomation.blueprintDraft);
   const draftStage = numberValue(rawBlueprintDraft.completedStage, 0, 0, 5) as BlueprintDraft["completedStage"];
   const blueprintDraft: BlueprintDraft | undefined = typeof rawBlueprintDraft.seedId === "string" && rawBlueprintDraft.seedId.trim()
@@ -251,7 +257,7 @@ export function normalizeWorkspaceData(
   const storedPhase = enumValue<AutomationPhase>(rawAutomation.phase, allowedPhases, "idle");
   const automation = createAutomationState({
     runId: typeof rawAutomation.runId === "string" ? rawAutomation.runId.slice(0, 200) : undefined,
-    phase: storedPhase === "writing" ? "paused" : storedPhase,
+    phase: storedPhase === "writing" && !options.preserveWritingPhase ? "paused" : storedPhase,
     brief: stringValue(rawAutomation.brief, "", 10_000),
     seeds: normalizeSeeds(rawAutomation.seeds),
     selectedSeedId: typeof rawAutomation.selectedSeedId === "string" ? rawAutomation.selectedSeedId.slice(0, 160) : undefined,
@@ -261,6 +267,10 @@ export function normalizeWorkspaceData(
     currentChapterNumber: numberValue(rawAutomation.currentChapterNumber, 0, 0, 9999),
     currentSegment: numberValue(rawAutomation.currentSegment, 0, 0, 20),
     generatedChapterIds: stringList(rawAutomation.generatedChapterIds, 200).filter((item) => chapterIds.has(item)),
+    writingRange: chapters.length ? {
+      fromChapter: Math.min(rangeFrom, rangeTo),
+      toChapter: Math.max(rangeFrom, rangeTo),
+    } : undefined,
     usage: {
       requestCount: numberValue(rawUsage.requestCount, 0, 0, 1_000_000),
       inputTokens: numberValue(rawUsage.inputTokens, 0, 0, 1_000_000_000),

@@ -39,6 +39,7 @@ import {
   buildSeedPrompt,
   applyChapterMemory,
   createAutomationState,
+  estimateWritingRange,
   parseChapterMemory,
   parseBlueprintStage,
   parseNovelBlueprint,
@@ -137,14 +138,16 @@ export default function AutoNovelStudio({
   const usageRef = useRef(workspace.automation.usage);
   const budgetRef = useRef({ maxRequests: workspace.automation.maxRequests, maxTokens: workspace.automation.maxTokens });
   const [blueprintStage, setBlueprintStage] = useState("");
-  const [rewindChapterNumber, setRewindChapterNumber] = useState(
-    Math.max(1, workspace.automation.currentChapterNumber || 1),
-  );
   const automation = workspace.automation;
   const isRunning = activePhases.includes(automation.phase) && !(automation.phase === "planning" && !aiBusy);
   const generatedCount = workspace.chapters.filter((item) => automation.generatedChapterIds.includes(item.id)).length;
   const estimatedSegments = Math.max(1, Math.ceil(automation.chapterWords / 2200));
   const estimatedCalls = 6 + automation.targetChapters * (estimatedSegments + 1) + Math.ceil(automation.targetChapters / 5);
+  const writingEstimate = estimateWritingRange(workspace);
+  const scheduledWorkspace: WorkspaceData = {
+    ...workspace,
+    automation: { ...workspace.automation, writingRange: writingEstimate.range },
+  };
 
   const patchAutomation = (patch: Partial<NovelAutomation>) => {
     setWorkspace((current) => ({
@@ -364,6 +367,11 @@ export default function AutoNovelStudio({
 
   const writeNovel = async (source: WorkspaceData) => {
     if (!ensureConfigured()) return;
+    const schedule = estimateWritingRange(source);
+    if (schedule.errors.length) {
+      notify(schedule.errors[0]);
+      return;
+    }
     usageRef.current = source.automation.usage;
     budgetRef.current = { maxRequests: source.automation.maxRequests, maxTokens: source.automation.maxTokens };
     const runId = source.automation.runId || nextRunId();
@@ -372,7 +380,7 @@ export default function AutoNovelStudio({
     let working: WorkspaceData = {
       ...source,
       project: { ...source.project, status: "AI 创作中" },
-      chapters: source.chapters.map((chapter) => source.automation.generatedChapterIds.includes(chapter.id) ? chapter : {
+      chapters: source.chapters.map((chapter) => source.automation.generatedChapterIds.includes(chapter.id) || chapter.number < schedule.range.fromChapter || chapter.number > schedule.range.toChapter ? chapter : {
         ...chapter,
         revision: chapter.revision || 0,
         generation: {
@@ -395,7 +403,9 @@ export default function AutoNovelStudio({
     setWorkspace(working);
 
     try {
-      const ordered = [...working.chapters].sort((a, b) => a.number - b.number);
+      const ordered = [...working.chapters]
+        .sort((a, b) => a.number - b.number)
+        .filter((chapter) => chapter.number >= schedule.range.fromChapter && chapter.number <= schedule.range.toChapter);
       for (const item of ordered) {
         if (stopRequested.current || runTokenRef.current !== runId) break;
         if (working.automation.generatedChapterIds.includes(item.id)) continue;
@@ -559,14 +569,15 @@ export default function AutoNovelStudio({
         return;
       }
 
+      const allGenerated = working.chapters.every((chapter) => working.automation.generatedChapterIds.includes(chapter.id));
       working = {
         ...working,
-        project: { ...working.project, status: "初稿完成" },
-        outline: working.outline.map((item) => ({ ...item, status: "已完成" })),
+        project: { ...working.project, status: allGenerated ? "初稿完成" : "创作中" },
+        outline: allGenerated ? working.outline.map((item) => ({ ...item, status: "已完成" })) : working.outline,
         automation: {
           ...working.automation,
-          phase: "completed",
-          currentChapterNumber: working.chapters.length,
+          phase: allGenerated ? "completed" : "paused",
+          currentChapterNumber: allGenerated ? working.chapters.length : schedule.range.toChapter,
           currentSegment: 0,
           lastError: undefined,
           usage: usageRef.current,
@@ -575,11 +586,13 @@ export default function AutoNovelStudio({
       };
       setWorkspace(working);
       await onDurableCheckpoint?.(working, {
-        stepKey: `${runId}:completed`,
-        kind: "run_completed",
+        stepKey: `${runId}:${allGenerated ? "completed" : `range-completed:${schedule.range.fromChapter}-${schedule.range.toChapter}`}`,
+        kind: allGenerated ? "run_completed" : "range_completed",
         status: "completed",
       });
-      notify("全书初稿已经完成，可以进入章节审阅与导出");
+      notify(allGenerated
+        ? "全书初稿已经完成，可以进入章节审阅与导出"
+        : `第 ${schedule.range.fromChapter}—${schedule.range.toChapter} 章已生成完成，任务已在范围终点安全停靠`);
     } catch (error) {
       const paused = stopRequested.current || controllerRef.current?.signal.aborted;
       working = {
@@ -655,6 +668,7 @@ export default function AutoNovelStudio({
           currentChapterNumber: 1,
           currentSegment: 0,
           generatedChapterIds: [],
+          writingRange: { fromChapter: 1, toChapter: currentSettings.targetChapters },
           usage: usageRef.current,
           maxRequests: currentSettings.maxRequests,
           maxTokens: currentSettings.maxTokens,
@@ -808,13 +822,21 @@ export default function AutoNovelStudio({
   };
 
   const rewindWritingFromChapter = async () => {
-    const chapter = workspace.chapters.find((item) => item.number === rewindChapterNumber);
+    const chapterNumber = writingEstimate.range.fromChapter;
+    const chapter = workspace.chapters.find((item) => item.number === chapterNumber);
     if (!chapter || aiBusy || backgroundBusy || backgroundActive) return;
     const affectedCount = workspace.chapters.filter((item) => item.number >= chapter.number).length;
-    if (!window.confirm(`将清空第 ${chapter.number} 章及之后 ${affectedCount} 章的正文、章节记忆和审校结果，并从这里重新写作。现有正文会自动存入版本历史和完整备份，是否继续？`)) return;
+    if (!window.confirm(`将清空第 ${chapter.number} 章及之后 ${affectedCount} 章的正文、章节记忆和审校结果。现有正文会自动存入版本历史和完整备份，是否继续？`)) return;
 
     const runId = nextRunId();
-    const rewound = rewindNovelFromChapter(workspace, chapter.number, runId);
+    const rewoundBase = rewindNovelFromChapter(workspace, chapter.number, runId);
+    const rewound: WorkspaceData = {
+      ...rewoundBase,
+      automation: {
+        ...rewoundBase.automation,
+        writingRange: writingEstimate.range,
+      },
+    };
     onBackup(workspace, `从第 ${chapter.number} 章重写前自动备份`);
     usageRef.current = rewound.automation.usage;
     budgetRef.current = { maxRequests: rewound.automation.maxRequests, maxTokens: rewound.automation.maxTokens };
@@ -824,10 +846,19 @@ export default function AutoNovelStudio({
       kind: "run_rewind",
       chapterNumber: chapter.number,
       status: "completed",
-      outputExcerpt: `已回退到第 ${chapter.number} 章，等待重新写作`,
+      outputExcerpt: `已回退到第 ${chapter.number} 章，计划写作至第 ${writingEstimate.range.toChapter} 章`,
       contextHash: `canon:${rewound.canon.revision}`,
     });
-    notify(`已安全回退到第 ${chapter.number} 章，可选择浏览器或云端后台重新写作`);
+    notify(`已安全回退到第 ${chapter.number} 章，可按当前范围重新写作`);
+  };
+
+  const updateWritingRange = (fromChapter: number, toChapter: number) => {
+    patchAutomation({
+      writingRange: {
+        fromChapter: Math.min(fromChapter, toChapter),
+        toChapter: Math.max(fromChapter, toChapter),
+      },
+    });
   };
 
   const pause = () => {
@@ -874,7 +905,7 @@ export default function AutoNovelStudio({
         <div className="heading-actions">
           {["writing", "planning"].includes(automation.phase) && aiBusy ? <button className="secondary-button" onClick={() => backgroundActive ? void onPauseBackground?.() : pause()}><Pause size={16} />暂停</button> : null}
           {resumableSeed && ["planning", "paused", "error"].includes(automation.phase) && automation.blueprintDraft && automation.blueprintDraft.completedStage < 5 ? <button className="primary-button" disabled={aiBusy} onClick={() => void buildBlueprintFrom(workspace, resumableSeed, false)}><RotateCcw size={16} />从第 {Math.min(5, automation.blueprintDraft!.completedStage + 1)} 步继续蓝图</button> : null}
-          {["paused", "error", "ready"].includes(automation.phase) && workspace.chapters.length ? <><button className="secondary-button" disabled={aiBusy || backgroundBusy} onClick={() => void writeNovel(workspace)}><Play size={16} />浏览器连续写作</button><button className="primary-button" disabled={backgroundBusy || !backgroundConfigured} onClick={() => void onStartBackground?.(workspace)}><Cloud size={16} />{backgroundBusy ? "正在启动…" : "云端后台写作"}</button></> : null}
+          {["paused", "error", "ready"].includes(automation.phase) && workspace.chapters.length ? <><button className="secondary-button" disabled={aiBusy || backgroundBusy || writingEstimate.pendingChapters.length === 0 || writingEstimate.errors.length > 0} onClick={() => void writeNovel(scheduledWorkspace)}><Play size={16} />浏览器连续写作</button><button className="primary-button" disabled={backgroundBusy || !backgroundConfigured || writingEstimate.pendingChapters.length === 0 || writingEstimate.errors.length > 0} onClick={() => void onStartBackground?.(scheduledWorkspace)}><Cloud size={16} />{backgroundBusy ? "正在启动…" : "云端后台写作"}</button></> : null}
         </div>
       </div>
 
@@ -936,12 +967,23 @@ export default function AutoNovelStudio({
         </div>
       </section>}
 
-      {automation.runId && workspace.chapters.length > 0 && <section className="auto-settings-card auto-rewind-card card">
-        <div className="auto-section-title"><div><span>正文恢复</span><h2>从指定章节安全重写</h2></div><small>自动保存旧正文并回滚后续记忆</small></div>
-        <div className="auto-rewind-controls">
-          <label><span>重新开始章节</span><select disabled={isRunning || backgroundActive} value={rewindChapterNumber} onChange={(event) => setRewindChapterNumber(Number(event.target.value))}>{[...workspace.chapters].sort((a, b) => a.number - b.number).map((item) => <option key={item.id} value={item.number}>第 {item.number} 章 · {item.title}</option>)}</select></label>
-          <div><b>会发生什么？</b><p>保留此前章节；清空所选章节及后续正文，移除对应事实账本与旧 AI 审校，并为已有正文建立章节版本。</p></div>
-          <button className="secondary-button" disabled={isRunning || aiBusy || backgroundBusy || backgroundActive} onClick={() => void rewindWritingFromChapter()}><RotateCcw size={16} />安全回退</button>
+      {workspace.chapters.length > 0 && <section className="auto-settings-card auto-scheduler-card card">
+        <div className="auto-section-title"><div><span>写作调度中心</span><h2>按章节范围控制 AI 写作</h2></div><small>浏览器与云端后台共用同一计划</small></div>
+        <div className="auto-scheduler-grid">
+          <label><span>从第几章开始</span><select disabled={isRunning || backgroundActive} value={writingEstimate.range.fromChapter} onChange={(event) => updateWritingRange(Number(event.target.value), Math.max(Number(event.target.value), writingEstimate.range.toChapter))}>{[...workspace.chapters].sort((a, b) => a.number - b.number).map((item) => <option key={item.id} value={item.number}>第 {item.number} 章 · {item.title}</option>)}</select></label>
+          <label><span>写到第几章</span><select disabled={isRunning || backgroundActive} value={writingEstimate.range.toChapter} onChange={(event) => updateWritingRange(Math.min(writingEstimate.range.fromChapter, Number(event.target.value)), Number(event.target.value))}>{[...workspace.chapters].sort((a, b) => a.number - b.number).map((item) => <option key={item.id} value={item.number}>第 {item.number} 章 · {item.title}</option>)}</select></label>
+          <div className="auto-scheduler-stat"><span><FileText size={15} />待生成章节</span><b>{writingEstimate.pendingChapters.length}</b><small>共 {writingEstimate.chapters.length} 章在范围内</small></div>
+          <div className="auto-scheduler-stat"><span><PenLine size={15} />剩余正文分段</span><b>{writingEstimate.remainingSegments}</b><small>按每段约 2,200 字估算</small></div>
+          <div className="auto-scheduler-stat"><span><Zap size={15} />最低模型调用</span><b>{writingEstimate.minimumRequests}</b><small>当前还有 {writingEstimate.remainingRequestBudget} 次预算</small></div>
+        </div>
+        <div className={`auto-scheduler-health ${writingEstimate.errors.length ? "has-error" : "is-ready"}`}>
+          {writingEstimate.errors.length ? <><AlertTriangle size={17} /><div><b>当前计划需要调整</b>{writingEstimate.errors.map((error) => <p key={error}>{error}</p>)}</div></> : <><Check size={17} /><div><b>写作计划已就绪</b><p>任务将在第 {writingEstimate.range.toChapter} 章完成审校后自动停靠，不会继续生成范围外章节。</p></div></>}
+        </div>
+        <div className="auto-scheduler-actions">
+          <span>“安全回退”会清理起点之后的旧正文和未来事实，适合大幅改写。</span>
+          <button className="secondary-button" disabled={isRunning || aiBusy || backgroundBusy || backgroundActive} onClick={() => void rewindWritingFromChapter()}><RotateCcw size={16} />从起点安全回退</button>
+          <button className="secondary-button" disabled={isRunning || aiBusy || backgroundBusy || writingEstimate.errors.length > 0} onClick={() => void writeNovel(scheduledWorkspace)}><Play size={16} />浏览器生成范围</button>
+          <button className="primary-button" disabled={isRunning || backgroundBusy || !backgroundConfigured || writingEstimate.errors.length > 0} onClick={() => void onStartBackground?.(scheduledWorkspace)}><Cloud size={16} />云端生成范围</button>
         </div>
       </section>}
 
@@ -959,7 +1001,7 @@ export default function AutoNovelStudio({
         </div>
         <footer className="auto-control-bar">
           <span>{backgroundActive ? <Cloud size={14} /> : durableProjectId ? <Cloud size={14} /> : <AlertTriangle size={14} />}{backgroundActive ? "后台工作器正在接力生成，关闭网页后任务仍会继续。" : durableProjectId ? backgroundConfigured ? "云端检查点已开启；保持后台工作器运行即可关闭网页。" : "云端检查点已开启；第三方后台模型密钥尚待配置。" : "首次运行会创建云端检查点；浏览器模式需保持页面打开。"}</span>
-          <div>{automation.phase === "writing" ? <button className="secondary-button" disabled={backgroundBusy} onClick={() => backgroundActive ? void onPauseBackground?.() : pause()}><CircleStop size={16} />暂停并保存</button> : automation.phase !== "completed" ? <><button className="secondary-button" disabled={aiBusy || backgroundBusy} onClick={() => void writeNovel(workspace)}><Play size={16} />浏览器续写</button><button className="primary-button" disabled={backgroundBusy || !backgroundConfigured} onClick={() => void onStartBackground?.(workspace)}><Cloud size={16} />云端后台续写</button></> : <button className="primary-button" onClick={() => onOpenChapter(workspace.chapters[0].id)}><BookOpenCheck size={16} />审阅全书</button>}<button className="secondary-button" disabled={isRunning} onClick={resetWorkflow}><RotateCcw size={15} />重置流程</button></div>
+          <div>{automation.phase === "writing" ? <button className="secondary-button" disabled={backgroundBusy} onClick={() => backgroundActive ? void onPauseBackground?.() : pause()}><CircleStop size={16} />暂停并保存</button> : automation.phase !== "completed" ? <><button className="secondary-button" disabled={aiBusy || backgroundBusy || writingEstimate.pendingChapters.length === 0 || writingEstimate.errors.length > 0} onClick={() => void writeNovel(scheduledWorkspace)}><Play size={16} />浏览器续写</button><button className="primary-button" disabled={backgroundBusy || !backgroundConfigured || writingEstimate.pendingChapters.length === 0 || writingEstimate.errors.length > 0} onClick={() => void onStartBackground?.(scheduledWorkspace)}><Cloud size={16} />云端后台续写</button></> : <button className="primary-button" onClick={() => onOpenChapter(workspace.chapters[0].id)}><BookOpenCheck size={16} />审阅全书</button>}<button className="secondary-button" disabled={isRunning} onClick={resetWorkflow}><RotateCcw size={15} />重置流程</button></div>
         </footer>
       </section>}
     </div>

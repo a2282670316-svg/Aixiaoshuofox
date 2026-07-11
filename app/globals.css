@@ -933,14 +933,21 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .auto-seed-actions { margin-top: 12px; padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: #fff; display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
 .auto-seed-actions > span { margin-right: auto; color: var(--soft); font-size: 8px; }
 
-.auto-rewind-card { margin-top: 18px; }
-.auto-rewind-controls { display: grid; grid-template-columns: minmax(220px, .8fr) minmax(280px, 1.4fr) auto; align-items: end; gap: 12px; }
-.auto-rewind-controls label { display: grid; gap: 7px; }
-.auto-rewind-controls label > span, .auto-rewind-controls div > b { color: #475467; font-size: 10px; font-weight: 750; }
-.auto-rewind-controls select { width: 100%; min-height: 38px; padding: 0 10px; border: 1px solid var(--line); border-radius: 8px; color: var(--ink); background: #fbfcfe; font-size: 10px; }
-.auto-rewind-controls div { display: grid; gap: 5px; }
-.auto-rewind-controls p { margin: 0; color: var(--soft); font-size: 8px; line-height: 1.6; }
-.auto-rewind-controls button { justify-content: center; }
+.auto-scheduler-card { margin-top: 18px; }
+.auto-scheduler-grid { display: grid; grid-template-columns: repeat(2, minmax(180px, 1fr)) repeat(3, minmax(130px, .72fr)); gap: 10px; }
+.auto-scheduler-grid label, .auto-scheduler-stat { min-height: 82px; padding: 11px; border: 1px solid var(--line); border-radius: 9px; background: #fbfcfe; display: grid; align-content: center; gap: 7px; }
+.auto-scheduler-grid label > span, .auto-scheduler-stat > span { display: flex; align-items: center; gap: 5px; color: #475467; font-size: 9px; font-weight: 750; }
+.auto-scheduler-grid select { width: 100%; min-height: 34px; padding: 0 8px; border: 1px solid #dfe3eb; border-radius: 7px; color: var(--ink); background: #fff; font-size: 9px; }
+.auto-scheduler-stat b { color: var(--ink); font-size: 22px; line-height: 1; }
+.auto-scheduler-stat small { color: var(--soft); font-size: 8px; }
+.auto-scheduler-health { margin-top: 10px; padding: 11px 12px; border: 1px solid; border-radius: 9px; display: grid; grid-template-columns: 20px 1fr; gap: 8px; align-items: start; }
+.auto-scheduler-health.is-ready { color: #166534; border-color: #bbf7d0; background: #f0fdf4; }
+.auto-scheduler-health.has-error { color: #b45309; border-color: #fed7aa; background: #fff7ed; }
+.auto-scheduler-health div { display: grid; gap: 3px; }
+.auto-scheduler-health b { font-size: 9px; }
+.auto-scheduler-health p { margin: 0; color: currentColor; font-size: 8px; line-height: 1.55; opacity: .88; }
+.auto-scheduler-actions { margin-top: 10px; display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+.auto-scheduler-actions > span { margin-right: auto; max-width: 480px; color: var(--soft); font-size: 8px; line-height: 1.55; }
 
 .auto-progress-card { margin-top: 18px; }
 .auto-progress-head { display: grid; grid-template-columns: 1fr 92px; align-items: center; gap: 20px; }
@@ -1029,7 +1036,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   .auto-step-grid { grid-template-columns: 1fr 1fr; }
   .auto-number-grid { grid-template-columns: 1fr; }
   .auto-seed-actions { align-items: stretch; flex-direction: column; }
-  .auto-rewind-controls { grid-template-columns: 1fr; align-items: stretch; }
+  .auto-scheduler-grid { grid-template-columns: 1fr 1fr; }
+  .auto-scheduler-actions { align-items: stretch; flex-direction: column; }
+  .auto-scheduler-actions > span { margin: 0 0 3px; max-width: none; }
   .auto-seed-actions > span { margin: 0 0 3px; }
   .auto-progress-head { grid-template-columns: 1fr 76px; }
   .auto-progress-ring { width: 72px; height: 72px; }
@@ -1050,6 +1059,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 @media (max-width: 460px) {
   .auto-step-grid { grid-template-columns: 1fr; }
   .auto-settings-card, .auto-progress-card { padding: 15px; }
+  .auto-scheduler-grid { grid-template-columns: 1fr; }
   .auto-progress-meta { display: grid; gap: 8px; }
   .auto-control-bar > div { grid-template-columns: 1fr; }
 }

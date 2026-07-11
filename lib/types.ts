@@ -175,6 +175,11 @@ export interface BlueprintDraft {
   chapters?: Record<string, unknown>;
 }
 
+export interface WritingRange {
+  fromChapter: number;
+  toChapter: number;
+}
+
 export interface NovelAutomation {
   runId?: string;
   phase: AutomationPhase;
@@ -187,6 +192,7 @@ export interface NovelAutomation {
   currentChapterNumber: number;
   currentSegment: number;
   generatedChapterIds: string[];
+  writingRange?: WritingRange;
   usage: {
     requestCount: number;
     inputTokens: number;
