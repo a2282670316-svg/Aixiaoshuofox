@@ -180,12 +180,32 @@ export function normalizeWorkspaceData(
         }];
       }),
     } : undefined;
+    const rawQuality = record(item.quality);
+    const quality = typeof rawQuality.overall === "number" ? {
+      overall: numberValue(rawQuality.overall, 0, 0, 100),
+      length: numberValue(rawQuality.length, 0, 0, 100),
+      outline: numberValue(rawQuality.outline, 0, 0, 100),
+      continuity: numberValue(rawQuality.continuity, 0, 0, 100),
+      foreshadow: numberValue(rawQuality.foreshadow, 0, 0, 100),
+      style: numberValue(rawQuality.style, 0, 0, 100),
+      evaluatedAt: dateValue(rawQuality.evaluatedAt),
+      notes: stringList(rawQuality.notes, 20),
+    } : undefined;
+    const rawRepairReview = record(item.repairReview);
+    const repairReview = typeof rawRepairReview.beforeVersionId === "string" ? {
+      beforeVersionId: rawRepairReview.beforeVersionId.slice(0, 200),
+      changeSummary: stringValue(rawRepairReview.changeSummary, "", 4000),
+      createdAt: dateValue(rawRepairReview.createdAt),
+      status: enumValue(rawRepairReview.status, ["pending", "accepted", "reverted"] as const, "pending"),
+    } : undefined;
     const rawGeneration = record(item.generation);
     const generation = typeof rawGeneration.runId === "string" ? {
       runId: rawGeneration.runId.slice(0, 200),
-      status: enumValue(rawGeneration.status, ["planned", "generating", "generated", "audited"] as const, "planned"),
+      status: enumValue(rawGeneration.status, ["planned", "generating", "generated", "audited", "repairing", "accepted", "blocked"] as const, "planned"),
       completedSegments: numberValue(rawGeneration.completedSegments, 0, 0, 20),
       baseRevision: numberValue(rawGeneration.baseRevision, 0, 0, 1_000_000),
+      repairAttempts: numberValue(rawGeneration.repairAttempts, 0, 0, 10),
+      acceptedAt: typeof rawGeneration.acceptedAt === "string" ? rawGeneration.acceptedAt.slice(0, 100) : undefined,
     } : undefined;
     return {
       id: nextId("chapter", item.id, index, chapterIds),
@@ -201,6 +221,8 @@ export function normalizeWorkspaceData(
       chapterOutline,
       revision: numberValue(item.revision, 0, 0, 1_000_000),
       memory,
+      quality,
+      repairReview,
       generation,
     };
   }).sort((a, b) => a.number - b.number);
@@ -332,6 +354,20 @@ export function normalizeWorkspaceData(
     },
     maxRequests: numberValue(rawAutomation.maxRequests, 250, 1, 10_000),
     maxTokens: numberValue(rawAutomation.maxTokens, 5_000_000, 1_000, 1_000_000_000),
+    stageModels: Object.fromEntries(Object.entries(record(rawAutomation.stageModels)).flatMap(([stage, value]) => {
+      if (!["ideation", "blueprint", "chapter", "memory", "audit", "repair"].includes(stage)) return [];
+      const config = record(value);
+      return [[stage, { model: typeof config.model === "string" ? config.model.slice(0, 300) : undefined, maxOutputTokens: typeof config.maxOutputTokens === "number" ? numberValue(config.maxOutputTokens, 16_384, 256, 131_072) : undefined }]];
+    })),
+    taskLog: objects(rawAutomation.taskLog, 500).map((item, index) => ({
+      id: stringValue(item.id, "task-" + (index + 1), 200),
+      runId: typeof item.runId === "string" ? item.runId.slice(0, 200) : undefined,
+      kind: stringValue(item.kind, "task", 200), label: stringValue(item.label, "AI 任务", 500),
+      status: enumValue(item.status, ["queued", "running", "completed", "failed", "cancelled"] as const, "completed"),
+      chapterNumber: typeof item.chapterNumber === "number" ? numberValue(item.chapterNumber, 1, 1, 9999) : undefined,
+      startedAt: dateValue(item.startedAt), finishedAt: typeof item.finishedAt === "string" ? dateValue(item.finishedAt) : undefined,
+      error: typeof item.error === "string" ? item.error.slice(0, 2000) : undefined,
+    })),
     lastError: typeof rawAutomation.lastError === "string" ? rawAutomation.lastError.slice(0, 2000) : undefined,
     blueprintDraft,
     updatedAt: typeof rawAutomation.updatedAt === "string" ? dateValue(rawAutomation.updatedAt) : undefined,

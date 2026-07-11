@@ -100,16 +100,26 @@ export function estimateWritingRange(workspace: WorkspaceData): WritingRangeEsti
     const segments = Math.max(1, Math.ceil(chapter.targetWords / 2200));
     return total + Math.max(0, segments - Math.min(segments, chapter.generation?.completedSegments || 0));
   }, 0);
-  const auditRequests = chapters.filter((chapter) =>
-    !workspace.automation.generatedChapterIds.includes(chapter.id) || workspace.canon.lastAuditedChapter < chapter.number
-  ).length;
-  const minimumRequests = remainingSegments + pendingChapters.length + auditRequests;
+  const workflowRequests = pendingChapters.reduce((total, chapter) => {
+    const segments = Math.max(1, Math.ceil(chapter.targetWords / 2200));
+    const completedSegments = Math.min(segments, chapter.generation?.completedSegments || 0);
+    if (completedSegments < segments) return total + 2;
+    if (!chapter.memory) return total + 2;
+    const blocking = workspace.issues.some((issue) => !issue.resolved && issue.severity === "错误" && issue.chapterNumber === chapter.number);
+    if (chapter.generation?.status === "audited" && blocking) {
+      return total + ((chapter.generation.repairAttempts || 0) < 1 ? 3 : 0);
+    }
+    return total + 1;
+  }, 0);
+  const minimumRequests = remainingSegments + workflowRequests;
   const missingPredecessorNumbers = ordered
     .filter((chapter) => chapter.number < range.fromChapter && !chapter.content.trim())
     .map((chapter) => chapter.number);
   const remainingRequestBudget = Math.max(0, workspace.automation.maxRequests - workspace.automation.usage.requestCount);
   const errors: string[] = [];
   if (!chapters.length) errors.push("所选写作范围没有可用章节");
+  const blockedChapters = chapters.filter((chapter) => chapter.generation?.status === "blocked").map((chapter) => chapter.number);
+  if (blockedChapters.length) errors.push(`第 ${blockedChapters.join("、")} 章自动修复后仍未通过验收，请先人工处理错误再继续`);
   if (missingPredecessorNumbers.length) {
     errors.push(`第 ${missingPredecessorNumbers.join("、")} 章尚无正文，不能跳过前文直接生成后续章节`);
   }
@@ -210,6 +220,15 @@ export function reserveModelRequest(
     throw new Error(`已达到 ${limits.maxTokens.toLocaleString("zh-CN")} Token 预算上限`);
   }
   return { ...usage, requestCount: usage.requestCount + 1 };
+}
+
+export function detectAIStage(prompt: string) {
+  if (/故事方向|三个方向|3 个.*方向/.test(prompt)) return "ideation" as const;
+  if (/第 [1-5]\/5 步|全书蓝图|人物与关系|世界设定|故事大纲|逐章目录/.test(prompt)) return "blueprint" as const;
+  if (/连续性记录员|事实记忆/.test(prompt)) return "memory" as const;
+  if (/一致性审校|逐章一致性/.test(prompt)) return "audit" as const;
+  if (/修订编辑|revisedContent|待修复问题/.test(prompt)) return "repair" as const;
+  return "chapter" as const;
 }
 
 export function createAutomationState(
@@ -930,6 +949,55 @@ export function canonBeforeChapter(workspace: WorkspaceData, chapterNumber: numb
   };
 }
 
+export function compactCanonBeforeChapter(workspace: WorkspaceData, chapterNumber: number): CanonLedger {
+  const full = canonBeforeChapter(workspace, chapterNumber);
+  const chapter = workspace.chapters.find((item) => item.number === chapterNumber);
+  const targetText = JSON.stringify({
+    title: chapter?.title,
+    summary: chapter?.summary,
+    pov: chapter?.pov,
+    outline: chapter?.chapterOutline,
+  });
+  const relevantTerms = [
+    ...workspace.characters.map((item) => item.name),
+    ...workspace.materials.filter((item) => item.type === "伏笔").map((item) => item.title),
+  ].filter((term) => term && targetText.includes(term));
+  const score = (text: string, itemChapter: number) =>
+    relevantTerms.reduce((total, term) => total + (text.includes(term) ? 100 : 0), 0)
+    + Math.max(0, 50 - Math.max(0, chapterNumber - itemChapter));
+  const select = <T extends { id: string }>(
+    items: T[],
+    chapterOf: (item: T) => number,
+    textOf: (item: T) => string,
+    recentLimit: number,
+    relevantLimit: number,
+  ) => {
+    const ordered = [...items].sort((a, b) => chapterOf(a) - chapterOf(b));
+    const recent = ordered.slice(-recentLimit);
+    const recentIds = new Set(recent.map((item) => item.id));
+    const relevant = ordered
+      .filter((item) => !recentIds.has(item.id) && relevantTerms.some((term) => textOf(item).includes(term)))
+      .sort((a, b) => score(textOf(b), chapterOf(b)) - score(textOf(a), chapterOf(a)))
+      .slice(0, relevantLimit);
+    return [...relevant, ...recent].sort((a, b) => chapterOf(a) - chapterOf(b));
+  };
+  const latestCharacterStates = [...full.characterStates]
+    .sort((a, b) => b.chapterNumber - a.chapterNumber)
+    .filter((item, index, list) => list.findIndex((candidate) => candidate.name === item.name) === index)
+    .sort((a, b) => a.name.localeCompare(b.name, "zh-CN"));
+  const openThreads = full.threads.filter((item) => item.status === "open").slice(-80);
+  const recentResolvedThreads = full.threads.filter((item) => item.status === "resolved").slice(-20);
+
+  return {
+    ...full,
+    chapterSummaries: full.chapterSummaries.slice(-16),
+    timeline: select(full.timeline, (item) => item.chapterNumber, (item) => item.event, 40, 20),
+    characterStates: latestCharacterStates,
+    threads: [...openThreads, ...recentResolvedThreads].slice(-100),
+    facts: select(full.facts, (item) => item.chapterNumber, (item) => item.fact, 60, 30),
+  };
+}
+
 export function foreshadowTasksForChapter(workspace: WorkspaceData, chapterNumber: number) {
   const fromMaterials = workspace.materials
     .filter((material) => material.type === "伏笔")
@@ -1014,7 +1082,7 @@ export function buildAutomatedChapterPrompt(
       summary: next.summary,
     } : null,
     unresolvedIssues: workspace.issues.filter((item) => !item.resolved && (!item.chapterNumber || item.chapterNumber <= target.number)),
-    canon: canonBeforeChapter(workspace, target.number),
+    canon: compactCanonBeforeChapter(workspace, target.number),
   };
 
   return `你是正在连续创作同一部长篇小说的中文作家。请完成第 ${target.number} 章《${target.title}》正文的第 ${segment.index + 1}/${segment.total} 段。
@@ -1057,7 +1125,7 @@ ${JSON.stringify(workspace.project)}
 ${JSON.stringify(workspace.characters.map((item) => ({ name: item.name, identity: item.identity, goal: item.goal, conflict: item.conflict })))}
 
 【本章之前的事实账本】
-${JSON.stringify(canonBeforeChapter(workspace, chapter.number))}
+${JSON.stringify(compactCanonBeforeChapter(workspace, chapter.number))}
 
 【本章应执行的伏笔任务】
 ${JSON.stringify(foreshadowTasksForChapter(workspace, chapter.number))}
@@ -1175,7 +1243,7 @@ export function buildRollingAuditPrompt(workspace: WorkspaceData, throughChapter
 ${JSON.stringify({ project: workspace.project, world: workspace.world, characters: workspace.characters, relationships: workspace.relationships })}
 
 【第 ${throughChapter} 章之前的事实账本】
-${JSON.stringify(canonBeforeChapter(workspace, throughChapter))}
+${JSON.stringify(compactCanonBeforeChapter(workspace, throughChapter))}
 
 【上一章结尾】
 ${previousChapter?.content.slice(-6000) || "无"}
@@ -1213,6 +1281,107 @@ export function parseRollingAudit(value: string, runId: string, defaultChapterNu
   }).slice(0, 8);
 }
 
+export function evaluateChapterQuality(workspace: WorkspaceData, chapterNumber: number) {
+  const chapter = workspace.chapters.find((item) => item.number === chapterNumber);
+  if (!chapter) throw new Error(`找不到第 ${chapterNumber} 章`);
+  const lengthRatio = chapter.content.replace(/\s+/g, "").length / Math.max(1, chapter.targetWords);
+  const length = clamp(lengthRatio * 100, 0, 100);
+  const outlineFields = chapter.chapterOutline ? [
+    chapter.chapterOutline.objective,
+    chapter.chapterOutline.opening,
+    ...chapter.chapterOutline.scenes,
+    chapter.chapterOutline.turningPoint,
+    chapter.chapterOutline.endingHook,
+  ] : [];
+  const outlineBase = outlineFields.length ? outlineFields.filter(Boolean).length / outlineFields.length * 100 : 20;
+  const chapterIssues = workspace.issues.filter((issue) => !issue.resolved && issue.chapterNumber === chapterNumber);
+  const outlinePenalty = chapterIssues.filter((issue) => /章纲|场景|转折|钩子|目标/.test(issue.title + issue.description)).length * 18;
+  const outline = clamp(outlineBase - outlinePenalty, 0, 100);
+  const errors = chapterIssues.filter((issue) => issue.severity === "错误").length;
+  const warnings = chapterIssues.filter((issue) => issue.severity === "警告").length;
+  const continuity = clamp(100 - errors * 30 - warnings * 12, 0, 100);
+  const tasks = foreshadowTasksForChapter(workspace, chapterNumber);
+  const updates = chapter.memory?.foreshadowUpdates || [];
+  const matched = tasks.filter((task) => updates.some((update) => update.title === task.title && update.status === (task.action === "plant" ? "planted" : task.action === "resolve" ? "resolved" : "advanced"))).length;
+  const foreshadow = tasks.length ? clamp(matched / tasks.length * 100, 0, 100) : 100;
+  const styleIssues = chapterIssues.filter((issue) => issue.category === "文风").length;
+  const style = clamp(100 - styleIssues * 18, 0, 100);
+  const overall = clamp(length * .2 + outline * .25 + continuity * .3 + foreshadow * .15 + style * .1, 0, 100);
+  const notes = [
+    ...(length < 70 ? ["正文长度尚未达到 70% 验收线"] : []),
+    ...(outline < 80 ? ["章纲目标、场景、转折或章末钩子需要继续落实"] : []),
+    ...(continuity < 80 ? ["仍有一致性问题需要处理"] : []),
+    ...(foreshadow < 100 ? ["本章伏笔任务尚未全部验证"] : []),
+  ];
+  return { overall, length, outline, continuity, foreshadow, style, evaluatedAt: new Date().toISOString(), notes };
+}
+
+export function buildForeshadowLedger(workspace: WorkspaceData) {
+  return workspace.materials.filter((material) => material.type === "伏笔").map((material) => {
+    const plan = material.foreshadowPlan || [];
+    const evidence = workspace.chapters.flatMap((chapter) => (chapter.memory?.foreshadowUpdates || [])
+      .filter((update) => update.title === material.title)
+      .map((update) => ({ chapterNumber: chapter.number, status: update.status, evidence: update.evidence })));
+    const plannedResolve = plan.find((step) => step.action === "resolve")?.chapterNumber;
+    const actualResolve = evidence.find((item) => item.status === "resolved")?.chapterNumber;
+    const planted = evidence.some((item) => item.status === "planted");
+    const currentChapter = workspace.automation.currentChapterNumber || Math.max(0, ...workspace.chapters.filter((item) => item.content.trim()).map((item) => item.number));
+    const status = actualResolve ? "已回收" : plannedResolve && currentChapter > plannedResolve ? "已延期" : planted ? "已埋设" : "计划中";
+    return { material, plan, evidence, plannedResolve, actualResolve, status };
+  });
+}
+
+export function latestCharacterTracking(workspace: WorkspaceData) {
+  return workspace.characters.map((character) => {
+    const history = workspace.canon.characterStates.filter((state) => state.characterId === character.id || state.name === character.name).sort((a, b) => a.chapterNumber - b.chapterNumber);
+    const latest = history.at(-1);
+    return { character, latest, history };
+  });
+}
+
+export function buildChapterQualityIssues(workspace: WorkspaceData, chapterNumber: number, runId: string): ConsistencyIssue[] {
+  const chapter = workspace.chapters.find((item) => item.number === chapterNumber);
+  if (!chapter) return [];
+  const actualLength = chapter.content.replace(/\s+/g, "").length;
+  const minimumLength = Math.max(300, Math.floor(chapter.targetWords * 0.7));
+  if (actualLength >= minimumLength) return [];
+  return [{
+    id: `quality-${runId}-${chapterNumber}-${chapter.revision || 0}-length`,
+    severity: "错误",
+    category: "情节",
+    title: "章节正文长度未达到验收线",
+    description: `本章目标 ${chapter.targetWords} 字，当前约 ${actualLength} 字；低于自动验收线 ${minimumLength} 字，可能存在情节、场景或转折未充分展开。`,
+    location: `第 ${chapterNumber} 章`,
+    resolved: false,
+    chapterNumber,
+    evidence: `当前正文约 ${actualLength} 字`,
+    suggestedFix: "在不改变既定剧情的前提下补足场景行动、人物反应、因果过渡和章末钩子，再重新审校。",
+    source: "local",
+  }];
+}
+
+export function unresolvedChapterErrors(workspace: WorkspaceData, chapterNumber: number) {
+  return workspace.issues.filter((issue) =>
+    !issue.resolved && issue.severity === "错误" && issue.chapterNumber === chapterNumber
+  );
+}
+
+export function replaceChapterAuditIssues(
+  workspace: WorkspaceData,
+  chapterNumber: number,
+  incoming: ConsistencyIssue[],
+): WorkspaceData {
+  return {
+    ...workspace,
+    issues: [
+      ...workspace.issues.map((issue) =>
+        issue.chapterNumber === chapterNumber && !issue.resolved ? { ...issue, resolved: true } : issue
+      ),
+      ...incoming,
+    ],
+  };
+}
+
 export function buildConsistencyRepairPrompt(workspace: WorkspaceData, issue: ConsistencyIssue, chapter: Chapter) {
   return `你是长篇小说修订编辑。请对第 ${chapter.number} 章做最小必要修订，解决指定一致性问题，不得改写无关剧情、文风、人物声音或章末钩子。
 
@@ -1229,7 +1398,7 @@ export function buildConsistencyRepairPrompt(workspace: WorkspaceData, issue: Co
 ${JSON.stringify(issue)}
 
 【本章之前的事实】
-${JSON.stringify(canonBeforeChapter(workspace, chapter.number))}
+${JSON.stringify(compactCanonBeforeChapter(workspace, chapter.number))}
 
 【本章章纲】
 ${JSON.stringify(chapter.chapterOutline || { summary: chapter.summary })}

@@ -69,10 +69,15 @@ import {
   buildChapterMemoryPrompt,
   buildConsistencyRepairPrompt,
   buildRollingAuditPrompt,
+  buildForeshadowLedger,
+  detectAIStage,
+  evaluateChapterQuality,
+  latestCharacterTracking,
   parseChapterMemory,
   parseConsistencyRepair,
   parseRollingAudit,
   removeChapterFromCanon,
+  replaceChapterAuditIssues,
 } from "@/lib/auto-novel";
 import { cloneWorkspace, createBlankWorkspace, normalizeWorkspaceData } from "@/lib/workspace";
 import type {
@@ -100,6 +105,7 @@ const SESSION_KEY = "novel-forge-ai-session-key";
 const BACKUP_KEY = "novel-forge-workspace-backups-v1";
 const ACTIVE_PROJECT_KEY = "novel-forge-active-cloud-project-v1";
 const chapterStatuses: ChapterStatus[] = ["待生成", "草稿", "修订中", "已完成"];
+const stageModelOptions = [["ideation", "故事方向"], ["blueprint", "五阶段蓝图"], ["chapter", "章节正文"], ["memory", "事实记忆"], ["audit", "一致性审校"], ["repair", "正文修复"]] as const;
 
 const navItems: Array<{ label: NavKey; icon: typeof PenLine }> = [
   { label: "创作台", icon: LayoutDashboard },
@@ -154,6 +160,30 @@ function Empty({ icon, title, text, action }: { icon: ReactNode; title: string; 
   return <div className="empty-state"><span>{icon}</span><h3>{title}</h3><p>{text}</p>{action}</div>;
 }
 
+function ChapterAcceptance({ chapter, issues, busy, onRebuild, onDiff }: { chapter: Chapter; issues: ConsistencyIssue[]; busy: boolean; onRebuild: () => void; onDiff: () => void }) {
+  const segments = Math.max(1, Math.ceil(chapter.targetWords / 2200));
+  const completedSegments = Math.min(segments, chapter.generation?.completedSegments || 0);
+  const chapterIssues = issues.filter((issue) => !issue.resolved && issue.chapterNumber === chapter.number);
+  const errors = chapterIssues.filter((issue) => issue.severity === "错误").length;
+  const length = countWords(chapter.content); const lengthPassed = length >= chapter.targetWords * 0.7; const status = chapter.generation?.status;
+  const stages = [
+    { label: "正文", done: completedSegments >= segments || lengthPassed, detail: `${length.toLocaleString("zh-CN")} / ${chapter.targetWords.toLocaleString("zh-CN")} 字` },
+    { label: "记忆", done: Boolean(chapter.memory), detail: chapter.memory ? "事实已写入账本" : "等待提取事实" },
+    { label: "审校", done: ["audited", "accepted", "blocked"].includes(status || ""), detail: chapterIssues.length ? `${chapterIssues.length} 项待确认` : "尚无未解决问题" },
+    { label: "修复", done: (chapter.generation?.repairAttempts || 0) > 0 || errors === 0, detail: chapter.generation?.repairAttempts ? `已自动修复 ${chapter.generation.repairAttempts} 次` : errors ? "等待自动修复" : "无需修复" },
+    { label: "验收", done: status === "accepted", detail: status === "blocked" ? "复审未通过，已阻塞" : status === "accepted" ? "可以安全进入下一章" : "等待最终验收" },
+  ];
+  const resumeAt = status === "blocked" ? "人工处理错误" : status === "audited" && errors ? "自动修复" : !chapter.memory ? "事实记忆" : !["audited", "accepted"].includes(status || "") ? "逐章审校" : status === "accepted" ? "已完成" : "正文生成";
+  const scores = chapter.quality ? [["总分", chapter.quality.overall], ["字数", chapter.quality.length], ["章纲", chapter.quality.outline], ["一致性", chapter.quality.continuity], ["伏笔", chapter.quality.foreshadow], ["文风", chapter.quality.style]] as const : [];
+  return <section className={`chapter-acceptance-card ${status === "blocked" ? "is-blocked" : status === "accepted" ? "is-accepted" : ""}`}>
+    <header><div><span>WRITING LOOP</span><h3>章节闭环验收</h3></div><div className="chapter-acceptance-actions"><strong>恢复点：{resumeAt}</strong><button disabled={busy || !chapter.content.trim()} onClick={onRebuild}><RefreshCw size={13} />重建记忆并复审</button>{chapter.repairReview && <button onClick={onDiff}><History size={13} />修复前后对比</button>}</div></header>
+    <div className="chapter-acceptance-steps">{stages.map((stage) => <div key={stage.label} className={stage.done ? "done" : "pending"}><i>{stage.done ? <Check size={13} /> : <span />}</i><b>{stage.label}</b><small>{stage.detail}</small></div>)}</div>
+    {scores.length > 0 && <div className="chapter-quality-scores">{scores.map(([label, score]) => <div key={label}><span>{label}</span><b>{score}</b><i><em style={{ width: `${score}%` }} /></i></div>)}</div>}
+    {!lengthPassed && <p className="chapter-acceptance-warning"><CircleAlert size={14} />正文尚未达到 70% 验收线，不能计为真正完成。</p>}
+    {errors > 0 && <p className="chapter-acceptance-warning"><CircleAlert size={14} />仍有 {errors} 项严重错误，闭环会先修复或暂停，不会直接写下一章。</p>}
+  </section>;
+}
+
 export default function Home() {
   const [workspace, setWorkspace] = useState<WorkspaceData>(DEMO_WORKSPACE);
   const [config, setConfig] = useState<AIConfig>(DEFAULT_AI_CONFIG);
@@ -172,6 +202,9 @@ export default function Home() {
   const [aiBusy, setAiBusy] = useState(false);
   const [auditProgress, setAuditProgress] = useState("");
   const [repairingIssueId, setRepairingIssueId] = useState("");
+  const [rebuildingChapterId, setRebuildingChapterId] = useState("");
+  const [repairQueueRunning, setRepairQueueRunning] = useState(false);
+  const [diffChapterId, setDiffChapterId] = useState("");
   const [aiResult, setAiResult] = useState<AIResult | null>(null);
   const [resultOpen, setResultOpen] = useState(false);
   const [ideaPrompt, setIdeaPrompt] = useState("");
@@ -375,7 +408,7 @@ export default function Home() {
   const chapter = workspace.chapters.find((item) => item.id === chapterId) ?? workspace.chapters[0];
   const character = workspace.characters.find((item) => item.id === characterId) ?? workspace.characters[0];
   const totalWords = workspace.chapters.reduce((sum, item) => sum + countWords(item.content), 0);
-  const completed = workspace.chapters.filter((item) => item.status === "已完成").length;
+  const completed = workspace.chapters.filter((item) => item.status === "已完成" && (item.generation?.status === "accepted" || countWords(item.content) >= item.targetWords * 0.7)).length;
   const unresolved = workspace.issues.filter((item) => !item.resolved).length;
 
   const notify = (message: string) => {
@@ -597,10 +630,63 @@ export default function Home() {
   };
 
   const updateChapter = (targetId: string, patch: Partial<Chapter>) => {
-    setWorkspace((current) => ({
-      ...current,
-      chapters: current.chapters.map((item) => item.id === targetId ? { ...item, ...patch, updatedAt: new Date().toISOString() } : item),
-    }));
+    setWorkspace((current) => {
+      const target = current.chapters.find((item) => item.id === targetId);
+      const contentChanged = target && typeof patch.content === "string" && patch.content !== target.content;
+      if (!target || !contentChanged) {
+        return {
+          ...current,
+          chapters: current.chapters.map((item) => item.id === targetId ? { ...item, ...patch, updatedAt: new Date().toISOString() } : item),
+        };
+      }
+
+      const affected = current.chapters.filter((item) => item.number >= target.number);
+      let updated = current;
+      for (const chapter of affected) updated = removeChapterFromCanon(updated, chapter.number);
+      const staleIssueId = `local-memory-stale-${target.number}`;
+      return {
+        ...updated,
+        chapters: updated.chapters.map((item) => item.id === targetId ? {
+          ...item,
+          ...patch,
+          memory: undefined,
+          status: "修订中",
+          revision: (item.revision || 0) + 1,
+          generation: item.generation ? { ...item.generation, status: "generated", acceptedAt: undefined } : item.generation,
+          updatedAt: new Date().toISOString(),
+        } : item.number > target.number ? {
+          ...item,
+          memory: undefined,
+          status: item.content.trim() ? "修订中" : item.status,
+          generation: item.generation ? { ...item.generation, status: "generated", acceptedAt: undefined } : item.generation,
+        } : item),
+        issues: [
+          ...updated.issues.filter((issue) => issue.id !== staleIssueId),
+          {
+            id: staleIssueId,
+            severity: "警告" as const,
+            category: "情节" as const,
+            title: "人工改稿后需要重建事实记忆",
+            description: `第 ${target.number} 章正文已修改，本章及后续章节的旧记忆和审校结论已失效。请从本章开始续写或运行逐章检查。`,
+            location: `第 ${target.number} 章`,
+            resolved: false,
+            chapterNumber: target.number,
+            source: "local" as const,
+          },
+        ],
+        automation: {
+          ...updated.automation,
+          generatedChapterIds: updated.automation.generatedChapterIds.filter((id) => {
+            const chapter = updated.chapters.find((item) => item.id === id);
+            return chapter ? chapter.number < target.number : false;
+          }),
+          phase: updated.automation.phase === "completed" ? "paused" : updated.automation.phase,
+          currentChapterNumber: target.number,
+          currentSegment: target.generation?.completedSegments || 0,
+          updatedAt: new Date().toISOString(),
+        },
+      };
+    });
   };
 
   const updateChapterOutline = (targetId: string, patch: Partial<NonNullable<Chapter["chapterOutline"]>>) => {
@@ -705,7 +791,7 @@ export default function Home() {
     const response = await fetch("/api/ai", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ...config, prompt, maxOutputTokens }),
+      body: JSON.stringify({ ...config, model: workspace.automation.stageModels?.[detectAIStage(prompt)]?.model?.trim() || config.model, prompt, maxOutputTokens: workspace.automation.stageModels?.[detectAIStage(prompt)]?.maxOutputTokens || maxOutputTokens }),
     });
     const payload = await response.json().catch(() => ({})) as { text?: string; error?: string; usage?: Record<string, unknown> };
     if (!response.ok || !payload.text) throw new Error(payload.error || "AI 请求失败");
@@ -797,82 +883,114 @@ export default function Home() {
     return uniqueNumbers.length === 1 ? uniqueNumbers[0] : undefined;
   };
 
+  const repairIssueAgainst = async (source: WorkspaceData, issue: ConsistencyIssue) => {
+    const chapterNumber = issue.chapterNumber;
+    const chapter = chapterNumber ? source.chapters.find((item) => item.number === chapterNumber) : undefined;
+    if (!chapter?.content.trim()) throw new Error("该问题没有可定位的章节正文");
+    let working = source;
+    const taskId = id("task");
+    working = { ...working, automation: { ...working.automation, taskLog: [{ id: taskId, runId: working.automation.runId, kind: "repair", label: `修复第 ${chapter.number} 章`, status: "running" as const, chapterNumber: chapter.number, startedAt: new Date().toISOString() }, ...(working.automation.taskLog || [])].slice(0, 500) } };
+    setAuditProgress(`正在修订第 ${chapter.number} 章正文`);
+    working = reserveAIRequestUsage(working);
+    setWorkspace(working);
+    const repairOutputTokens = Math.min(32_768, Math.max(16_384, Math.ceil(chapter.content.replace(/\s+/g, "").length * 2 + 2_048)));
+    const repairPayload = await callAIText(buildConsistencyRepairPrompt(working, issue, chapter), repairOutputTokens);
+    const repair = parseConsistencyRepair(repairPayload.text!);
+    const versionId = id("version");
+    working = removeChapterFromCanon(working, chapter.number);
+    working = applyAITokenUsage({
+      ...working,
+      chapters: working.chapters.map((item) => item.id === chapter.id ? { ...item, content: repair.revisedContent, status: "修订中", memory: undefined, quality: undefined, revision: (item.revision || 0) + 1, updatedAt: new Date().toISOString(), repairReview: { beforeVersionId: versionId, changeSummary: repair.changeSummary, createdAt: new Date().toISOString(), status: "pending" } } : item),
+      versions: [{ id: versionId, chapterId: chapter.id, title: chapter.title, content: chapter.content, createdAt: new Date().toISOString(), note: `AI 修复前存档：${issue.title}` }, ...working.versions],
+    }, repairPayload.usage);
+
+    setAuditProgress(`正在重建第 ${chapter.number} 章事实记忆`);
+    working = reserveAIRequestUsage(working);
+    setWorkspace(working);
+    const revisedChapter = working.chapters.find((item) => item.id === chapter.id)!;
+    const memoryPayload = await callAIText(buildChapterMemoryPrompt(working, revisedChapter), 8192);
+    working = applyAITokenUsage(applyChapterMemory(working, chapter.id, parseChapterMemory(memoryPayload.text!)), memoryPayload.usage);
+
+    setAuditProgress(`正在复查第 ${chapter.number} 章`);
+    working = reserveAIRequestUsage(working);
+    setWorkspace(working);
+    const auditPayload = await callAIText(buildRollingAuditPrompt(working, chapter.number), 8192);
+    const newIssues = parseRollingAudit(auditPayload.text!, id("repair-audit"), chapter.number);
+    working = applyAITokenUsage(replaceChapterAuditIssues(working, chapter.number, newIssues), auditPayload.usage);
+    const quality = evaluateChapterQuality(working, chapter.number);
+    const accepted = !newIssues.some((entry) => entry.severity === "错误") && quality.length >= 70 && quality.overall >= 70;
+    const finishedAt = new Date().toISOString();
+    working = {
+      ...working,
+      chapters: working.chapters.map((item) => item.id === chapter.id ? {
+        ...item, quality, status: accepted ? "已完成" : "修订中",
+        generation: item.generation ? { ...item.generation, status: accepted ? "accepted" : "blocked", acceptedAt: accepted ? finishedAt : undefined } : { runId: working.automation.runId || `manual-${Date.now()}`, status: accepted ? "accepted" : "blocked", completedSegments: Math.max(1, Math.ceil(item.targetWords / 2200)), baseRevision: item.revision || 0, repairAttempts: 1, acceptedAt: accepted ? finishedAt : undefined },
+      } : item),
+      canon: { ...working.canon, lastAuditedChapter: Math.max(working.canon.lastAuditedChapter, chapter.number) },
+      automation: {
+        ...working.automation,
+        generatedChapterIds: accepted ? [...new Set([...working.automation.generatedChapterIds, chapter.id])] : working.automation.generatedChapterIds.filter((value) => value !== chapter.id),
+        taskLog: (working.automation.taskLog || []).map((task) => task.id === taskId ? { ...task, status: "completed" as const, finishedAt } : task),
+      },
+    };
+    return { working, accepted, newIssues };
+  };
+
   const repairConsistencyIssue = async (issue: ConsistencyIssue) => {
     const chapterNumber = resolveIssueChapterNumber(issue);
     const chapter = chapterNumber ? workspace.chapters.find((item) => item.number === chapterNumber) : undefined;
     if (!chapter?.content.trim()) return notify("该问题没有可定位的章节正文，无法自动修复");
-    if (!config.baseUrl.trim() || !config.model.trim()) {
-      setSettingsTab("AI");
-      setSettingsOpen(true);
-      return notify("请先配置 AI 接口");
-    }
-    const remainingRequests = workspace.automation.maxRequests - workspace.automation.usage.requestCount;
-    if (remainingRequests < 3) return notify(`AI 一键修复需要 3 次调用，当前只剩 ${Math.max(0, remainingRequests)} 次预算`);
-    if (!window.confirm(`AI 将修订第 ${chapter.number} 章的完整正文，原稿会自动存入版本历史，修复后还会重建本章记忆并重新审校。是否继续？`)) return;
-
-    setAiBusy(true);
-    setRepairingIssueId(issue.id);
-    createBackup(workspace, `AI 修复第 ${chapter.number} 章前自动备份`);
-    let working = workspace;
+    if (!config.baseUrl.trim() || !config.model.trim()) { setSettingsTab("AI"); setSettingsOpen(true); return notify("请先配置 AI 接口"); }
+    if (workspace.automation.maxRequests - workspace.automation.usage.requestCount < 3) return notify("AI 一键修复至少需要 3 次调用预算");
+    if (!window.confirm(`AI 将修订第 ${chapter.number} 章，并重建记忆、复审和生成差异记录。是否继续？`)) return;
+    setAiBusy(true); setRepairingIssueId(issue.id); createBackup(workspace, `AI 修复第 ${chapter.number} 章前自动备份`);
     try {
-      setAuditProgress(`正在修订第 ${chapter.number} 章正文`);
-      working = reserveAIRequestUsage(working);
-      setWorkspace(working);
-      const repairOutputTokens = Math.min(32_768, Math.max(16_384, Math.ceil(chapter.content.replace(/\s+/g, "").length * 2 + 2_048)));
-      const repairPayload = await callAIText(buildConsistencyRepairPrompt(working, issue, chapter), repairOutputTokens);
-      const repair = parseConsistencyRepair(repairPayload.text!);
-      working = removeChapterFromCanon(working, chapter.number);
-      working = applyAITokenUsage({
-        ...working,
-        chapters: working.chapters.map((item) => item.id === chapter.id ? {
-          ...item,
-          content: repair.revisedContent,
-          status: "修订中",
-          memory: undefined,
-          revision: (item.revision || 0) + 1,
-          updatedAt: new Date().toISOString(),
-        } : item),
-        versions: [{
-          id: id("version"),
-          chapterId: chapter.id,
-          title: chapter.title,
-          content: chapter.content,
-          createdAt: new Date().toISOString(),
-          note: `AI 一键修复前存档：${issue.title}`,
-        }, ...working.versions],
-        issues: working.issues.map((item) => item.id === issue.id ? { ...item, resolved: true } : item),
-      }, repairPayload.usage);
-      setWorkspace(working);
+      const result = await repairIssueAgainst(workspace, { ...issue, chapterNumber: chapter.number });
+      setWorkspace(result.working); setDiffChapterId(chapter.id);
+      notify(result.accepted ? `第 ${chapter.number} 章已修复并通过验收` : `第 ${chapter.number} 章修复后仍需人工确认`);
+    } catch (error) { setWorkspace((current) => ({ ...current, automation: { ...current.automation, taskLog: (current.automation.taskLog || []).map((task) => task.status === "running" ? { ...task, status: "failed" as const, finishedAt: new Date().toISOString(), error: error instanceof Error ? error.message : "修复失败" } : task) } })); notify(error instanceof Error ? error.message : "AI 一键修复失败"); }
+    finally { setAuditProgress(""); setRepairingIssueId(""); setAiBusy(false); }
+  };
 
-      setAuditProgress(`正在重建第 ${chapter.number} 章事实记忆`);
-      working = reserveAIRequestUsage(working);
-      setWorkspace(working);
-      const revisedChapter = working.chapters.find((item) => item.id === chapter.id)!;
-      const memoryPayload = await callAIText(buildChapterMemoryPrompt(working, revisedChapter), 8192);
+  const rebuildChapterMemoryAndAudit = async (chapter: Chapter) => {
+    if (!chapter.content.trim()) return notify("本章还没有正文");
+    if (!config.baseUrl.trim() || !config.model.trim()) { setSettingsTab("AI"); setSettingsOpen(true); return notify("请先配置 AI 接口"); }
+    if (workspace.automation.maxRequests - workspace.automation.usage.requestCount < 2) return notify("重建记忆并复审至少需要 2 次调用预算");
+    setAiBusy(true); setRebuildingChapterId(chapter.id); createBackup(workspace, `重建第 ${chapter.number} 章记忆前自动备份`);
+    let working = removeChapterFromCanon(workspace, chapter.number);
+    const taskId = id("task");
+    working = { ...working, automation: { ...working.automation, taskLog: [{ id: taskId, runId: working.automation.runId, kind: "resync", label: `重建第 ${chapter.number} 章记忆并复审`, status: "running" as const, chapterNumber: chapter.number, startedAt: new Date().toISOString() }, ...(working.automation.taskLog || [])].slice(0, 500) } };
+    try {
+      setAuditProgress(`正在重建第 ${chapter.number} 章事实记忆`); working = reserveAIRequestUsage(working); setWorkspace(working);
+      const memoryPayload = await callAIText(buildChapterMemoryPrompt(working, chapter), 8192);
       working = applyAITokenUsage(applyChapterMemory(working, chapter.id, parseChapterMemory(memoryPayload.text!)), memoryPayload.usage);
-      setWorkspace(working);
-
-      setAuditProgress(`正在复查第 ${chapter.number} 章`);
-      working = reserveAIRequestUsage(working);
-      setWorkspace(working);
+      setAuditProgress(`正在复审第 ${chapter.number} 章`); working = reserveAIRequestUsage(working); setWorkspace(working);
       const auditPayload = await callAIText(buildRollingAuditPrompt(working, chapter.number), 8192);
-      const newIssues = parseRollingAudit(auditPayload.text!, id("repair-audit"), chapter.number);
-      working = applyAITokenUsage({
-        ...working,
-        chapters: working.chapters.map((item) => item.id === chapter.id ? { ...item, status: "已完成" } : item),
-        issues: [...working.issues, ...newIssues],
-        canon: { ...working.canon, lastAuditedChapter: Math.max(working.canon.lastAuditedChapter, chapter.number) },
-      }, auditPayload.usage);
-      setWorkspace(working);
-      notify(newIssues.length ? `修复已应用，复查后仍有 ${newIssues.length} 项需确认` : `第 ${chapter.number} 章已修复并通过复查`);
-    } catch (error) {
-      setWorkspace(working);
-      notify(error instanceof Error ? error.message : "AI 一键修复失败");
-    } finally {
-      setAuditProgress("");
-      setRepairingIssueId("");
-      setAiBusy(false);
-    }
+      const newIssues = parseRollingAudit(auditPayload.text!, id("resync-audit"), chapter.number);
+      working = applyAITokenUsage(replaceChapterAuditIssues(working, chapter.number, newIssues), auditPayload.usage);
+      const quality = evaluateChapterQuality(working, chapter.number); const accepted = !newIssues.some((item) => item.severity === "错误") && quality.length >= 70 && quality.overall >= 70; const finishedAt = new Date().toISOString();
+      working = { ...working, chapters: working.chapters.map((item) => item.id === chapter.id ? { ...item, quality, status: accepted ? "已完成" : "修订中", generation: item.generation ? { ...item.generation, status: accepted ? "accepted" : "blocked", acceptedAt: accepted ? finishedAt : undefined } : { runId: working.automation.runId || `manual-${Date.now()}`, status: accepted ? "accepted" : "blocked", completedSegments: Math.max(1, Math.ceil(item.targetWords / 2200)), baseRevision: item.revision || 0, acceptedAt: accepted ? finishedAt : undefined } } : item), automation: { ...working.automation, generatedChapterIds: accepted ? [...new Set([...working.automation.generatedChapterIds, chapter.id])] : working.automation.generatedChapterIds.filter((value) => value !== chapter.id), taskLog: (working.automation.taskLog || []).map((task) => task.id === taskId ? { ...task, status: "completed" as const, finishedAt } : task) } };
+      setWorkspace(working); notify(accepted ? "本章记忆已重建并通过复审" : "记忆已重建，复审仍有问题需要处理");
+    } catch (error) { setWorkspace({ ...working, automation: { ...working.automation, taskLog: (working.automation.taskLog || []).map((task) => task.id === taskId ? { ...task, status: "failed" as const, finishedAt: new Date().toISOString(), error: error instanceof Error ? error.message : "重建失败" } : task) } }); notify(error instanceof Error ? error.message : "重建失败"); }
+    finally { setAuditProgress(""); setRebuildingChapterId(""); setAiBusy(false); }
+  };
+
+  const repairAllConsistencyIssues = async () => {
+    const grouped = new Map<number, ConsistencyIssue[]>();
+    workspace.issues.filter((issue) => !issue.resolved && issue.severity === "错误" && issue.chapterNumber).forEach((issue) => grouped.set(issue.chapterNumber!, [...(grouped.get(issue.chapterNumber!) || []), issue]));
+    if (!grouped.size) return notify("当前没有可自动修复的章节错误");
+    if (workspace.automation.maxRequests - workspace.automation.usage.requestCount < grouped.size * 3) return notify(`修复队列至少需要 ${grouped.size * 3} 次调用预算`);
+    if (!window.confirm(`将按章节顺序修复 ${grouped.size} 章，每章都会保存原稿、重建记忆并复审。是否继续？`)) return;
+    setAiBusy(true); setRepairQueueRunning(true); createBackup(workspace, "全书修复队列前自动备份"); let working = workspace; let haltedAt: number | undefined;
+    try {
+      for (const [chapterNumber, issues] of [...grouped.entries()].sort((a, b) => a[0] - b[0])) {
+        const combined: ConsistencyIssue = { ...issues[0], chapterNumber, title: `第 ${chapterNumber} 章错误修复队列（${issues.length} 项）`, description: issues.map((item, index) => `${index + 1}. ${item.title}：${item.description}`).join("\n"), suggestedFix: issues.map((item) => item.suggestedFix).filter(Boolean).join("；") };
+        const result = await repairIssueAgainst(working, combined); working = result.working; setWorkspace(working);
+        if (!result.accepted) { haltedAt = chapterNumber; break; }
+      }
+      setWorkspace(working); notify(haltedAt ? `修复队列停在第 ${haltedAt} 章，复审仍未通过` : "全书错误修复队列已完成");
+    } catch (error) { setWorkspace({ ...working, automation: { ...working.automation, taskLog: (working.automation.taskLog || []).map((task) => task.status === "running" ? { ...task, status: "failed" as const, finishedAt: new Date().toISOString(), error: error instanceof Error ? error.message : "修复队列失败" } : task) } }); notify(error instanceof Error ? error.message : "修复队列失败"); }
+    finally { setAuditProgress(""); setRepairQueueRunning(false); setAiBusy(false); }
   };
 
   const applyResult = (mode: "insert" | "replace") => {
@@ -917,6 +1035,9 @@ export default function Home() {
       chapterNumbers.add(item.number);
       if (item.status === "已完成" && !item.content.trim()) {
         issues.push({ id: id("local"), severity: "错误", category: "情节", title: "已完成章节没有正文", description: "请补充正文或更改章节状态。", location: `第 ${item.number} 章`, resolved: false, chapterNumber: item.number, source: "local" });
+      }
+      else if (item.status === "已完成" && countWords(item.content) < item.targetWords * 0.7) {
+        issues.push({ id: id("local"), severity: "错误", category: "情节", title: `第 ${item.number} 章正文过短`, description: `本章目标 ${item.targetWords} 字，当前约 ${countWords(item.content)} 字，尚未达到 70% 验收线。`, location: `第 ${item.number} 章`, resolved: false, chapterNumber: item.number, source: "local", suggestedFix: "补足场景、转折与章末钩子后重新审校" });
       }
       if (item.pov && !workspace.characters.some((person) => person.name === item.pov)) {
         issues.push({ id: id("local"), severity: "警告", category: "人物", title: `视角人物“${item.pov}”没有人物卡`, description: "请建立人物卡或更正视角字段。", location: `第 ${item.number} 章`, resolved: false, chapterNumber: item.number, source: "local", suggestedFix: "统一视角姓名与人物档案" });
@@ -1107,6 +1228,7 @@ export default function Home() {
         <div className="character-list">{workspace.characters.map((item) => <button key={item.id} className={character?.id === item.id ? "active" : ""} onClick={() => setCharacterId(item.id)}><span className="character-avatar" style={{ background: item.color }}>{item.name.slice(0, 1)}</span><span><b>{item.name}</b><small>{item.role} · {item.identity || "身份待完善"}</small></span><ChevronRight size={16} /></button>)}</div>
         {character ? <section className="character-editor card"><div className="character-profile-head"><span className="large-avatar" style={{ background: character.color }}>{character.name.slice(0, 1)}</span><div><input value={character.name} onChange={(event) => updateCharacter({ name: event.target.value })} /><p>{character.identity || "完善人物身份"}</p></div><button className="secondary-button compact" onClick={() => runAI("人物深化", `深化人物“${character.name}”，重点解决目标与内在冲突。`)}><Sparkles size={15} />AI 深化</button></div><div className="form-grid two-col"><label><span>角色定位</span><input value={character.role} onChange={(event) => updateCharacter({ role: event.target.value })} /></label><label><span>年龄</span><input value={character.age} onChange={(event) => updateCharacter({ age: event.target.value })} /></label><label className="full"><span>身份</span><input value={character.identity} onChange={(event) => updateCharacter({ identity: event.target.value })} /></label><label className="full"><span>外在目标</span><textarea value={character.goal} onChange={(event) => updateCharacter({ goal: event.target.value })} /></label><label className="full"><span>核心冲突</span><textarea value={character.conflict} onChange={(event) => updateCharacter({ conflict: event.target.value })} /></label><label className="full"><span>人物弧光</span><textarea value={character.arc} onChange={(event) => updateCharacter({ arc: event.target.value })} /></label><label className="full"><span>性格标签（逗号分隔）</span><input value={character.traits.join("，")} onChange={(event) => updateCharacter({ traits: event.target.value.split(/[，,]/).map((item) => item.trim()).filter(Boolean) })} /></label></div><footer><span><Cloud size={14} />修改已自动保存</span><button onClick={() => { setWorkspace((current) => ({ ...current, characters: current.characters.filter((item) => item.id !== character.id), relationships: current.relationships.filter((item) => item.fromId !== character.id && item.toId !== character.id) })); setCharacterId(workspace.characters.find((item) => item.id !== character.id)?.id || ""); }}><Trash2 size={15} />删除人物</button></footer></section> : <Empty icon={<UsersRound />} title="还没有人物" text="创建第一个人物卡。" />}
       </div>
+      <section className="tracking-ledger card"><div className="card-heading"><div><span>CHARACTER TRACKING</span><h2>人物最新状态</h2></div><small>来自章节事实记忆</small></div><div className="tracking-grid">{latestCharacterTracking(workspace).map(({ character: person, latest, history }) => <article key={person.id}><header><span className="character-avatar" style={{ background: person.color }}>{person.name.slice(0, 1)}</span><div><b>{person.name}</b><small>{latest ? `更新至第 ${latest.chapterNumber} 章` : "尚无章节状态"}</small></div></header><p>{latest?.state || "完成章节记忆提取后，将在这里记录位置、身体、情绪、知情范围、目标与关系变化。"}</p><footer>状态记录 {history.length} 条</footer></article>)}</div></section>
     </div>
   );
 
@@ -1150,7 +1272,7 @@ export default function Home() {
     return (
       <div className="chapter-workbench">
         <aside className="chapter-sidebar"><div className="chapter-side-head"><div><span>章节目录</span><b>{workspace.chapters.length} 章</b></div><button onClick={addChapter}><Plus size={17} /></button></div><div className="chapter-side-list">{[...workspace.chapters].sort((a, b) => a.number - b.number).map((item) => <button key={item.id} className={chapter?.id === item.id ? "active" : ""} onClick={() => setChapterId(item.id)}><span>{item.number}</span><div><b>{item.title}</b><small>{number(countWords(item.content))} 字 · {item.status}</small></div><i /></button>)}</div></aside>
-        {chapter ? <section className="chapter-editor"><header className="editor-topbar"><div><span>第 {chapter.number} 章</span><select value={chapter.status} onChange={(event) => updateChapter(chapter.id, { status: event.target.value as ChapterStatus })}>{chapterStatuses.map((item) => <option key={item}>{item}</option>)}</select></div><div><button className="secondary-button compact" onClick={() => setVersionsOpen((value) => !value)}><History size={15} />版本 {versions.length}</button><button className="secondary-button compact" onClick={() => saveVersion(chapter)}><Save size={15} />存档</button><button className="icon-button" onClick={() => { if (!window.confirm(`删除第 ${chapter.number} 章吗？`)) return; setWorkspace((current) => ({ ...current, chapters: current.chapters.filter((item) => item.id !== chapter.id) })); setChapterId(workspace.chapters.find((item) => item.id !== chapter.id)?.id || ""); }}><Trash2 size={16} /></button></div></header>{versionsOpen && <div className="version-popover"><div><b>版本历史</b><button onClick={() => setVersionsOpen(false)}><X size={15} /></button></div>{versions.length ? versions.map((item) => <button key={item.id} onClick={() => restoreVersion(item.id)}><History size={15} /><span><b>{item.note}</b><small>{dateLabel(item.createdAt)} · {number(countWords(item.content))} 字</small></span><RotateCcw size={14} /></button>) : <p>还没有手动存档</p>}</div>}<div className="editor-document"><input className="chapter-title-input" value={chapter.title} onChange={(event) => updateChapter(chapter.id, { title: event.target.value })} /><textarea className="chapter-summary-input" value={chapter.summary} onChange={(event) => updateChapter(chapter.id, { summary: event.target.value })} placeholder="用一两句话概括本章发生的关键变化…" /><div className="editor-meta"><label>视角 <input value={chapter.pov || ""} onChange={(event) => updateChapter(chapter.id, { pov: event.target.value })} /></label><label>目标字数 <input type="number" value={chapter.targetWords} onChange={(event) => updateChapter(chapter.id, { targetWords: Number(event.target.value) })} /></label><span>{number(countWords(chapter.content))} 字</span></div><section className="chapter-outline-card"><header><div><span>CHAPTER BLUEPRINT</span><h3>本章章纲</h3></div><small>AI 生成与一致性检查都会严格执行</small></header><div className="chapter-outline-grid"><label><span>本章目标</span><textarea value={chapter.chapterOutline?.objective || ""} onChange={(event) => updateChapterOutline(chapter.id, { objective: event.target.value })} placeholder="本章结束时，剧情必须发生什么变化？" /></label><label><span>开场切入</span><textarea value={chapter.chapterOutline?.opening || ""} onChange={(event) => updateChapterOutline(chapter.id, { opening: event.target.value })} placeholder="用什么场景、动作或冲突开场？" /></label><label className="full"><span>场景推进（每行一个场景）</span><textarea value={(chapter.chapterOutline?.scenes || []).join("\n")} onChange={(event) => updateChapterOutline(chapter.id, { scenes: event.target.value.split(/\n+/).map((item) => item.trim()).filter(Boolean) })} placeholder={"场景一：建立冲突\n场景二：人物作出选择\n场景三：选择产生后果"} /></label><label><span>关键转折</span><textarea value={chapter.chapterOutline?.turningPoint || ""} onChange={(event) => updateChapterOutline(chapter.id, { turningPoint: event.target.value })} placeholder="本章不可逆的转折是什么？" /></label><label><span>结尾钩子</span><textarea value={chapter.chapterOutline?.endingHook || ""} onChange={(event) => updateChapterOutline(chapter.id, { endingHook: event.target.value })} placeholder="用新问题、代价或决定收束" /></label></div>{Boolean(chapter.chapterOutline?.foreshadowActions.length) && <div className="chapter-foreshadow-actions"><b>本章伏笔任务</b>{chapter.chapterOutline?.foreshadowActions.map((task, index) => <p key={task.title + "-" + index}><i>{task.action === "plant" ? "埋设" : task.action === "resolve" ? "回收" : "推进"}</i><strong>{task.title}</strong><span>{task.instruction}</span></p>)}</div>}</section><div className="ai-writing-bar"><span><Sparkles size={16} />AI 写作</span><button disabled={!chapter.content} onClick={() => runAI("续写本章", "从当前结尾自然续写。", chapter.id)}>续写</button><button disabled={!chapter.content} onClick={() => runAI("润色改写", "保持事件不变，增强画面与节奏。", chapter.id)}>润色</button><button onClick={() => runAI("情节推进", "给出接下来的三个行动方案。", chapter.id)}>推进建议</button><button onClick={() => runAI("生成章节", chapter.summary || "依据大纲生成本章。", chapter.id)}>生成草稿</button></div><textarea className="manuscript" value={chapter.content} onChange={(event) => updateChapter(chapter.id, { content: event.target.value })} placeholder="从这里开始写作…" /></div><footer className="editor-footer"><span><Cloud size={14} />已自动保存到此浏览器</span><span>{chapter.pov || "未指定视角"} · 目标 {number(chapter.targetWords)} 字 · 完成 {Math.min(100, Math.round(countWords(chapter.content) / Math.max(1, chapter.targetWords) * 100))}%</span></footer></section> : <Empty icon={<FileText />} title="还没有章节" text="创建第一章，开始写下你的故事。" action={<button className="primary-button" onClick={addChapter}>创建章节</button>} />}
+        {chapter ? <section className="chapter-editor"><header className="editor-topbar"><div><span>第 {chapter.number} 章</span><select value={chapter.status} onChange={(event) => updateChapter(chapter.id, { status: event.target.value as ChapterStatus })}>{chapterStatuses.map((item) => <option key={item}>{item}</option>)}</select></div><div><button className="secondary-button compact" onClick={() => setVersionsOpen((value) => !value)}><History size={15} />版本 {versions.length}</button><button className="secondary-button compact" onClick={() => saveVersion(chapter)}><Save size={15} />存档</button><button className="icon-button" onClick={() => { if (!window.confirm(`删除第 ${chapter.number} 章吗？`)) return; setWorkspace((current) => ({ ...current, chapters: current.chapters.filter((item) => item.id !== chapter.id) })); setChapterId(workspace.chapters.find((item) => item.id !== chapter.id)?.id || ""); }}><Trash2 size={16} /></button></div></header>{versionsOpen && <div className="version-popover"><div><b>版本历史</b><button onClick={() => setVersionsOpen(false)}><X size={15} /></button></div>{versions.length ? versions.map((item) => <button key={item.id} onClick={() => restoreVersion(item.id)}><History size={15} /><span><b>{item.note}</b><small>{dateLabel(item.createdAt)} · {number(countWords(item.content))} 字</small></span><RotateCcw size={14} /></button>) : <p>还没有手动存档</p>}</div>}<div className="editor-document"><input className="chapter-title-input" value={chapter.title} onChange={(event) => updateChapter(chapter.id, { title: event.target.value })} /><textarea className="chapter-summary-input" value={chapter.summary} onChange={(event) => updateChapter(chapter.id, { summary: event.target.value })} placeholder="用一两句话概括本章发生的关键变化…" /><div className="editor-meta"><label>视角 <input value={chapter.pov || ""} onChange={(event) => updateChapter(chapter.id, { pov: event.target.value })} /></label><label>目标字数 <input type="number" value={chapter.targetWords} onChange={(event) => updateChapter(chapter.id, { targetWords: Number(event.target.value) })} /></label><span>{number(countWords(chapter.content))} 字</span></div><section className="chapter-outline-card"><header><div><span>CHAPTER BLUEPRINT</span><h3>本章章纲</h3></div><small>AI 生成与一致性检查都会严格执行</small></header><div className="chapter-outline-grid"><label><span>本章目标</span><textarea value={chapter.chapterOutline?.objective || ""} onChange={(event) => updateChapterOutline(chapter.id, { objective: event.target.value })} placeholder="本章结束时，剧情必须发生什么变化？" /></label><label><span>开场切入</span><textarea value={chapter.chapterOutline?.opening || ""} onChange={(event) => updateChapterOutline(chapter.id, { opening: event.target.value })} placeholder="用什么场景、动作或冲突开场？" /></label><label className="full"><span>场景推进（每行一个场景）</span><textarea value={(chapter.chapterOutline?.scenes || []).join("\n")} onChange={(event) => updateChapterOutline(chapter.id, { scenes: event.target.value.split(/\n+/).map((item) => item.trim()).filter(Boolean) })} placeholder={"场景一：建立冲突\n场景二：人物作出选择\n场景三：选择产生后果"} /></label><label><span>关键转折</span><textarea value={chapter.chapterOutline?.turningPoint || ""} onChange={(event) => updateChapterOutline(chapter.id, { turningPoint: event.target.value })} placeholder="本章不可逆的转折是什么？" /></label><label><span>结尾钩子</span><textarea value={chapter.chapterOutline?.endingHook || ""} onChange={(event) => updateChapterOutline(chapter.id, { endingHook: event.target.value })} placeholder="用新问题、代价或决定收束" /></label></div>{Boolean(chapter.chapterOutline?.foreshadowActions.length) && <div className="chapter-foreshadow-actions"><b>本章伏笔任务</b>{chapter.chapterOutline?.foreshadowActions.map((task, index) => <p key={task.title + "-" + index}><i>{task.action === "plant" ? "埋设" : task.action === "resolve" ? "回收" : "推进"}</i><strong>{task.title}</strong><span>{task.instruction}</span></p>)}</div>}</section><ChapterAcceptance chapter={chapter} issues={workspace.issues} busy={aiBusy || rebuildingChapterId === chapter.id} onRebuild={() => void rebuildChapterMemoryAndAudit(chapter)} onDiff={() => setDiffChapterId(chapter.id)} /><div className="ai-writing-bar"><span><Sparkles size={16} />AI 写作</span><button disabled={!chapter.content} onClick={() => runAI("续写本章", "从当前结尾自然续写。", chapter.id)}>续写</button><button disabled={!chapter.content} onClick={() => runAI("润色改写", "保持事件不变，增强画面与节奏。", chapter.id)}>润色</button><button onClick={() => runAI("情节推进", "给出接下来的三个行动方案。", chapter.id)}>推进建议</button><button onClick={() => runAI("生成章节", chapter.summary || "依据大纲生成本章。", chapter.id)}>生成草稿</button></div><textarea className="manuscript" value={chapter.content} onChange={(event) => updateChapter(chapter.id, { content: event.target.value })} placeholder="从这里开始写作…" /></div><footer className="editor-footer"><span><Cloud size={14} />已自动保存到此浏览器</span><span>{chapter.pov || "未指定视角"} · 目标 {number(chapter.targetWords)} 字 · 完成 {Math.min(100, Math.round(countWords(chapter.content) / Math.max(1, chapter.targetWords) * 100))}%</span></footer></section> : <Empty icon={<FileText />} title="还没有章节" text="创建第一章，开始写下你的故事。" action={<button className="primary-button" onClick={addChapter}>创建章节</button>} />}
       </div>
     );
   };
@@ -1164,6 +1286,7 @@ export default function Home() {
       <div className="view">
         <Heading eyebrow="CONTINUITY AUDIT" title="一致性检查" description="把疑点变成可处理的清单，区分真正冲突与有意伏笔。">
           <button className="secondary-button" disabled={aiBusy} onClick={runLocalCheck}><RefreshCw size={16} />规则扫描</button>
+          <button className="secondary-button" disabled={aiBusy || !openIssues.some((item) => item.severity === "错误" && item.chapterNumber)} onClick={() => void repairAllConsistencyIssues()}>{repairQueueRunning ? <RefreshCw className="spin" size={16} /> : <WandSparkles size={16} />}{repairQueueRunning ? "修复队列运行中" : "修复全书错误"}</button>
           <button className="primary-button" disabled={aiBusy} onClick={runChapterAudits}>{aiBusy && auditProgress ? <RefreshCw className="spin" size={16} /> : <Sparkles size={16} />}{auditProgress || "逐章 AI 检查"}</button>
         </Heading>
         <div className="audit-metrics"><article><span className="error"><CircleAlert size={19} /></span><div><small>错误</small><strong>{severity("错误")}</strong></div></article><article><span className="warning"><CircleAlert size={19} /></span><div><small>警告</small><strong>{severity("警告")}</strong></div></article><article><span className="hint"><Lightbulb size={19} /></span><div><small>提示</small><strong>{severity("提示")}</strong></div></article><article><span className="resolved"><CheckCircle2 size={19} /></span><div><small>已处理</small><strong>{workspace.issues.filter((item) => item.resolved).length}</strong></div></article></div>
@@ -1195,6 +1318,7 @@ export default function Home() {
         </Heading>
         <div className="filter-tabs">{types.map((item) => <button key={item} className={materialFilter === item ? "active" : ""} onClick={() => setMaterialFilter(item)}>{item}<span>{item === "全部" ? workspace.materials.length : workspace.materials.filter((entry) => entry.type === item).length}</span></button>)}</div>
         <div className="material-grid">{materials.map((material) => <article className="material-card card" key={material.id}><header><select value={material.type} onChange={(event) => setWorkspace((current) => ({ ...current, materials: current.materials.map((item) => item.id === material.id ? { ...item, type: event.target.value as Material["type"] } : item) }))}>{types.slice(1).map((item) => <option key={item}>{item}</option>)}</select><button onClick={() => setWorkspace((current) => ({ ...current, materials: current.materials.filter((item) => item.id !== material.id) }))}><Trash2 size={15} /></button></header><input value={material.title} onChange={(event) => setWorkspace((current) => ({ ...current, materials: current.materials.map((item) => item.id === material.id ? { ...item, title: event.target.value } : item) }))} /><textarea value={material.content} onChange={(event) => setWorkspace((current) => ({ ...current, materials: current.materials.map((item) => item.id === material.id ? { ...item, content: event.target.value } : item) }))} />{material.type === "伏笔" && Boolean(material.foreshadowPlan?.length) && <div className="material-foreshadow-plan"><b>运用计划</b>{material.foreshadowPlan?.map((step, index) => { const update = workspace.chapters.find((entry) => entry.number === step.chapterNumber)?.memory?.foreshadowUpdates?.find((entry) => entry.title === material.title); return <p key={step.chapterNumber + "-" + index} className={update ? "done" : ""}><i>{step.action === "plant" ? "埋设" : step.action === "resolve" ? "回收" : "推进"}</i><span>第 {step.chapterNumber} 章 · {step.instruction}</span><small>{update ? "已在正文验证" : "待执行"}</small></p>; })}</div>}<div className="tag-row">{material.tags.map((tag) => <i key={tag}>{tag}</i>)}</div><footer>{dateLabel(material.createdAt)}</footer></article>)}</div>
+        <section className="foreshadow-ledger card"><div className="card-heading"><div><span>FORESHADOW LEDGER</span><h2>独立伏笔账本</h2></div><small>计划、正文证据与延期状态</small></div><div className="foreshadow-ledger-list">{buildForeshadowLedger(workspace).map((entry) => <article key={entry.material.id} className={entry.status === "已延期" ? "is-late" : entry.status === "已回收" ? "is-resolved" : ""}><header><div><b>{entry.material.title}</b><small>{entry.material.content}</small></div><strong>{entry.status}</strong></header><div>{entry.plan.map((step, index) => { const evidence = entry.evidence.find((item) => item.chapterNumber === step.chapterNumber); return <p key={step.chapterNumber + "-" + index} className={evidence ? "done" : ""}><i>{step.action === "plant" ? "埋设" : step.action === "resolve" ? "回收" : "推进"}</i><span>第 {step.chapterNumber} 章 · {step.instruction}</span><small>{evidence?.evidence || "尚无正文证据"}</small></p>; })}</div></article>)}</div></section>
       </div>
     );
   };
@@ -1247,7 +1371,7 @@ export default function Home() {
       {projectLibraryOpen && <div className="modal-backdrop" onMouseDown={(event) => { if (event.currentTarget === event.target) setProjectLibraryOpen(false); }}><section className="project-library-modal" role="dialog" aria-modal="true" aria-label="作品库"><header><div><LibraryBig size={19} /><span><b>我的作品库</b><small>本地编辑、云端保存与任务恢复</small></span></div><button className="icon-button" aria-label="关闭作品库" onClick={() => setProjectLibraryOpen(false)}><X size={18} /></button></header><div className="project-library-actions"><button className="primary-button" onClick={createNewProject}><Plus size={16} />新建作品</button><button className="secondary-button" disabled={cloudBusy} onClick={() => void saveCloudProject(workspace)}><Cloud size={16} />保存当前作品</button><button className="secondary-button" disabled={cloudBusy} onClick={() => void saveCloudProject(workspace, true)}><Copy size={16} />复制为新作品</button><button className="icon-button" aria-label="刷新云端作品" disabled={cloudBusy} onClick={() => void loadCloudProjects()}><RefreshCw className={cloudBusy ? "spin" : ""} size={16} /></button></div>{cloudError && <div className="project-cloud-error"><CircleAlert size={16} />{cloudError}</div>}<div className="project-library-current"><span><BookOpen size={18} /></span><div><small>当前浏览器作品</small><b>《{workspace.project.title}》</b><p>{workspace.project.genre} · {workspace.chapters.length} 章 · {activeCloudProjectId ? "已关联云端" : "仅保存在本机"}</p></div></div><div className="project-library-list"><div className="section-bar"><div><h2>云端作品</h2><span>{cloudProjects.length} 部</span></div><small>{cloudBusy ? "正在同步…" : "按最近更新排序"}</small></div>{cloudProjects.length ? cloudProjects.map((project) => <article key={project.id} className={activeCloudProjectId === project.id ? "active" : ""}><button className="project-open-button" onClick={() => void openCloudProject(project.id)}><span><BookOpen size={17} /></span><div><b>《{project.title}》</b><small>{project.genre || "题材待定"} · {project.status} · {dateLabel(project.updatedAt)}</small></div>{activeCloudProjectId === project.id ? <i>当前</i> : <ChevronRight size={16} />}</button><button className="icon-button project-delete-button" aria-label={`删除《${project.title}》`} onClick={() => void removeCloudProject(project)}><Trash2 size={15} /></button></article>) : <Empty icon={<Cloud />} title="还没有云端作品" text="保存当前作品后，可跨设备恢复并持久保存自动写作检查点。" />}</div></section></div>}
 
       {settingsOpen && <div className="modal-backdrop" onMouseDown={(event) => { if (event.currentTarget === event.target) setSettingsOpen(false); }}><section className="settings-modal" role="dialog" aria-modal="true" aria-label="工作台设置"><header><div><Settings2 size={19} /><span><b>工作台设置</b><small>AI、作品与本地数据</small></span></div><button className="icon-button" aria-label="关闭设置" onClick={() => setSettingsOpen(false)}><X size={18} /></button></header><div className="settings-layout"><nav><button className={settingsTab === "AI" ? "active" : ""} onClick={() => setSettingsTab("AI")}><BrainCircuit size={17} />AI 模型</button><button className={settingsTab === "作品" ? "active" : ""} onClick={() => setSettingsTab("作品")}><BookOpen size={17} />作品信息</button><button className={settingsTab === "数据" ? "active" : ""} onClick={() => setSettingsTab("数据")}><Archive size={17} />数据管理</button></nav><div className="settings-content">
-        {settingsTab === "AI" && <><div className="settings-title"><h2>连接 OpenAI 兼容模型</h2><p>支持 HTTP/HTTPS、Chat Completions 与 Responses；密钥不会写入项目源码。</p></div><div className="form-grid"><label><span>接口地址</span><input value={config.baseUrl} onChange={(event) => setConfig((current) => ({ ...current, baseUrl: event.target.value }))} placeholder="http://127.0.0.1:11434/v1" /><small>可填写 /v1、/chat/completions 或 /responses；本地地址需本地运行本站</small></label><label><span>接口模式</span><select value={config.apiMode} onChange={(event) => setConfig((current) => ({ ...current, apiMode: event.target.value as AIConfig["apiMode"] }))}><option value="auto">自动识别（推荐）</option><option value="chat">Chat Completions</option><option value="responses">Responses API</option></select><small>自动模式遇到 Chat 404 时会改用 Responses</small></label><label><span>API Key（可选）</span><input type="password" value={config.apiKey} onChange={(event) => setConfig((current) => ({ ...current, apiKey: event.target.value }))} autoComplete="off" /><small>Ollama 等无鉴权接口可以留空</small></label><label><span>模型名称</span><input value={config.model} onChange={(event) => setConfig((current) => ({ ...current, model: event.target.value }))} /></label><label><span>创作温度 · {config.temperature.toFixed(1)}</span><input type="range" min="0" max="2" step="0.1" value={config.temperature} onChange={(event) => setConfig((current) => ({ ...current, temperature: Number(event.target.value) }))} /></label><label className="check-label"><input type="checkbox" checked={config.rememberKey} onChange={(event) => setConfig((current) => ({ ...current, rememberKey: event.target.checked }))} /><span><b>在此浏览器中记住密钥</b><small>关闭时，仅保留到本次会话结束。</small></span></label></div><div className="settings-callout"><ShieldCheck size={17} /><span>Responses 请求只发送合法的文本输入，不会把 output_text 作为输入类型；公网 HTTP 建议改用 HTTPS。</span></div><button className="secondary-button" disabled={aiBusy || !config.baseUrl || !config.model} onClick={() => runAI("自由对话", "只回复：连接成功。")}><Zap size={16} />测试连接</button></>}
+        {settingsTab === "AI" && <><div className="settings-title"><h2>连接 OpenAI 兼容模型</h2><p>支持 HTTP/HTTPS、Chat Completions 与 Responses；密钥不会写入项目源码。</p></div><div className="form-grid"><label><span>接口地址</span><input value={config.baseUrl} onChange={(event) => setConfig((current) => ({ ...current, baseUrl: event.target.value }))} placeholder="http://127.0.0.1:11434/v1" /><small>可填写 /v1、/chat/completions 或 /responses；本地地址需本地运行本站</small></label><label><span>接口模式</span><select value={config.apiMode} onChange={(event) => setConfig((current) => ({ ...current, apiMode: event.target.value as AIConfig["apiMode"] }))}><option value="auto">自动识别（推荐）</option><option value="chat">Chat Completions</option><option value="responses">Responses API</option></select><small>自动模式遇到 Chat 404 时会改用 Responses</small></label><label><span>API Key（可选）</span><input type="password" value={config.apiKey} onChange={(event) => setConfig((current) => ({ ...current, apiKey: event.target.value }))} autoComplete="off" /><small>Ollama 等无鉴权接口可以留空</small></label><label><span>模型名称</span><input value={config.model} onChange={(event) => setConfig((current) => ({ ...current, model: event.target.value }))} /></label><section className="stage-model-settings"><div><b>分阶段模型</b><small>留空时使用上方默认模型；可为正文、记忆、审校和修复分别指定模型。</small></div><div>{stageModelOptions.map(([stage, label]) => <label key={stage}><span>{label}</span><input value={workspace.automation.stageModels?.[stage]?.model || ""} placeholder={config.model || "使用默认模型"} onChange={(event) => setWorkspace((current) => ({ ...current, automation: { ...current.automation, stageModels: { ...current.automation.stageModels, [stage]: { ...current.automation.stageModels?.[stage], model: event.target.value } } } }))} /><input type="number" min={256} max={131072} value={workspace.automation.stageModels?.[stage]?.maxOutputTokens || ""} placeholder="输出 Token" onChange={(event) => setWorkspace((current) => ({ ...current, automation: { ...current.automation, stageModels: { ...current.automation.stageModels, [stage]: { ...current.automation.stageModels?.[stage], maxOutputTokens: event.target.value ? Number(event.target.value) : undefined } } } }))} /></label>)}</div></section><label><span>创作温度 · {config.temperature.toFixed(1)}</span><input type="range" min="0" max="2" step="0.1" value={config.temperature} onChange={(event) => setConfig((current) => ({ ...current, temperature: Number(event.target.value) }))} /></label><label className="check-label"><input type="checkbox" checked={config.rememberKey} onChange={(event) => setConfig((current) => ({ ...current, rememberKey: event.target.checked }))} /><span><b>在此浏览器中记住密钥</b><small>关闭时，仅保留到本次会话结束。</small></span></label></div><div className="settings-callout"><ShieldCheck size={17} /><span>Responses 请求只发送合法的文本输入，不会把 output_text 作为输入类型；公网 HTTP 建议改用 HTTPS。</span></div><button className="secondary-button" disabled={aiBusy || !config.baseUrl || !config.model} onClick={() => runAI("自由对话", "只回复：连接成功。")}><Zap size={16} />测试连接</button></>}
         {settingsTab === "作品" && <><div className="settings-title"><h2>作品信息</h2><p>这些内容会作为全局约束带入每一次 AI 创作。</p></div><div className="form-grid two-col"><label><span>书名</span><input value={workspace.project.title} onChange={(event) => setWorkspace((current) => ({ ...current, project: { ...current.project, title: event.target.value } }))} /></label><label><span>题材</span><input value={workspace.project.genre} onChange={(event) => setWorkspace((current) => ({ ...current, project: { ...current.project, genre: event.target.value } }))} /></label><label className="full"><span>一句话梗概</span><textarea value={workspace.project.premise} onChange={(event) => setWorkspace((current) => ({ ...current, project: { ...current.project, premise: event.target.value } }))} /></label><label className="full"><span>主题表达</span><textarea value={workspace.project.theme} onChange={(event) => setWorkspace((current) => ({ ...current, project: { ...current.project, theme: event.target.value } }))} /></label><label><span>目标字数</span><input type="number" value={workspace.project.targetWords} onChange={(event) => setWorkspace((current) => ({ ...current, project: { ...current.project, targetWords: Number(event.target.value) } }))} /></label><label><span>目标章节</span><input type="number" value={workspace.project.targetChapters} onChange={(event) => setWorkspace((current) => ({ ...current, project: { ...current.project, targetChapters: Number(event.target.value) } }))} /></label><label className="full"><span>叙事视角</span><input value={workspace.project.pointOfView} onChange={(event) => setWorkspace((current) => ({ ...current, project: { ...current.project, pointOfView: event.target.value } }))} /></label><label className="full"><span>文风约束</span><textarea value={workspace.project.writingStyle} onChange={(event) => setWorkspace((current) => ({ ...current, project: { ...current.project, writingStyle: event.target.value } }))} /></label></div></>}
         {settingsTab === "数据" && <>
           <div className="settings-title"><h2>本地数据管理</h2><p>导出完整备份后，可以在另一台设备恢复。</p></div>
@@ -1259,6 +1383,8 @@ export default function Home() {
           {backups.length > 0 && <div className="backup-section"><div><b>最近自动备份</b><small>最多保留 5 份</small></div>{backups.map((backup) => <button key={backup.id} onClick={() => restoreBackup(backup)}><span><History size={16} /></span><div><b>{backup.label}</b><small>{backup.workspace.project.title} · {dateLabel(backup.createdAt)}</small></div><RotateCcw size={15} /></button>)}</div>}
         </>}
         </div></div><footer><span><Cloud size={14} />设置已自动保存</span><button className="primary-button" onClick={() => setSettingsOpen(false)}>完成</button></footer></section></div>}
+
+      {diffChapterId && (() => { const target = workspace.chapters.find((item) => item.id === diffChapterId); const before = target?.repairReview ? workspace.versions.find((item) => item.id === target.repairReview?.beforeVersionId) : undefined; if (!target || !before) return null; return <div className="modal-backdrop"><section className="repair-diff-modal" role="dialog" aria-modal="true" aria-label="修复前后差异"><header><div><b>第 {target.number} 章修复前后对比</b><small>{target.repairReview?.changeSummary}</small></div><button className="icon-button" onClick={() => setDiffChapterId("")}><X size={18} /></button></header><div className="repair-diff-columns"><article><h3>修复前</h3><pre>{before.content}</pre></article><article><h3>修复后</h3><pre>{target.content}</pre></article></div><footer><button className="secondary-button" onClick={() => { setWorkspace((current) => ({ ...current, chapters: current.chapters.map((item) => item.id === target.id ? { ...item, content: before.content, status: "修订中", repairReview: item.repairReview ? { ...item.repairReview, status: "reverted" } : item.repairReview } : item) })); setDiffChapterId(""); notify("已恢复修复前正文"); }}><RotateCcw size={15} />恢复原稿</button><button className="primary-button" onClick={() => { setWorkspace((current) => ({ ...current, chapters: current.chapters.map((item) => item.id === target.id && item.repairReview ? { ...item, repairReview: { ...item.repairReview, status: "accepted" } } : item) })); setDiffChapterId(""); notify("已接受本次修复"); }}><Check size={15} />接受修复</button></footer></section></div>; })()}
 
       <input ref={importRef} className="visually-hidden" type="file" accept=".json,application/json" onChange={importFile} />
       {aiResult && resultOpen && <div className="modal-backdrop" onMouseDown={(event) => { if (event.currentTarget === event.target) setResultOpen(false); }}><section className="ai-result-modal" role="dialog" aria-modal="true" aria-label="AI 生成结果"><header><div><span><Sparkles size={18} /></span><div><b>AI 生成结果</b><small>{aiResult.task} · 应用前请先审阅</small></div></div><button className="icon-button" aria-label="关闭 AI 结果" onClick={() => setResultOpen(false)}><X size={18} /></button></header><article>{aiResult.text}</article><footer><button className="secondary-button" onClick={async () => { await navigator.clipboard.writeText(aiResult.text); notify("已复制结果"); }}><Copy size={16} />复制</button><button className="secondary-button" onClick={saveResultAsMaterial}><LibraryBig size={16} />存入素材库</button><span />{aiResult.chapterId && <><button className="secondary-button" onClick={() => applyResult("replace")}><RefreshCw size={16} />替换正文</button><button className="primary-button" onClick={() => applyResult("insert")}><ArrowDownToLine size={16} />插入正文末尾</button></>}</footer></section></div>}

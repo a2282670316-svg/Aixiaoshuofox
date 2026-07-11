@@ -47,6 +47,7 @@
   "type": "module",
   "displayName": "万象小说工坊",
   "overrides": {
-    "ws": "8.21.0"
+    "ws": "8.21.0",
+    "postcss": "8.5.16"
   }
 }

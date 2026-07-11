@@ -6,14 +6,21 @@ import {
   applyChapterMemory,
   buildAutomatedChapterPrompt,
   buildChapterMemoryPrompt,
+  buildChapterQualityIssues,
+  buildConsistencyRepairPrompt,
   buildRollingAuditPrompt,
   estimateWritingRange,
+  evaluateChapterQuality,
   parseChapterMemory,
+  parseConsistencyRepair,
   parseRollingAudit,
+  removeChapterFromCanon,
+  replaceChapterAuditIssues,
+  unresolvedChapterErrors,
 } from "@/lib/auto-novel";
-import type { Chapter, WorkspaceData } from "@/lib/types";
+import type { Chapter, ConsistencyIssue, WorkspaceData } from "@/lib/types";
 
-type BackgroundKind = "chapter_segment" | "chapter_memory" | "rolling_audit";
+type BackgroundKind = "chapter_segment" | "chapter_memory" | "rolling_audit" | "consistency_repair";
 
 type BackgroundStep = {
   stepKey: string;
@@ -130,25 +137,20 @@ function nextBackgroundStep(workspace: WorkspaceData): BackgroundStep | null {
   const runId = workspace.automation.runId;
   if (!runId) throw new Error("自动创作缺少运行编号");
   const schedule = estimateWritingRange(workspace);
-  const ordered = schedule.chapters;
 
-  for (const chapter of ordered) {
-    const generated = workspace.automation.generatedChapterIds.includes(chapter.id);
-    const shouldAudit = true;
-    if (generated) {
-      if (shouldAudit && workspace.canon.lastAuditedChapter < chapter.number) {
-        return {
-          stepKey: `${runId}:audit:${chapter.number}`,
-          kind: "rolling_audit",
-          chapterNumber: chapter.number,
-          prompt: buildRollingAuditPrompt(workspace, chapter.number),
-        };
-      }
-      continue;
-    }
+  for (const chapter of schedule.chapters) {
+    const generation = chapter.generation;
+    const repairAttempts = generation?.repairAttempts || 0;
+    const blockingIssues = unresolvedChapterErrors(workspace, chapter.number);
+    const accepted = generation?.status === "accepted"
+      || (workspace.automation.generatedChapterIds.includes(chapter.id)
+        && workspace.canon.lastAuditedChapter >= chapter.number
+        && !blockingIssues.length);
+    if (accepted) continue;
+    if (generation?.status === "blocked") return null;
 
     const total = chapterSegments(chapter);
-    const completedSegments = Math.min(total, chapter.generation?.completedSegments || 0);
+    const completedSegments = Math.min(total, generation?.completedSegments || 0);
     if (completedSegments < total) {
       return {
         stepKey: `${runId}:chapter:${chapter.number}:segment:${completedSegments + 1}`,
@@ -164,12 +166,33 @@ function nextBackgroundStep(workspace: WorkspaceData): BackgroundStep | null {
     }
     if (!chapter.memory) {
       return {
-        stepKey: `${runId}:chapter:${chapter.number}:memory`,
+        stepKey: `${runId}:chapter:${chapter.number}:memory:${repairAttempts}`,
         kind: "chapter_memory",
         chapterNumber: chapter.number,
         prompt: buildChapterMemoryPrompt(workspace, chapter),
       };
     }
+    if (generation?.status === "audited" && blockingIssues.length) {
+      if (repairAttempts >= 1) return null;
+      const combinedIssue: ConsistencyIssue = {
+        ...blockingIssues[0],
+        title: `第 ${chapter.number} 章自动验收未通过（${blockingIssues.length} 项）`,
+        description: blockingIssues.map((issue, index) => `${index + 1}. ${issue.title}：${issue.description}`).join("\n"),
+        suggestedFix: blockingIssues.map((issue) => issue.suggestedFix).filter(Boolean).join("；"),
+      };
+      return {
+        stepKey: `${runId}:chapter:${chapter.number}:repair:${repairAttempts + 1}`,
+        kind: "consistency_repair",
+        chapterNumber: chapter.number,
+        prompt: buildConsistencyRepairPrompt(workspace, combinedIssue, chapter),
+      };
+    }
+    return {
+      stepKey: `${runId}:audit:${chapter.number}:${repairAttempts}`,
+      kind: "rolling_audit",
+      chapterNumber: chapter.number,
+      prompt: buildRollingAuditPrompt(workspace, chapter.number),
+    };
   }
   return null;
 }
@@ -199,9 +222,13 @@ async function finishRun(ownerId: string, projectId: string, workspace: Workspac
   return finished;
 }
 
-async function submitStep(ownerId: string, projectId: string, workspace: WorkspaceData, step: BackgroundStep) {
+async function submitStep(ownerId: string, projectId: string, workspace: WorkspaceData, step: BackgroundStep, respectPause = false) {
   const runId = workspace.automation.runId;
   if (!runId) throw new Error("自动创作缺少运行编号");
+  if (respectPause) {
+    const latest = await getProject(ownerId, projectId);
+    if (latest?.workspace.automation.phase === "paused") return null;
+  }
   const existing = await getD1().prepare(`SELECT response_id, status FROM background_responses
     WHERE run_id = ? AND step_key = ?`).bind(runId, step.stepKey).first();
   if (existing && ["queued", "processing", "completed"].includes(String(existing.status))) {
@@ -210,7 +237,8 @@ async function submitStep(ownerId: string, projectId: string, workspace: Workspa
 
   if (workspace.automation.usage.requestCount >= workspace.automation.maxRequests) throw new Error("已达到最大模型调用次数");
   if (workspace.automation.usage.totalTokens >= workspace.automation.maxTokens) throw new Error("已达到最大 Token 预算");
-  const model = backgroundModel();
+  const stage = step.kind === "chapter_segment" ? "chapter" : step.kind === "chapter_memory" ? "memory" : step.kind === "rolling_audit" ? "audit" : "repair";
+  const model = workspace.automation.stageModels?.[stage]?.model?.trim() || backgroundModel();
   if (!model) throw new Error("服务器尚未配置 BACKGROUND_AI_MODEL");
   const jobId = crypto.randomUUID();
   const now = new Date().toISOString();
@@ -224,6 +252,14 @@ async function submitStep(ownerId: string, projectId: string, workspace: Workspa
     .bind(jobId, `pending:${jobId}`, runId, projectId, ownerId, step.stepKey, step.kind,
       step.chapterNumber, step.segmentNumber ?? null, now, now)
     .run();
+  if (respectPause) {
+    const latest = await getProject(ownerId, projectId);
+    if (latest?.workspace.automation.phase === "paused") {
+      await getD1().prepare("UPDATE background_responses SET status = 'cancelled', updated_at = ? WHERE id = ?")
+        .bind(new Date().toISOString(), jobId).run();
+      return null;
+    }
+  }
   try {
     const response = await openAIClient().responses.create({
       model,
@@ -231,7 +267,7 @@ async function submitStep(ownerId: string, projectId: string, workspace: Workspa
       instructions: "你是严谨、尊重作者意图的中文长篇小说创作助手。严格遵循用户要求的输出格式。",
       background: true,
       store: true,
-      max_output_tokens: 16_000,
+      max_output_tokens: workspace.automation.stageModels?.[stage]?.maxOutputTokens || 16_000,
       metadata: { novel_job_id: jobId, novel_run_id: runId.slice(0, 64) },
     });
     await getD1().prepare("UPDATE background_responses SET response_id = ?, updated_at = ? WHERE id = ?")
@@ -247,9 +283,12 @@ async function submitStep(ownerId: string, projectId: string, workspace: Workspa
 
 export async function enqueueNextBackgroundStep(ownerId: string, projectId: string, source?: WorkspaceData) {
   await ensureNovelSchema();
-  const project = source ? null : await getProject(ownerId, projectId);
-  if (!source && !project) throw new Error("找不到云端作品");
-  let workspace = prepareWritingWorkspace(source || project!.workspace);
+  const project = await getProject(ownerId, projectId);
+  if (!project) throw new Error("找不到云端作品");
+  if (source && project.workspace.automation.phase === "paused") {
+    return { status: "paused", workspace: project.workspace };
+  }
+  let workspace = prepareWritingWorkspace(source || project.workspace);
   if (!workspace.chapters.length) throw new Error("请先生成全书蓝图和章节目录");
   await saveAutomationCheckpoint(ownerId, projectId, workspace);
   const step = nextBackgroundStep(workspace);
@@ -257,7 +296,11 @@ export async function enqueueNextBackgroundStep(ownerId: string, projectId: stri
     workspace = await finishRun(ownerId, projectId, workspace);
     return { status: workspace.automation.phase === "completed" ? "completed" : "range_completed", workspace };
   }
-  const submitted = await submitStep(ownerId, projectId, workspace, step);
+  const submitted = await submitStep(ownerId, projectId, workspace, step, Boolean(source));
+  if (!submitted) {
+    const paused = await getProject(ownerId, projectId);
+    return { status: "paused", workspace: paused?.workspace || workspace };
+  }
   return { status: "queued", workspace, ...submitted };
 }
 
@@ -285,6 +328,7 @@ function applyCompletedStep(workspace: WorkspaceData, job: BackgroundJobRow, out
           status: "generating" as const,
           completedSegments: segmentNumber,
           baseRevision: item.generation?.baseRevision ?? item.revision ?? 0,
+          repairAttempts: item.generation?.repairAttempts || 0,
         },
       } : item),
       automation: {
@@ -297,19 +341,49 @@ function applyCompletedStep(workspace: WorkspaceData, job: BackgroundJobRow, out
     };
   }
 
+  if (job.kind === "consistency_repair") {
+    const repaired = parseConsistencyRepair(output);
+    const repairAttempts = (chapter.generation?.repairAttempts || 0) + 1;
+    const repairVersionId = `version-${Date.now()}-${chapter.number}`;
+    let updated = removeChapterFromCanon(workspace, chapter.number);
+    updated = {
+      ...updated,
+      chapters: updated.chapters.map((item) => item.id === chapter.id ? {
+        ...item,
+        content: repaired.revisedContent,
+        status: "修订中" as const,
+        memory: undefined,
+        revision: (item.revision || 0) + 1,
+        updatedAt: now,
+        repairReview: { beforeVersionId: repairVersionId, changeSummary: repaired.changeSummary, createdAt: now, status: "pending" },
+        generation: item.generation ? { ...item.generation, status: "repairing" as const, repairAttempts } : item.generation,
+      } : item),
+      versions: [{
+        id: repairVersionId,
+        chapterId: chapter.id,
+        title: chapter.title,
+        content: chapter.content,
+        createdAt: now,
+        note: "自动闭环修复前存档",
+      }, ...updated.versions],
+      issues: updated.issues.map((issue) => issue.chapterNumber === chapter.number && !issue.resolved ? { ...issue, resolved: true } : issue),
+      automation: { ...updated.automation, updatedAt: now },
+    };
+    return updated;
+  }
+
   if (job.kind === "chapter_memory") {
     let updated = applyChapterMemory(workspace, chapter.id, parseChapterMemory(output));
     updated = {
       ...updated,
       chapters: updated.chapters.map((item) => item.id === chapter.id ? {
         ...item,
-        status: "已完成" as const,
+        status: "修订中" as const,
         generation: item.generation ? { ...item.generation, status: "generated" as const } : item.generation,
       } : item),
       automation: {
         ...updated.automation,
-        generatedChapterIds: [...new Set([...updated.automation.generatedChapterIds, chapter.id])],
-        currentChapterNumber: chapter.number + 1,
+        currentChapterNumber: chapter.number,
         currentSegment: 0,
         updatedAt: now,
       },
@@ -317,17 +391,45 @@ function applyCompletedStep(workspace: WorkspaceData, job: BackgroundJobRow, out
     return updated;
   }
 
-  const issues = parseRollingAudit(output, runId, chapter.number);
-  return {
-    ...workspace,
-    issues: [...workspace.issues, ...issues.filter((candidate) => !workspace.issues.some((issue) => issue.title === candidate.title && issue.location === candidate.location))],
-    chapters: workspace.chapters.map((item) => item.id === chapter.id ? {
+  const aiIssues = parseRollingAudit(output, runId, chapter.number);
+  const auditIssues = [...buildChapterQualityIssues(workspace, chapter.number, runId), ...aiIssues];
+  let updated = replaceChapterAuditIssues(workspace, chapter.number, auditIssues);
+  let quality = evaluateChapterQuality(updated, chapter.number);
+  if (quality.overall < 70) {
+    updated = { ...updated, issues: [...updated.issues, { id: `quality-score-${runId}-${chapter.number}-${chapter.revision || 0}`, severity: "错误", category: "情节", title: "章节综合质量未达到验收线", description: `当前综合质量 ${quality.overall} 分，低于 70 分验收线。`, location: `第 ${chapter.number} 章`, resolved: false, chapterNumber: chapter.number, suggestedFix: quality.notes.join("；"), source: "local" }] };
+    quality = evaluateChapterQuality(updated, chapter.number);
+  }
+  const blockingIssues = unresolvedChapterErrors(updated, chapter.number);
+  const repairAttempts = chapter.generation?.repairAttempts || 0;
+  const accepted = !blockingIssues.length;
+  const blocked = !accepted && repairAttempts >= 1;
+  updated = {
+    ...updated,
+    project: blocked ? { ...updated.project, status: "等待人工确认" } : updated.project,
+    chapters: updated.chapters.map((item) => item.id === chapter.id ? {
       ...item,
-      generation: item.generation ? { ...item.generation, status: "audited" as const } : item.generation,
+      status: accepted ? "已完成" as const : "修订中" as const,
+      quality,
+      generation: item.generation ? {
+        ...item.generation,
+        status: accepted ? "accepted" as const : blocked ? "blocked" as const : "audited" as const,
+        acceptedAt: accepted ? now : undefined,
+      } : item.generation,
     } : item),
-    canon: { ...workspace.canon, lastAuditedChapter: chapter.number },
-    automation: { ...workspace.automation, updatedAt: now },
+    canon: { ...updated.canon, lastAuditedChapter: Math.max(updated.canon.lastAuditedChapter, chapter.number) },
+    automation: {
+      ...updated.automation,
+      phase: blocked ? "paused" as const : "writing" as const,
+      generatedChapterIds: accepted
+        ? [...new Set([...updated.automation.generatedChapterIds, chapter.id])]
+        : updated.automation.generatedChapterIds.filter((id) => id !== chapter.id),
+      currentChapterNumber: accepted ? chapter.number + 1 : chapter.number,
+      currentSegment: 0,
+      lastError: blocked ? `第 ${chapter.number} 章自动修复后仍有 ${blockingIssues.length} 项错误，已暂停等待人工确认` : undefined,
+      updatedAt: now,
+    },
   };
+  return updated;
 }
 
 export async function completeBackgroundResponse(responseId: string, webhookId: string) {
@@ -361,8 +463,15 @@ export async function completeBackgroundResponse(responseId: string, webhookId: 
     if (!output) throw new Error("后台模型没有返回可用文本");
     const project = await getProject(job.owner_id, job.project_id);
     if (!project) throw new Error("后台作品已经不存在");
+    if (project.workspace.automation.phase === "paused" || project.workspace.automation.runId !== job.run_id) {
+      await db.prepare("UPDATE background_responses SET status = 'cancelled', updated_at = ? WHERE id = ?")
+        .bind(new Date().toISOString(), job.id).run();
+      return { status: "paused" };
+    }
     let workspace = applyCompletedStep(project.workspace, job, output);
     workspace = updateUsage(workspace, response.usage);
+    const taskLabel = job.kind === "chapter_segment" ? `生成第 ${job.chapter_number} 章第 ${job.segment_number} 段` : job.kind === "chapter_memory" ? `提取第 ${job.chapter_number} 章事实记忆` : job.kind === "rolling_audit" ? `审校第 ${job.chapter_number} 章` : `修复第 ${job.chapter_number} 章`;
+    workspace = { ...workspace, automation: { ...workspace.automation, taskLog: [{ id: job.id, runId: job.run_id, kind: job.kind, label: taskLabel, status: "completed" as const, chapterNumber: job.chapter_number ?? undefined, startedAt: new Date().toISOString(), finishedAt: new Date().toISOString() }, ...(workspace.automation.taskLog || []).filter((task) => task.id !== job.id)].slice(0, 500) } };
     await saveAutomationCheckpoint(job.owner_id, job.project_id, workspace, {
       stepKey: job.step_key,
       kind: job.kind,
@@ -372,8 +481,23 @@ export async function completeBackgroundResponse(responseId: string, webhookId: 
       outputExcerpt: output.slice(-1500),
       contextHash: `canon:${workspace.canon.revision}`,
     });
-    await db.prepare("UPDATE background_responses SET status = 'completed', updated_at = ? WHERE response_id = ?")
+    const committed = await db.prepare("UPDATE background_responses SET status = 'completed', updated_at = ? WHERE response_id = ? AND status = 'processing'")
       .bind(new Date().toISOString(), responseId).run();
+    if (!committed.meta.changes) {
+      const paused: WorkspaceData = {
+        ...workspace,
+        project: { ...workspace.project, status: "已暂停" },
+        automation: { ...workspace.automation, phase: "paused", updatedAt: new Date().toISOString() },
+      };
+      await saveAutomationCheckpoint(job.owner_id, job.project_id, paused, {
+        stepKey: `${job.run_id}:paused:${job.chapter_number || 0}:${job.segment_number || 0}`,
+        kind: "run_paused",
+        chapterNumber: job.chapter_number ?? undefined,
+        segmentNumber: job.segment_number ?? undefined,
+        status: "completed",
+      });
+      return { status: "paused" };
+    }
     const next = await enqueueNextBackgroundStep(job.owner_id, job.project_id, workspace);
     return { status: "completed", next: next.status };
   } catch (error) {

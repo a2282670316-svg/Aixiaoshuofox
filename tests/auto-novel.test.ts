@@ -3,11 +3,17 @@ import test from "node:test";
 import {
   buildAutomatedChapterPrompt,
   buildBlueprintChaptersPrompt,
+  buildChapterQualityIssues,
   applyChapterMemory,
   canonBeforeChapter,
+  compactCanonBeforeChapter,
   foreshadowTasksForChapter,
   createAutomationState,
+  detectAIStage,
   estimateWritingRange,
+  evaluateChapterQuality,
+  buildForeshadowLedger,
+  latestCharacterTracking,
   parseChapterMemory,
   parseBlueprintStage,
   parseNovelBlueprint,
@@ -16,7 +22,9 @@ import {
   parseSeedOptions,
   reserveModelRequest,
   removeChapterFromCanon,
+  replaceChapterAuditIssues,
   restartBlueprintDraft,
+  unresolvedChapterErrors,
   rewindNovelFromChapter,
 } from "../lib/auto-novel";
 import type { StorySeed, WorkspaceData } from "../lib/types";
@@ -562,4 +570,72 @@ test("removes one chapter from canon before rebuilding it", () => {
   const cleaned = removeChapterFromCanon(workspace, 2);
   assert.deepEqual(cleaned.canon.chapterSummaries.map((item) => item.chapterNumber), [1]);
   assert.deepEqual(cleaned.canon.facts.map((item) => item.chapterNumber), [1]);
+});
+
+
+test("blocks chapter acceptance when the final draft is materially too short", () => {
+  const chapter = { ...DEMO_WORKSPACE.chapters[0], number: 1, targetWords: 2000, content: "短".repeat(900), revision: 3 };
+  const workspace: WorkspaceData = { ...DEMO_WORKSPACE, chapters: [chapter] };
+  const issues = buildChapterQualityIssues(workspace, 1, "quality-run");
+  assert.equal(issues.length, 1);
+  assert.equal(issues[0].severity, "错误");
+  const audited = replaceChapterAuditIssues(workspace, 1, issues);
+  assert.equal(unresolvedChapterErrors(audited, 1).length, 1);
+});
+
+test("re-audit resolves stale chapter issues before adding the new result", () => {
+  const oldIssue = { ...DEMO_WORKSPACE.issues[0], id: "old", chapterNumber: 1, resolved: false };
+  const nextIssue = { ...oldIssue, id: "new", title: "复审新问题" };
+  const workspace: WorkspaceData = { ...DEMO_WORKSPACE, issues: [oldIssue] };
+  const replaced = replaceChapterAuditIssues(workspace, 1, [nextIssue]);
+  assert.equal(replaced.issues.find((item) => item.id === "old")?.resolved, true);
+  assert.equal(replaced.issues.find((item) => item.id === "new")?.resolved, false);
+});
+
+
+test("compacts long-form canon while retaining relevant older facts", () => {
+  const target = { ...DEMO_WORKSPACE.chapters[0], id: "chapter-120", number: 120, title: "沈砚的最终调查", summary: "沈砚核对旧案事实" };
+  const workspace: WorkspaceData = {
+    ...DEMO_WORKSPACE,
+    chapters: [...DEMO_WORKSPACE.chapters, target],
+    canon: {
+      ...DEMO_WORKSPACE.canon,
+      chapterSummaries: Array.from({ length: 119 }, (_, index) => ({ chapterId: `c-${index + 1}`, chapterNumber: index + 1, summary: `第 ${index + 1} 章摘要` })),
+      timeline: Array.from({ length: 119 }, (_, index) => ({ id: `t-${index + 1}`, chapterNumber: index + 1, event: `事件 ${index + 1}` })),
+      facts: Array.from({ length: 119 }, (_, index) => ({ id: `f-${index + 1}`, chapterNumber: index + 1, fact: index === 0 ? "沈砚从未公开旧钥匙" : `普通事实 ${index + 1}` })),
+    },
+  };
+  const compact = compactCanonBeforeChapter(workspace, 120);
+  assert.ok(compact.chapterSummaries.length <= 16);
+  assert.ok(compact.timeline.length <= 60);
+  assert.ok(compact.facts.length <= 90);
+  assert.ok(compact.facts.some((item) => item.fact.includes("沈砚")));
+});
+
+
+test("selects independent models by writing stage", () => {
+  assert.equal(detectAIStage("生成三个故事方向"), "ideation");
+  assert.equal(detectAIStage("第 3/5 步：故事大纲"), "blueprint");
+  assert.equal(detectAIStage("你是长篇小说的连续性记录员"), "memory");
+  assert.equal(detectAIStage("逐章一致性审校"), "audit");
+  assert.equal(detectAIStage("请输出 revisedContent 修订全文"), "repair");
+  assert.equal(detectAIStage("继续创作本章正文"), "chapter");
+});
+
+test("calculates chapter quality and tracks foreshadows and character state", () => {
+  const chapter = { ...DEMO_WORKSPACE.chapters[0], targetWords: 1000, content: "正文".repeat(500), memory: { summary: "完成", timelineEvents: [], characterUpdates: [{ name: DEMO_WORKSPACE.characters[0].name, state: "在码头继续调查" }], openedThreads: [], resolvedThreads: [], establishedFacts: [], foreshadowUpdates: [] } };
+  const workspace: WorkspaceData = { ...DEMO_WORKSPACE, chapters: [chapter], issues: [], canon: { ...DEMO_WORKSPACE.canon, characterStates: [{ characterId: DEMO_WORKSPACE.characters[0].id, name: DEMO_WORKSPACE.characters[0].name, state: "在码头继续调查", chapterNumber: chapter.number }] } };
+  const quality = evaluateChapterQuality(workspace, chapter.number);
+  assert.ok(quality.overall >= 70);
+  assert.equal(latestCharacterTracking(workspace)[0].latest?.chapterNumber, chapter.number);
+  assert.equal(buildForeshadowLedger(workspace).length, workspace.materials.filter((item) => item.type === "伏笔").length);
+});
+
+test("normalizes stage models, task logs, quality and repair review", () => {
+  const source: WorkspaceData = { ...DEMO_WORKSPACE, chapters: [{ ...DEMO_WORKSPACE.chapters[0], quality: { overall: 88, length: 90, outline: 80, continuity: 92, foreshadow: 100, style: 85, evaluatedAt: new Date().toISOString(), notes: [] }, repairReview: { beforeVersionId: "v1", changeSummary: "修复冲突", createdAt: new Date().toISOString(), status: "pending" } }], automation: { ...DEMO_WORKSPACE.automation, stageModels: { audit: { model: "audit-model", maxOutputTokens: 4096 } }, taskLog: [{ id: "task-1", kind: "audit", label: "审校", status: "completed", startedAt: new Date().toISOString() }] } };
+  const normalized = normalizeWorkspaceData(source, DEMO_WORKSPACE);
+  assert.equal(normalized.chapters[0].quality?.overall, 88);
+  assert.equal(normalized.chapters[0].repairReview?.status, "pending");
+  assert.equal(normalized.automation.stageModels?.audit?.model, "audit-model");
+  assert.equal(normalized.automation.taskLog?.[0].status, "completed");
 });

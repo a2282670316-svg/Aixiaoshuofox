@@ -87,6 +87,24 @@ export interface ChapterOutline {
   }>;
 }
 
+export interface ChapterQualityReport {
+  overall: number;
+  length: number;
+  outline: number;
+  continuity: number;
+  foreshadow: number;
+  style: number;
+  evaluatedAt: string;
+  notes: string[];
+}
+
+export interface ChapterRepairReview {
+  beforeVersionId: string;
+  changeSummary: string;
+  createdAt: string;
+  status: "pending" | "accepted" | "reverted";
+}
+
 export interface Chapter {
   id: string;
   number: number;
@@ -101,11 +119,15 @@ export interface Chapter {
   chapterOutline?: ChapterOutline;
   revision?: number;
   memory?: ChapterMemory;
+  quality?: ChapterQualityReport;
+  repairReview?: ChapterRepairReview;
   generation?: {
     runId: string;
-    status: "planned" | "generating" | "generated" | "audited";
+    status: "planned" | "generating" | "generated" | "audited" | "repairing" | "accepted" | "blocked";
     completedSegments: number;
     baseRevision: number;
+    repairAttempts?: number;
+    acceptedAt?: string;
   };
 }
 
@@ -210,6 +232,25 @@ export interface WritingRange {
   toChapter: number;
 }
 
+export type AIStage = "ideation" | "blueprint" | "chapter" | "memory" | "audit" | "repair";
+
+export interface StageModelConfig {
+  model?: string;
+  maxOutputTokens?: number;
+}
+
+export interface AutomationTaskLog {
+  id: string;
+  runId?: string;
+  kind: string;
+  label: string;
+  status: "queued" | "running" | "completed" | "failed" | "cancelled";
+  chapterNumber?: number;
+  startedAt: string;
+  finishedAt?: string;
+  error?: string;
+}
+
 export interface NovelAutomation {
   runId?: string;
   phase: AutomationPhase;
@@ -231,6 +272,8 @@ export interface NovelAutomation {
   };
   maxRequests: number;
   maxTokens: number;
+  stageModels?: Partial<Record<AIStage, StageModelConfig>>;
+  taskLog?: AutomationTaskLog[];
   lastError?: string;
   blueprintDraft?: BlueprintDraft;
   updatedAt?: string;
