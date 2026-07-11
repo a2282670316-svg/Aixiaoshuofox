@@ -43,13 +43,12 @@ export async function POST(request: Request) {
       return NextResponse.json({ status: "paused", workspace });
     }
     const configuration = backgroundConfiguration();
-    if (!configuration.apiKey || !configuration.model || !configuration.webhookSecret) {
+    if (!configuration.apiKey || !configuration.model) {
       return NextResponse.json({
         error: "服务器后台写作尚未配置完成",
         missing: {
           apiKey: !configuration.apiKey,
           model: !configuration.model,
-          webhookSecret: !configuration.webhookSecret,
         },
       }, { status: 503 });
     }

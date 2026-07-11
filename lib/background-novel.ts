@@ -47,17 +47,28 @@ function configuredValue(value: string | undefined) {
 }
 
 export function backgroundConfiguration() {
+  const apiKey = configuredValue(env.BACKGROUND_AI_API_KEY) || configuredValue(env.OPENAI_API_KEY);
+  const model = configuredValue(env.BACKGROUND_AI_MODEL) || configuredValue(env.OPENAI_MODEL);
+  const baseUrl = configuredValue(env.BACKGROUND_AI_BASE_URL) || "https://api.openai.com/v1";
   return {
-    apiKey: Boolean(configuredValue(env.OPENAI_API_KEY)),
-    model: configuredValue(env.OPENAI_MODEL),
+    apiKey: Boolean(apiKey),
+    model,
+    baseUrl,
+    provider: configuredValue(env.BACKGROUND_AI_BASE_URL) ? "第三方 Responses" : "OpenAI Responses",
     webhookSecret: Boolean(configuredValue(env.OPENAI_WEBHOOK_SECRET)),
+    workerSecret: Boolean(configuredValue(env.BACKGROUND_WORKER_SECRET)),
   };
 }
 
 function openAIClient() {
-  const apiKey = configuredValue(env.OPENAI_API_KEY);
-  if (!apiKey) throw new Error("服务器尚未配置 OPENAI_API_KEY");
-  return new OpenAI({ apiKey });
+  const apiKey = configuredValue(env.BACKGROUND_AI_API_KEY) || configuredValue(env.OPENAI_API_KEY);
+  if (!apiKey) throw new Error("服务器尚未配置 BACKGROUND_AI_API_KEY");
+  const baseURL = configuredValue(env.BACKGROUND_AI_BASE_URL) || undefined;
+  return new OpenAI({ apiKey, baseURL });
+}
+
+function backgroundModel() {
+  return configuredValue(env.BACKGROUND_AI_MODEL) || configuredValue(env.OPENAI_MODEL);
 }
 
 function countCharacters(value: string) {
@@ -193,8 +204,8 @@ async function submitStep(ownerId: string, projectId: string, workspace: Workspa
 
   if (workspace.automation.usage.requestCount >= workspace.automation.maxRequests) throw new Error("已达到最大模型调用次数");
   if (workspace.automation.usage.totalTokens >= workspace.automation.maxTokens) throw new Error("已达到最大 Token 预算");
-  const model = configuredValue(env.OPENAI_MODEL);
-  if (!model) throw new Error("服务器尚未配置 OPENAI_MODEL");
+  const model = backgroundModel();
+  if (!model) throw new Error("服务器尚未配置 BACKGROUND_AI_MODEL");
   const jobId = crypto.randomUUID();
   const now = new Date().toISOString();
   await getD1().prepare(`INSERT INTO background_responses
@@ -415,4 +426,33 @@ export async function backgroundRunStatus(ownerId: string, projectId: string) {
     FROM background_responses WHERE project_id = ? AND owner_id = ? ORDER BY updated_at DESC LIMIT 1`)
     .bind(projectId, ownerId).first();
   return { project, active: active || null, configuration: backgroundConfiguration() };
+}
+
+export async function pollBackgroundResponses(projectId?: string) {
+  await ensureNovelSchema();
+  const db = getD1();
+  const query = projectId
+    ? db.prepare(`SELECT response_id FROM background_responses
+        WHERE project_id = ? AND status = 'queued' AND response_id NOT LIKE 'pending:%'
+        ORDER BY created_at ASC LIMIT 5`).bind(projectId)
+    : db.prepare(`SELECT response_id FROM background_responses
+        WHERE status = 'queued' AND response_id NOT LIKE 'pending:%'
+        ORDER BY created_at ASC LIMIT 5`);
+  const rows = await query.all<{ response_id: string }>();
+  const results: Array<{ responseId: string; status: string; error?: string }> = [];
+  for (const row of rows.results || []) {
+    const responseId = String(row.response_id);
+    try {
+      const response = await openAIClient().responses.retrieve(responseId) as RetrievedBackgroundResponse;
+      if (["queued", "in_progress"].includes(response.status)) {
+        results.push({ responseId, status: response.status });
+        continue;
+      }
+      const completed = await completeBackgroundResponse(responseId, `poll:${responseId}:${response.status}`);
+      results.push({ responseId, status: completed.status });
+    } catch (error) {
+      results.push({ responseId, status: "retry", error: error instanceof Error ? error.message : "轮询失败" });
+    }
+  }
+  return results;
 }

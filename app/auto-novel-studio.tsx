@@ -717,7 +717,7 @@ export default function AutoNovelStudio({
           })}
         </div>
         <footer className="auto-control-bar">
-          <span>{backgroundActive ? <Cloud size={14} /> : durableProjectId ? <Cloud size={14} /> : <AlertTriangle size={14} />}{backgroundActive ? "云端正在接力生成，关闭网页后任务仍会继续。" : durableProjectId ? backgroundConfigured ? "云端检查点已开启，可切换为关闭网页仍继续的后台模式。" : "云端检查点已开启；后台模型与回调密钥尚待配置。" : "首次运行会创建云端检查点；浏览器模式需保持页面打开。"}</span>
+          <span>{backgroundActive ? <Cloud size={14} /> : durableProjectId ? <Cloud size={14} /> : <AlertTriangle size={14} />}{backgroundActive ? "后台工作器正在接力生成，关闭网页后任务仍会继续。" : durableProjectId ? backgroundConfigured ? "云端检查点已开启；保持后台工作器运行即可关闭网页。" : "云端检查点已开启；第三方后台模型密钥尚待配置。" : "首次运行会创建云端检查点；浏览器模式需保持页面打开。"}</span>
           <div>{automation.phase === "writing" ? <button className="secondary-button" disabled={backgroundBusy} onClick={() => backgroundActive ? void onPauseBackground?.() : pause()}><CircleStop size={16} />暂停并保存</button> : automation.phase !== "completed" ? <><button className="secondary-button" disabled={aiBusy || backgroundBusy} onClick={() => void writeNovel(workspace)}><Play size={16} />浏览器续写</button><button className="primary-button" disabled={backgroundBusy || !backgroundConfigured} onClick={() => void onStartBackground?.(workspace)}><Cloud size={16} />云端后台续写</button></> : <button className="primary-button" onClick={() => onOpenChapter(workspace.chapters[0].id)}><BookOpenCheck size={16} />审阅全书</button>}<button className="secondary-button" disabled={isRunning} onClick={resetWorkflow}><RotateCcw size={15} />重置流程</button></div>
         </footer>
       </section>}

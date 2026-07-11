@@ -206,7 +206,27 @@ test("reports background automation configuration without exposing secrets", asy
   );
   assert.equal(response.status, 200);
   const payload = await response.json();
-  assert.deepEqual(payload.configuration, { apiKey: false, model: "", webhookSecret: false });
+  assert.deepEqual(payload.configuration, {
+    apiKey: false,
+    model: "",
+    baseUrl: "https://api.openai.com/v1",
+    provider: "OpenAI Responses",
+    webhookSecret: false,
+    workerSecret: false,
+  });
+});
+
+test("protects the third-party background polling worker", async () => {
+  const worker = await workerPromise;
+  const statusResponse = await worker.fetch(new Request("http://localhost/api/automation/worker"), env, context);
+  assert.equal(statusResponse.status, 200);
+  assert.equal((await statusResponse.json()).ready, false);
+  const runResponse = await worker.fetch(
+    new Request("http://localhost/api/automation/worker", { method: "POST" }),
+    env,
+    context,
+  );
+  assert.equal(runResponse.status, 401);
 });
 
 test("rejects unsigned webhooks when the signing secret is not configured", async () => {

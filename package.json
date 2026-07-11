@@ -13,7 +13,8 @@
     "test": "npm run build && node --test tests/rendered-html.test.mjs && tsx --test tests/auto-novel.test.ts",
     "validate:artifact": "node scripts/validate-artifact.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
-    "db:generate": "drizzle-kit generate"
+    "db:generate": "drizzle-kit generate",
+    "background:worker": "node --env-file-if-exists=.env.local scripts/background-worker.mjs"
   },
   "dependencies": {
     "drizzle-orm": "0.45.2",

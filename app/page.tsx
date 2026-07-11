@@ -100,7 +100,7 @@ const navItems: Array<{ label: NavKey; icon: typeof PenLine }> = [
 type AIResult = { task: string; text: string; chapterId?: string };
 type WorkspaceBackup = { id: string; label: string; createdAt: string; workspace: WorkspaceData };
 type CloudProjectSummary = { id: string; title: string; genre: string; status: string; createdAt: string; updatedAt: string };
-type BackgroundConfiguration = { apiKey: boolean; model: string; webhookSecret: boolean };
+type BackgroundConfiguration = { apiKey: boolean; model: string; baseUrl?: string; provider?: string; webhookSecret: boolean; workerSecret?: boolean };
 
 function id(prefix: string) {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
@@ -930,7 +930,7 @@ export default function Home() {
 
   const renderView = () => {
     if (active === "创作台") return renderDashboard();
-    if (active === "AI 全书") return <AutoNovelStudio workspace={workspace} config={config} setWorkspace={setWorkspace} aiBusy={aiBusy} setAiBusy={setAiBusy} notify={notify} onNeedConfig={() => { setSettingsTab("AI"); setSettingsOpen(true); }} onBackup={createBackup} onOpenChapter={(targetId) => { setChapterId(targetId); setActive("章节"); }} onDurableCheckpoint={persistDurableCheckpoint} durableProjectId={activeCloudProjectId || undefined} backgroundConfigured={backgroundConfiguration.apiKey && Boolean(backgroundConfiguration.model) && backgroundConfiguration.webhookSecret} backgroundActive={backgroundActive} backgroundBusy={backgroundBusy} backgroundModel={backgroundConfiguration.model} onStartBackground={startBackgroundWriting} onPauseBackground={pauseBackgroundWriting} />;
+    if (active === "AI 全书") return <AutoNovelStudio workspace={workspace} config={config} setWorkspace={setWorkspace} aiBusy={aiBusy} setAiBusy={setAiBusy} notify={notify} onNeedConfig={() => { setSettingsTab("AI"); setSettingsOpen(true); }} onBackup={createBackup} onOpenChapter={(targetId) => { setChapterId(targetId); setActive("章节"); }} onDurableCheckpoint={persistDurableCheckpoint} durableProjectId={activeCloudProjectId || undefined} backgroundConfigured={backgroundConfiguration.apiKey && Boolean(backgroundConfiguration.model)} backgroundActive={backgroundActive} backgroundBusy={backgroundBusy} backgroundModel={backgroundConfiguration.model} onStartBackground={startBackgroundWriting} onPauseBackground={pauseBackgroundWriting} />;
     if (active === "灵感") return renderIdeas();
     if (active === "世界观") return renderWorld();
     if (active === "人物") return renderCharacters();
