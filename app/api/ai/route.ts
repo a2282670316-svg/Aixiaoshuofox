@@ -7,6 +7,7 @@ type AIRequestBody = {
   model?: string;
   apiMode?: AIEndpointMode;
   temperature?: number;
+  maxOutputTokens?: number;
   prompt?: string;
 };
 
@@ -119,6 +120,10 @@ export async function POST(request: Request) {
   if (body.apiMode !== undefined && !["auto", "chat", "responses"].includes(body.apiMode)) {
     return NextResponse.json({ error: "接口模式无效" }, { status: 400 });
   }
+  const maxOutputTokens = body.maxOutputTokens === undefined ? 16_384 : body.maxOutputTokens;
+  if (!Number.isInteger(maxOutputTokens) || maxOutputTokens < 256 || maxOutputTokens > 65_536) {
+    return NextResponse.json({ error: "最大输出 Token 必须是 256 到 65536 之间的整数" }, { status: 400 });
+  }
 
   let endpoint: ReturnType<typeof resolveAIEndpoint>;
   try {
@@ -144,8 +149,10 @@ export async function POST(request: Request) {
         ...(mode === "responses" ? {
           instructions: "你是严谨、尊重作者意图的中文长篇小说创作助手。",
           input: prompt,
+          max_output_tokens: maxOutputTokens,
         } : {
           temperature,
+          max_tokens: maxOutputTokens,
           messages: [
             { role: "system", content: "你是严谨、尊重作者意图的中文长篇小说创作助手。" },
             { role: "user", content: prompt },

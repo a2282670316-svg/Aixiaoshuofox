@@ -134,6 +134,7 @@ test("uses valid Responses API text input and parses output text", async () => {
     assert.equal(requestBody.input, "测试");
     assert.equal(requestBody.output_text, undefined);
     assert.equal(requestBody.temperature, undefined);
+    assert.equal(requestBody.max_output_tokens, 16384);
     assert.equal((await response.json()).text, "连接成功");
   } finally {
     globalThis.fetch = originalFetch;

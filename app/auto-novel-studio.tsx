@@ -165,6 +165,7 @@ export default function AutoNovelStudio({
           body: JSON.stringify({
             ...config,
             prompt,
+            maxOutputTokens: prompt.includes("完整全书蓝图") ? 32_768 : 16_384,
           }),
           signal,
         });

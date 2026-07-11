@@ -614,6 +614,7 @@ export default function Home() {
         body: JSON.stringify({
           ...config,
           prompt: buildUserPrompt(task, instruction, workspace, targetChapterId),
+          maxOutputTokens: 16_384,
         }),
       });
       const payload = await response.json() as { text?: string; error?: string };
