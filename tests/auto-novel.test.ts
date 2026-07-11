@@ -12,6 +12,7 @@ import {
   parseSeedOptions,
   reserveModelRequest,
   restartBlueprintDraft,
+  rewindNovelFromChapter,
 } from "../lib/auto-novel";
 import type { StorySeed, WorkspaceData } from "../lib/types";
 import { DEMO_WORKSPACE } from "../lib/demo-data";
@@ -300,4 +301,82 @@ test("parses rolling continuity audit issues", () => {
   assert.equal(issues.length, 1);
   assert.equal(issues[0].severity, "警告");
   assert.equal(issues[0].resolved, false);
+});
+
+
+test("rewinds writing from a chapter without keeping future canon", () => {
+  const settings = createAutomationState({
+    runId: "old-run",
+    phase: "completed",
+    targetChapters: 4,
+    targetWords: 16000,
+    chapterWords: 4000,
+    currentChapterNumber: 4,
+  });
+  const parsed = parseNovelBlueprint(blueprintJson(), seed, settings);
+  const chapters = parsed.chapters.map((chapter) => ({
+    ...chapter,
+    content: `第${chapter.number}章旧正文`,
+    status: "已完成" as const,
+    revision: 1,
+    memory: {
+      summary: `第${chapter.number}章摘要`,
+      timelineEvents: [],
+      characterUpdates: [],
+      openedThreads: [],
+      resolvedThreads: [],
+      establishedFacts: [],
+    },
+    generation: { runId: "old-run", status: "audited" as const, completedSegments: 2, baseRevision: 0 },
+  }));
+  const workspace: WorkspaceData = {
+    ...parsed,
+    chapters,
+    issues: [
+      { id: "audit-old-run-1", severity: "警告", category: "情节", title: "旧审校", description: "未来内容", location: "第3章", resolved: false },
+      { id: "local-1", severity: "提示", category: "文风", title: "人工记录", description: "保留", location: "全书", resolved: false },
+    ],
+    canon: {
+      revision: 8,
+      chapterSummaries: chapters.map((chapter) => ({ chapterId: chapter.id, chapterNumber: chapter.number, summary: chapter.memory!.summary })),
+      timeline: chapters.map((chapter) => ({ id: `timeline-${chapter.number}`, chapterNumber: chapter.number, event: "事件" })),
+      characterStates: chapters.map((chapter) => ({ name: "林岚", state: `状态${chapter.number}`, chapterNumber: chapter.number })),
+      threads: [
+        { id: "thread-1", title: "旧线索", status: "resolved", openedChapter: 1, resolvedChapter: 3 },
+        { id: "thread-2", title: "未来线索", status: "open", openedChapter: 3 },
+      ],
+      facts: chapters.map((chapter) => ({ id: `fact-${chapter.number}`, chapterNumber: chapter.number, fact: "事实" })),
+      lastAuditedChapter: 4,
+    },
+    automation: {
+      ...settings,
+      generatedChapterIds: chapters.map((chapter) => chapter.id),
+      usage: { requestCount: 42, inputTokens: 100, outputTokens: 200, totalTokens: 300 },
+    },
+  };
+
+  const rewound = rewindNovelFromChapter(workspace, 3, "new-run", "2026-07-11T12:00:00.000Z");
+
+  assert.equal(rewound.chapters[1].content, "第2章旧正文");
+  assert.equal(rewound.chapters[2].content, "");
+  assert.equal(rewound.chapters[2].status, "待生成");
+  assert.equal(rewound.chapters[2].memory, undefined);
+  assert.equal(rewound.versions.length, 2);
+  assert.equal(rewound.canon.chapterSummaries.length, 2);
+  assert.equal(rewound.canon.timeline.length, 2);
+  assert.equal(rewound.canon.facts.length, 2);
+  assert.equal(rewound.canon.lastAuditedChapter, 2);
+  assert.equal(rewound.canon.threads.length, 1);
+  assert.equal(rewound.canon.threads[0].status, "open");
+  assert.equal(rewound.canon.threads[0].resolvedChapter, undefined);
+  assert.deepEqual(rewound.issues.map((issue) => issue.id), ["local-1"]);
+  assert.equal(rewound.automation.runId, "new-run");
+  assert.equal(rewound.automation.phase, "paused");
+  assert.equal(rewound.automation.currentChapterNumber, 3);
+  assert.deepEqual(rewound.automation.generatedChapterIds, chapters.slice(0, 2).map((chapter) => chapter.id));
+  assert.equal(rewound.automation.usage.requestCount, 42);
+});
+
+test("rejects rewinding to a chapter that does not exist", () => {
+  assert.throws(() => rewindNovelFromChapter(DEMO_WORKSPACE, 999, "new-run"), /没有找到第 999 章/);
 });

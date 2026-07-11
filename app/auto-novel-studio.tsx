@@ -46,6 +46,7 @@ import {
   parseSeedOptions,
   reserveModelRequest,
   restartBlueprintDraft,
+  rewindNovelFromChapter,
 } from "@/lib/auto-novel";
 import type { BlueprintStagePayload } from "@/lib/auto-novel";
 import type {
@@ -136,6 +137,9 @@ export default function AutoNovelStudio({
   const usageRef = useRef(workspace.automation.usage);
   const budgetRef = useRef({ maxRequests: workspace.automation.maxRequests, maxTokens: workspace.automation.maxTokens });
   const [blueprintStage, setBlueprintStage] = useState("");
+  const [rewindChapterNumber, setRewindChapterNumber] = useState(
+    Math.max(1, workspace.automation.currentChapterNumber || 1),
+  );
   const automation = workspace.automation;
   const isRunning = activePhases.includes(automation.phase) && !(automation.phase === "planning" && !aiBusy);
   const generatedCount = workspace.chapters.filter((item) => automation.generatedChapterIds.includes(item.id)).length;
@@ -803,6 +807,29 @@ export default function AutoNovelStudio({
     await buildBlueprintFrom(source, seed, false);
   };
 
+  const rewindWritingFromChapter = async () => {
+    const chapter = workspace.chapters.find((item) => item.number === rewindChapterNumber);
+    if (!chapter || aiBusy || backgroundBusy || backgroundActive) return;
+    const affectedCount = workspace.chapters.filter((item) => item.number >= chapter.number).length;
+    if (!window.confirm(`将清空第 ${chapter.number} 章及之后 ${affectedCount} 章的正文、章节记忆和审校结果，并从这里重新写作。现有正文会自动存入版本历史和完整备份，是否继续？`)) return;
+
+    const runId = nextRunId();
+    const rewound = rewindNovelFromChapter(workspace, chapter.number, runId);
+    onBackup(workspace, `从第 ${chapter.number} 章重写前自动备份`);
+    usageRef.current = rewound.automation.usage;
+    budgetRef.current = { maxRequests: rewound.automation.maxRequests, maxTokens: rewound.automation.maxTokens };
+    setWorkspace(rewound);
+    await onDurableCheckpoint?.(rewound, {
+      stepKey: `${runId}:rewind:${chapter.number}`,
+      kind: "run_rewind",
+      chapterNumber: chapter.number,
+      status: "completed",
+      outputExcerpt: `已回退到第 ${chapter.number} 章，等待重新写作`,
+      contextHash: `canon:${rewound.canon.revision}`,
+    });
+    notify(`已安全回退到第 ${chapter.number} 章，可选择浏览器或云端后台重新写作`);
+  };
+
   const pause = () => {
     stopRequested.current = true;
     runTokenRef.current = `paused-${Date.now()}`;
@@ -906,6 +933,15 @@ export default function AutoNovelStudio({
         <div className="auto-section-title"><div><span>蓝图维护</span><h2>单独重做一个阶段</h2></div><small>重做上游阶段会自动刷新依赖它的后续阶段</small></div>
         <div className="heading-actions">
           {(["人物与关系", "世界设定", "故事大纲", "伏笔回收", "逐章目录"] as const).map((label, index) => <button key={label} className="secondary-button compact" disabled={aiBusy || automation.phase === "writing"} onClick={() => void redoBlueprintStage((index + 1) as 1 | 2 | 3 | 4 | 5)}><RotateCcw size={14} />重做{label}</button>)}
+        </div>
+      </section>}
+
+      {automation.runId && workspace.chapters.length > 0 && <section className="auto-settings-card auto-rewind-card card">
+        <div className="auto-section-title"><div><span>正文恢复</span><h2>从指定章节安全重写</h2></div><small>自动保存旧正文并回滚后续记忆</small></div>
+        <div className="auto-rewind-controls">
+          <label><span>重新开始章节</span><select disabled={isRunning || backgroundActive} value={rewindChapterNumber} onChange={(event) => setRewindChapterNumber(Number(event.target.value))}>{[...workspace.chapters].sort((a, b) => a.number - b.number).map((item) => <option key={item.id} value={item.number}>第 {item.number} 章 · {item.title}</option>)}</select></label>
+          <div><b>会发生什么？</b><p>保留此前章节；清空所选章节及后续正文，移除对应事实账本与旧 AI 审校，并为已有正文建立章节版本。</p></div>
+          <button className="secondary-button" disabled={isRunning || aiBusy || backgroundBusy || backgroundActive} onClick={() => void rewindWritingFromChapter()}><RotateCcw size={16} />安全回退</button>
         </div>
       </section>}
 

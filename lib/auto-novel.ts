@@ -65,6 +65,73 @@ export function restartBlueprintDraft(
   };
 }
 
+export function rewindNovelFromChapter(
+  workspace: WorkspaceData,
+  chapterNumber: number,
+  runId: string,
+  now = new Date().toISOString(),
+): WorkspaceData {
+  const target = workspace.chapters.find((chapter) => chapter.number === chapterNumber);
+  if (!target) throw new Error(`没有找到第 ${chapterNumber} 章`);
+  if (!runId.trim()) throw new Error("重新写作需要新的运行编号");
+
+  const affected = workspace.chapters.filter((chapter) => chapter.number >= chapterNumber);
+  const affectedIds = new Set(affected.map((chapter) => chapter.id));
+  const previousRunId = workspace.automation.runId;
+  const snapshots = affected.flatMap((chapter) => chapter.content.trim() ? [{
+    id: `version-${runId}-${chapter.id}`,
+    chapterId: chapter.id,
+    title: chapter.title,
+    content: chapter.content,
+    createdAt: now,
+    note: `从第 ${chapterNumber} 章重写前自动存档`,
+  }] : []);
+
+  return {
+    ...workspace,
+    project: { ...workspace.project, status: "创作中" },
+    chapters: workspace.chapters.map((chapter) => chapter.number >= chapterNumber ? {
+      ...chapter,
+      content: "",
+      status: "待生成",
+      updatedAt: now,
+      revision: (chapter.revision || 0) + 1,
+      memory: undefined,
+      generation: undefined,
+    } : chapter),
+    issues: previousRunId
+      ? workspace.issues.filter((issue) => !issue.id.startsWith(`audit-${previousRunId}-`))
+      : workspace.issues,
+    versions: [...snapshots, ...workspace.versions],
+    canon: {
+      ...workspace.canon,
+      revision: workspace.canon.revision + 1,
+      chapterSummaries: workspace.canon.chapterSummaries.filter((item) => item.chapterNumber < chapterNumber),
+      timeline: workspace.canon.timeline.filter((item) => item.chapterNumber < chapterNumber),
+      characterStates: workspace.canon.characterStates.filter((item) => item.chapterNumber < chapterNumber),
+      facts: workspace.canon.facts.filter((item) => item.chapterNumber < chapterNumber),
+      threads: workspace.canon.threads
+        .filter((item) => item.openedChapter < chapterNumber)
+        .map((item) => item.resolvedChapter !== undefined && item.resolvedChapter >= chapterNumber ? {
+          ...item,
+          status: "open" as const,
+          resolvedChapter: undefined,
+        } : item),
+      lastAuditedChapter: Math.min(workspace.canon.lastAuditedChapter, Math.max(0, chapterNumber - 1)),
+    },
+    automation: {
+      ...workspace.automation,
+      runId,
+      phase: "paused",
+      currentChapterNumber: chapterNumber,
+      currentSegment: 0,
+      generatedChapterIds: workspace.automation.generatedChapterIds.filter((id) => !affectedIds.has(id)),
+      lastError: undefined,
+      updatedAt: now,
+    },
+  };
+}
+
 export function reserveModelRequest(
   usage: NovelAutomation["usage"],
   limits: Pick<NovelAutomation, "maxRequests" | "maxTokens">,
