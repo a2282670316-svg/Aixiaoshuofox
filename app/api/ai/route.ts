@@ -141,11 +141,11 @@ export async function POST(request: Request) {
       },
       body: JSON.stringify({
         model,
-        temperature,
         ...(mode === "responses" ? {
           instructions: "你是严谨、尊重作者意图的中文长篇小说创作助手。",
           input: prompt,
         } : {
+          temperature,
           messages: [
             { role: "system", content: "你是严谨、尊重作者意图的中文长篇小说创作助手。" },
             { role: "user", content: prompt },
@@ -158,6 +158,7 @@ export async function POST(request: Request) {
     let selectedMode = endpoint.mode;
     let upstream = await callUpstream(endpoint.url, selectedMode);
     if (upstream.status === 404 && endpoint.automatic) {
+      await upstream.body?.cancel();
       const responsesEndpoint = resolveAIEndpoint(body.baseUrl, {
         allowPrivateNetwork: ["localhost", "127.0.0.1", "::1", "terminal.local"].includes(new URL(request.url).hostname.toLowerCase()),
         mode: "responses",
