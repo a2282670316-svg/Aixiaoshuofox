@@ -1,108 +1,97 @@
-# vinext-starter
+# 万象小说工坊
 
-A clean full-stack starter running on
-[vinext](https://github.com/cloudflare/vinext), with optional Cloudflare D1 and
-Drizzle support.
+面向个人小说作者的 AI 长篇创作工作台。项目覆盖从灵感、设定、人物和大纲，到自动写作、一致性审校、云端检查点、版本历史和成稿导出的完整流程。
 
-## Prerequisites
+## 已实现功能
 
-- Node.js `>=22.13.0`
-- Linux with `flock`, `curl`, and GNU `timeout`
+- AI 全书创作：没有灵感时自动生成 3 个故事方向，并支持 AI 代选
+- 自动蓝图：一次建立作品信息、人物、世界观、关系、大纲、伏笔和章节目录
+- 连续写作：按章、按段生成全书，支持暂停、错误重试和刷新后续写
+- 长篇记忆：每章完成后提取梗概、时间线、人物状态、事实和待回收线索
+- 滚动审校：每 5 章及全书结尾自动审查人物、时间线、世界规则和伏笔
+- 成本保护：限制最大模型调用数和 Token，并显示实际消耗
+- 多作品管理：新建、切换、复制和删除作品
+- 双层持久化：浏览器即时保存，同时通过 D1 保存作品、运行状态、生成步骤和事实账本
+- 安全恢复：每段生成后写入检查点；新蓝图、导入和恢复前自动备份
+- 完整工作台：灵感、世界观、人物、关系图、大纲、章节、素材、一致性、版本和导出
+- 响应式界面：支持桌面、平板和手机布局
 
-## Sites Lifecycle
+## AI 配置
 
-The Sites lifecycle CLI runs the locked dependency install before returning this checkout. Edit the source under `app/`, then checkpoint when a coherent milestone is ready to inspect or share. The remote Sites builder runs `npm run build` against the pushed commit. Do not repeat install or build as a normal pre-checkpoint step.
+在“设置 → AI 模型”中填写：
 
-This starter does not use `wrangler.jsonc`.
+1. OpenAI Chat Completions 兼容接口地址，例如 `https://api.openai.com/v1` 或 `http://127.0.0.1:11434/v1`
+2. API Key
+3. 模型名称
+4. 创作温度
 
-`install:ci` is intentionally a single, non-retrying `npm ci`. It refuses a concurrent install for the same project, consumes a matching image-seeded npm cache with `--prefer-offline` while retaining registry fallback for a missing cache object, otherwise downloads and verifies the complete vinext tarball recorded in `package-lock.json`, limits npm to one socket, and terminates a stalled install. `build` applies a short timeout and then validates the Sites artifact. These helpers target Linux and use GNU `timeout`; they are not native macOS scripts.
+接口地址支持 HTTP 和 HTTPS，可选择“自动识别、Chat Completions、Responses API”。显式 `/responses` 地址会原样使用；自动模式在 Chat 端点返回 404 时会尝试 Responses。Responses 请求只发送合法的文本输入，不会把 `output_text` 当成输入类型。API Key 可留空，适合 Ollama 等无需鉴权的本地服务。AI 请求通过 `/api/ai` 转发，服务端默认不持久化 API Key 或生成内容。公网 HTTP 会以明文传输内容和密钥，建议公网模型使用 HTTPS；本机和内网接口只允许在本地运行本站时访问。
 
-Scripts that need writable project-scoped home, npm, XDG, and temporary paths use `scripts/sites-env.sh`. The `dev` and `start` scripts honor the caller's runtime environment and keep Wrangler logs inside the checkout. The generated `.sites-runtime/` directory is disposable and ignored by Git.
+“AI 全书”默认按约 2200 字一段连续生成。每段、每章记忆和滚动审校完成后都会写入检查点。使用浏览器中的 API Key 时，自动写作期间需要保持页面打开；暂停或意外刷新后，可以从已保存位置继续。
 
-## Included Shape
+## 本地运行
 
-- edit site code under `app/`
-- `app/chatgpt-auth.ts` provides optional dispatch-owned ChatGPT sign-in helpers
-- `.openai/hosting.json` declares optional Sites D1 and R2 bindings
-- `vite.config.ts` simulates declared bindings for local development
-- `db/index.ts` reads the D1 binding from the Cloudflare Worker environment
-- `db/schema.ts` starts intentionally empty
-- `examples/d1/` contains an optional D1 example surface
-- `drizzle.config.ts` supports local migration generation when needed
+需要 Node.js `22.13.0` 或更高版本。
 
-## Workspace Auth Headers
-
-OpenAI workspace sites can read the current user's email from
-`oai-authenticated-user-email`.
-
-SIWC-authenticated workspace sites may also receive
-`oai-authenticated-user-full-name` when the user's SIWC profile has a non-empty
-`name` claim. The full-name value is percent-encoded UTF-8 and is accompanied by
-`oai-authenticated-user-full-name-encoding: percent-encoded-utf-8`.
-
-Treat the full name as optional and fall back to email when it is absent:
-
-```tsx
-import { headers } from "next/headers";
-
-export default async function Home() {
-  const requestHeaders = await headers();
-  const email = requestHeaders.get("oai-authenticated-user-email");
-  const encodedFullName = requestHeaders.get("oai-authenticated-user-full-name");
-  const fullName =
-    encodedFullName &&
-    requestHeaders.get("oai-authenticated-user-full-name-encoding") ===
-      "percent-encoded-utf-8"
-      ? decodeURIComponent(encodedFullName)
-      : null;
-
-  const displayName = fullName ?? email;
-  // ...
-}
+```bash
+npm run install:ci
+npm run dev
 ```
 
-## Optional Dispatch-Owned ChatGPT Sign-In
+打开 `http://localhost:5173/`。
 
-Import the ready-to-use helpers from `app/chatgpt-auth.ts` when the site needs
-optional or required ChatGPT sign-in:
+生产验证：
 
-- Use `getChatGPTUser()` for optional signed-in UI.
-- Use `requireChatGPTUser(returnTo)` for server-rendered pages that should send
-  anonymous visitors through Sign in with ChatGPT.
-- Use `chatGPTSignInPath(returnTo)` and `chatGPTSignOutPath(returnTo)` for
-  browser links or actions.
-- Pass a same-origin relative `returnTo` path for the destination after sign-in
-  or sign-out. The helper validates and safely encodes it.
-- Mark protected pages with `export const dynamic = "force-dynamic"` because
-  they depend on per-request identity headers.
+```bash
+npm run lint
+npm exec -- tsc --noEmit
+npm test
+```
 
-Dispatch owns `/signin-with-chatgpt`, `/signout-with-chatgpt`, `/callback`, the
-OAuth cookies, and identity header injection. Do not implement app routes for
-those reserved paths. Routes that do not import and call the helper remain
-anonymous-compatible.
+数据库结构变更后生成迁移：
 
-SIWC establishes identity only; it does not prove workspace membership. Use the
-Sites hosting platform's access policy controls for workspace-wide restrictions,
-or enforce explicit server-side membership or allowlist checks.
+```bash
+npm run db:generate
+```
 
-Use SIWC for account pages, user-specific dashboards, saved records, and write
-actions tied to the current ChatGPT user. Leave public content anonymous.
+## 云端数据与认证
 
-## Diagnostic Commands
+Cloudflare Sites 配置在 `.openai/hosting.json`，D1 绑定名为 `DB`。数据表包括作品、自动化运行、生成步骤、事实账本和作品快照。
 
-- `npm run install:ci`: perform the one bounded lockfile install
-- `npm run dev`: start the Vite/Vinext development server
-- `npm run build`: build and validate the deployable Sites artifact
-- `npm run start`: start the built Vinext application
-- `npm test`: build, validate, and verify the rendered development-preview metadata
-- `npm run validate:artifact`: recheck an existing artifact's manifest and ESM `default.fetch` export
-- `npm run db:generate`: generate Drizzle migrations after schema changes
+- 本地开发仅允许来自 `localhost`、`127.0.0.1` 或 `::1` 的请求使用本地开发身份
+- 生产环境从 `oai-authenticated-user-email` 请求头取得登录用户，并按用户隔离作品
+- 写入接口执行同源校验和请求体大小限制
+- 浏览器 `localStorage` 仍作为断网和云端异常时的本地兜底
+- 建议定期从“设置 → 数据管理”导出 JSON 完整备份；备份不包含 API Key
 
-Use build and validation commands for targeted diagnosis after a remote failure, not as part of the normal checkpoint path.
+## 关闭网页后继续写作
 
-The timeout defaults can be overridden for a controlled canary with `SITES_INSTALL_TIMEOUT`, `SITES_INSTALL_KILL_AFTER`, `SITES_BUILD_TIMEOUT`, and `SITES_BUILD_KILL_AFTER`. A timeout fails the command; the helpers never retry an unchanged install or build.
+项目支持两种连续写作方式：
 
-## Learn More
+- 浏览器连续写作：可使用任意 HTTP/HTTPS Chat Completions 兼容接口，页面需保持打开
+- 云端后台写作：使用 OpenAI Responses API 后台模式与 Webhook 接力，关闭网页后仍会按“章节段落 → 章节记忆 → 滚动审校”的顺序继续
 
-- [vinext Documentation](https://github.com/cloudflare/vinext)
-- [Drizzle D1 Guide](https://orm.drizzle.team/docs/get-started/d1-new)
+云端后台模式需要在部署环境设置：
+
+```text
+OPENAI_API_KEY=服务端 OpenAI API Key
+OPENAI_MODEL=支持 Responses API 的模型名称
+OPENAI_WEBHOOK_SECRET=OpenAI Webhook 签名密钥
+```
+
+在 OpenAI 项目中创建 Webhook，订阅 `response.completed`，回调地址为：
+
+```text
+https://你的站点/api/openai/webhook
+```
+
+后台任务会在 D1 中保存模型响应编号、运行步骤、调用次数、Token、错误和幂等 Webhook 事件。重复回调不会重复写入正文；达到预算上限会停止提交新步骤；点击暂停会取消当前后台响应。
+
+## 技术结构
+
+- Next.js 16、React 19、TypeScript
+- Vinext 与 Cloudflare Worker 运行时
+- Cloudflare D1 与 Drizzle ORM
+- Sites 生产部署
+- OpenAI Chat Completions 兼容 AI 代理
+- OpenAI Responses API 后台模式与签名 Webhook
