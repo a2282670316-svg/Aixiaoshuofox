@@ -343,6 +343,7 @@ export default function AutoNovelStudio({
           stage: "chapters",
           targetChapters: settings.targetChapters,
           outlineStage: outline,
+          foreshadowStage: foreshadows,
         });
       } catch {
         draft = { seedId: seed.id, completedStage: 4, foundation, world, outline, foreshadows };
@@ -356,6 +357,7 @@ export default function AutoNovelStudio({
           stage: "chapters",
           targetChapters: settings.targetChapters,
           outlineStage: outline,
+          foreshadowStage: foreshadows,
         }),
       );
       await persistStage(5, "chapters", chapters);
@@ -506,12 +508,11 @@ export default function AutoNovelStudio({
           contextHash: `canon:${working.canon.revision}`,
         });
 
-        const shouldAudit = item.number % 5 === 0 || item.number === ordered[ordered.length - 1]?.number;
-        if (shouldAudit) {
+        {
           controllerRef.current = new AbortController();
           const auditIssues = await requestStructured(
             buildRollingAuditPrompt(working, item.number),
-            (value) => parseRollingAudit(value, runId),
+            (value) => parseRollingAudit(value, runId, item.number),
             controllerRef.current.signal,
           );
           if (stopRequested.current || runTokenRef.current !== runId) break;

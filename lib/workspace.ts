@@ -140,6 +140,25 @@ export function normalizeWorkspaceData(
     const outlineBeatId = typeof item.outlineBeatId === "string" && outlineIds.has(item.outlineBeatId)
       ? item.outlineBeatId
       : undefined;
+    const rawChapterOutline = record(item.chapterOutline);
+    const summaryFallback = stringValue(item.summary, "", 20_000);
+    const rawScenes = stringList(rawChapterOutline.scenes, 12);
+    const chapterOutline = {
+      objective: stringValue(rawChapterOutline.objective, summaryFallback || "推进本章核心冲突", 4000),
+      opening: stringValue(rawChapterOutline.opening, "承接上一章的未解问题进入场景", 4000),
+      scenes: rawScenes.length ? rawScenes : [summaryFallback || "人物在场景中行动、受阻并做出选择"],
+      turningPoint: stringValue(rawChapterOutline.turningPoint, "主角做出不可逆选择并付出代价", 4000),
+      endingHook: stringValue(rawChapterOutline.endingHook, "以新问题或危机引向下一章", 4000),
+      foreshadowActions: objects(rawChapterOutline.foreshadowActions, 20).flatMap((action) => {
+        const title = stringValue(action.title, "", 500).trim();
+        if (!title) return [];
+        return [{
+          title,
+          action: enumValue(action.action, ["plant", "advance", "resolve"] as const, "advance"),
+          instruction: stringValue(action.instruction, "", 4000),
+        }];
+      }),
+    };
     const rawMemory = record(item.memory);
     const memory: ChapterMemory | undefined = typeof rawMemory.summary === "string" ? {
       summary: stringValue(rawMemory.summary, "", 20_000),
@@ -151,6 +170,15 @@ export function normalizeWorkspaceData(
       openedThreads: stringList(rawMemory.openedThreads, 100),
       resolvedThreads: stringList(rawMemory.resolvedThreads, 100),
       establishedFacts: stringList(rawMemory.establishedFacts, 200),
+      foreshadowUpdates: objects(rawMemory.foreshadowUpdates, 100).flatMap((update) => {
+        const title = stringValue(update.title, "", 500).trim();
+        if (!title) return [];
+        return [{
+          title,
+          status: enumValue(update.status, ["planted", "advanced", "resolved"] as const, "advanced"),
+          evidence: stringValue(update.evidence, "", 4000),
+        }];
+      }),
     } : undefined;
     const rawGeneration = record(item.generation);
     const generation = typeof rawGeneration.runId === "string" ? {
@@ -170,6 +198,7 @@ export function normalizeWorkspaceData(
       outlineBeatId,
       pov: typeof item.pov === "string" ? item.pov.slice(0, 200) : undefined,
       targetWords: numberValue(item.targetWords, 4000, 100, 50_000),
+      chapterOutline,
       revision: numberValue(item.revision, 0, 0, 1_000_000),
       memory,
       generation,
@@ -208,6 +237,10 @@ export function normalizeWorkspaceData(
     description: stringValue(item.description, "", 20_000),
     location: stringValue(item.location, "未指定", 500),
     resolved: item.resolved === true,
+    chapterNumber: Number.isInteger(item.chapterNumber) ? numberValue(item.chapterNumber, 1, 1, 9999) : undefined,
+    evidence: typeof item.evidence === "string" ? item.evidence.slice(0, 10_000) : undefined,
+    suggestedFix: typeof item.suggestedFix === "string" ? item.suggestedFix.slice(0, 10_000) : undefined,
+    source: enumValue(item.source, ["local", "ai"] as const, "local"),
   }));
 
   const materialIds = new Set<string>();
@@ -218,6 +251,26 @@ export function normalizeWorkspaceData(
     content: stringValue(item.content, "", 50_000),
     tags: stringList(item.tags),
     createdAt: dateValue(item.createdAt),
+    foreshadowPlan: (() => {
+      const explicit = objects(item.foreshadowPlan, 30).flatMap((step) => {
+        if (!Number.isInteger(step.chapterNumber)) return [];
+        return [{
+          chapterNumber: numberValue(step.chapterNumber, 1, 1, 9999),
+          action: enumValue(step.action, ["plant", "advance", "resolve"] as const, "advance"),
+          instruction: stringValue(step.instruction, "", 4000),
+        }];
+      });
+      if (explicit.length) return explicit;
+      const tagged = stringList(item.tags, 30).flatMap((tag) => {
+        const match = tag.match(/^第\s*(\d+)\s*章$/);
+        return match ? [Number(match[1])] : [];
+      }).sort((a, b) => a - b);
+      return tagged.map((chapterNumber, stepIndex) => ({
+        chapterNumber,
+        action: stepIndex === 0 ? "plant" as const : stepIndex === tagged.length - 1 ? "resolve" as const : "advance" as const,
+        instruction: stepIndex === 0 ? "自然埋设伏笔" : stepIndex === tagged.length - 1 ? "回收伏笔并影响剧情" : "升级伏笔或制造误导",
+      }));
+    })(),
   }));
 
   const versionIds = new Set<string>();

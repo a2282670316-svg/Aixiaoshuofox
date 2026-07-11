@@ -72,6 +72,21 @@ export interface OutlineBeat {
   status: "待规划" | "进行中" | "已完成";
 }
 
+export type ForeshadowAction = "plant" | "advance" | "resolve";
+
+export interface ChapterOutline {
+  objective: string;
+  opening: string;
+  scenes: string[];
+  turningPoint: string;
+  endingHook: string;
+  foreshadowActions: Array<{
+    title: string;
+    action: ForeshadowAction;
+    instruction: string;
+  }>;
+}
+
 export interface Chapter {
   id: string;
   number: number;
@@ -83,6 +98,7 @@ export interface Chapter {
   outlineBeatId?: string;
   pov?: string;
   targetWords: number;
+  chapterOutline?: ChapterOutline;
   revision?: number;
   memory?: ChapterMemory;
   generation?: {
@@ -100,6 +116,11 @@ export interface ChapterMemory {
   openedThreads: string[];
   resolvedThreads: string[];
   establishedFacts: string[];
+  foreshadowUpdates?: Array<{
+    title: string;
+    status: "planted" | "advanced" | "resolved";
+    evidence: string;
+  }>;
 }
 
 export interface CanonLedger {
@@ -120,6 +141,10 @@ export interface ConsistencyIssue {
   description: string;
   location: string;
   resolved: boolean;
+  chapterNumber?: number;
+  evidence?: string;
+  suggestedFix?: string;
+  source?: "local" | "ai";
 }
 
 export interface Material {
@@ -129,6 +154,11 @@ export interface Material {
   content: string;
   tags: string[];
   createdAt: string;
+  foreshadowPlan?: Array<{
+    chapterNumber: number;
+    action: ForeshadowAction;
+    instruction: string;
+  }>;
 }
 
 export interface ChapterVersion {

@@ -101,8 +101,7 @@ export function estimateWritingRange(workspace: WorkspaceData): WritingRangeEsti
     return total + Math.max(0, segments - Math.min(segments, chapter.generation?.completedSegments || 0));
   }, 0);
   const auditRequests = chapters.filter((chapter) =>
-    (chapter.number % 5 === 0 || chapter.number === range.toChapter)
-    && (!workspace.automation.generatedChapterIds.includes(chapter.id) || workspace.canon.lastAuditedChapter < chapter.number)
+    !workspace.automation.generatedChapterIds.includes(chapter.id) || workspace.canon.lastAuditedChapter < chapter.number
   ).length;
   const minimumRequests = remainingSegments + pendingChapters.length + auditRequests;
   const missingPredecessorNumbers = ordered
@@ -411,6 +410,7 @@ type BlueprintStageOptions = {
   stage?: BlueprintStageName;
   targetChapters?: number;
   outlineStage?: BlueprintStagePayload;
+  foreshadowStage?: BlueprintStagePayload;
 };
 
 function isJsonRecord(value: unknown): value is JsonRecord {
@@ -511,27 +511,49 @@ function validateForeshadowStage(payload: JsonRecord, targetChapters?: number) {
     const title = text(item.title);
     if (titles.has(title)) throw new Error(`伏笔标题重复：${title}`);
     titles.add(title);
-    const tags = list(item.tags).map((tag) => text(tag)).filter(Boolean);
-    if (tags.length < 2) throw new Error(`${label}至少需要两个 tags`);
-    const chapters = chapterTags(tags);
-    if (chapters.length < 2) throw new Error(`${label}必须用章节标签注明埋设和回收位置`);
-    if (targetChapters && chapters.some((chapter) => chapter < 1 || chapter > targetChapters)) {
-      throw new Error(`${label}引用了目标范围外的章节`);
+    const plan = list(item.plan).filter(isJsonRecord);
+    if (plan.length >= 2) {
+      let previousChapter = 0;
+      for (const [stepIndex, step] of plan.entries()) {
+        if (!Number.isInteger(step.chapter)) throw new Error(`${label}第 ${stepIndex + 1} 个任务的 chapter 必须是整数`);
+        const chapter = Number(step.chapter);
+        if (chapter <= previousChapter) throw new Error(`${label}的 plan 必须按章节递增`);
+        if (targetChapters && (chapter < 1 || chapter > targetChapters)) throw new Error(`${label}引用了目标范围外的章节`);
+        if (!["plant", "advance", "resolve"].includes(text(step.action))) throw new Error(`${label}第 ${stepIndex + 1} 个任务的 action 无效`);
+        requiredStageText(step, "instruction", `${label}第 ${stepIndex + 1} 个任务`);
+        previousChapter = chapter;
+      }
+      if (text(plan[0].action) !== "plant") throw new Error(`${label}的第一个任务必须是 plant`);
+      if (text(plan.at(-1)?.action) !== "resolve") throw new Error(`${label}的最后一个任务必须是 resolve`);
+    } else {
+      const tags = list(item.tags).map((tag) => text(tag)).filter(Boolean);
+      const chapters = chapterTags(tags);
+      if (chapters.length < 2) throw new Error(`${label}必须提供 plan，或用章节标签注明埋设和回收位置`);
+      if (targetChapters && chapters.some((chapter) => chapter < 1 || chapter > targetChapters)) throw new Error(`${label}引用了目标范围外的章节`);
+      if (Math.min(...chapters) === Math.max(...chapters)) throw new Error(`${label}的埋设与回收章节不能相同`);
     }
-    if (Math.min(...chapters) === Math.max(...chapters)) throw new Error(`${label}的埋设与回收章节不能相同`);
   }
 }
 
-function validateChapterStage(payload: JsonRecord, targetChapters?: number, outlineStage?: BlueprintStagePayload) {
+function validateChapterStage(payload: JsonRecord, targetChapters?: number, outlineStage?: BlueprintStagePayload, foreshadowStage?: BlueprintStagePayload) {
   if (!targetChapters) throw new Error("章节校验缺少目标章节数");
   const chapters = stageObjects(payload, "chapters", targetChapters, targetChapters);
   const outline = list(outlineStage?.outline).filter(isJsonRecord);
   if (!outline.length) throw new Error("章节校验缺少大纲上下文");
+  const foreshadowTitles = new Set(list(foreshadowStage?.foreshadows).filter(isJsonRecord).map((item) => text(item.title)));
   const seenNumbers = new Set<number>();
   const usedOutlineIndexes = new Set<number>();
   for (const [index, chapter] of chapters.entries()) {
     const label = `第 ${index + 1} 条章节规划`;
-    for (const key of ["title", "summary", "pov"]) requiredStageText(chapter, key, label);
+    for (const key of ["title", "summary", "pov", "objective", "opening", "turningPoint", "endingHook"]) requiredStageText(chapter, key, label);
+    const scenes = list(chapter.scenes).map((scene) => text(scene)).filter(Boolean);
+    if (scenes.length < 3 || scenes.length > 8) throw new Error(`${label}的 scenes 必须为 3—8 个可执行场景`);
+    for (const action of list(chapter.foreshadowActions).filter(isJsonRecord)) {
+      const title = text(action.title);
+      if (!title || !foreshadowTitles.has(title)) throw new Error(`${label}引用了不存在的伏笔：${title || "未命名"}`);
+      if (!["plant", "advance", "resolve"].includes(text(action.action))) throw new Error(`${label}的伏笔 action 无效`);
+      requiredStageText(action, "instruction", `${label}的伏笔任务`);
+    }
     if (!Number.isInteger(chapter.number)) throw new Error(`${label}的 number 必须是整数`);
     const number = Number(chapter.number);
     if (number < 1 || number > targetChapters || seenNumbers.has(number)) throw new Error(`章节编号必须从 1 到 ${targetChapters} 且不能重复`);
@@ -569,7 +591,7 @@ export function parseBlueprintStage(
   if (options.stage === "world") validateWorldStage(payload);
   if (options.stage === "outline") validateOutlineStage(payload, options.targetChapters);
   if (options.stage === "foreshadows") validateForeshadowStage(payload, options.targetChapters);
-  if (options.stage === "chapters") validateChapterStage(payload, options.targetChapters, options.outlineStage);
+  if (options.stage === "chapters") validateChapterStage(payload, options.targetChapters, options.outlineStage, options.foreshadowStage);
   return payload;
 }
 
@@ -656,9 +678,9 @@ export function buildBlueprintForeshadowsPrompt(
   return `你是中文长篇小说伏笔编辑。现在只完成全书蓝图的第 4/5 步：伏笔。不要生成章节目录。
 
 只输出合法 JSON：
-{"foreshadows":[{"title":"伏笔名称","content":"如何埋设、误导、升级和回收","tags":["第1章","第8章","待回收"]}]}
+{"foreshadows":[{"title":"伏笔名称","content":"伏笔的真相、误导方式与回收效果","plan":[{"chapter":1,"action":"plant","instruction":"本章如何自然埋设"},{"chapter":5,"action":"advance","instruction":"如何升级或制造误导"},{"chapter":12,"action":"resolve","instruction":"如何揭示并影响决战"}]}]}
 
-要求：生成 4—12 条伏笔；每条注明具体埋设和回收范围；至少覆盖人物秘密、世界规则与核心谜题；结局前回收主要伏笔。
+要求：生成 4—12 条伏笔；每条 plan 至少包含 plant 和 resolve，可包含多个 advance；章节必须递增且不超出 1—${settings.targetChapters}；至少覆盖人物秘密、世界规则与核心谜题；结局前回收主要伏笔。
 
 【故事方向】${JSON.stringify(seedContext(seed))}
 【人物】${JSON.stringify(list(foundation.characters))}
@@ -681,14 +703,16 @@ export function buildBlueprintChaptersPrompt(
   return `你是中文长篇小说章节规划师。现在只完成全书蓝图的第 5/5 步：章节。不要重复输出人物、设定、大纲或伏笔。
 
 只输出合法 JSON：
-{"chapters":[{"number":1,"title":"章名","summary":"本章发生的事件、人物选择、代价、转折和结尾钩子","pov":"视角人物","outlineIndex":0}]}
+{"chapters":[{"number":1,"title":"章名","summary":"本章因果摘要","pov":"视角人物","outlineIndex":0,"objective":"本章必须完成的剧情目标","opening":"开场场景与即时张力","scenes":["场景1：地点、行动、冲突与结果","场景2：…","场景3：…"],"turningPoint":"不可逆转折或代价","endingHook":"下一章必须回应的问题","foreshadowActions":[{"title":"必须与伏笔表同名","action":"plant|advance|resolve","instruction":"本章的具体执行方式"}]}]}
 
 硬性要求：
 1. chapters 必须恰好 ${settings.targetChapters} 条，number 从 1 到 ${settings.targetChapters} 连续递增。
 2. 每章目标约 ${settings.chapterWords} 字；summary 必须具体，不能写“承上启下”。
 3. outlineIndex 从 0 开始，必须对应提供的大纲节点。
 4. 相邻章节形成清晰因果；每章都产生新信息、选择或不可逆代价。
-5. 最后一章完成核心冲突、人物弧光并回收主要伏笔。
+5. 每章必须提供 objective、opening、3—8 个 scenes、turningPoint 和 endingHook，形成可直接写作的章纲。
+6. 伏笔表中每个 plan 任务必须出现在对应章的 foreshadowActions 中，不得遗漏或擅自改名。
+7. 最后一章完成核心冲突、人物弧光并回收主要伏笔。
 
 【故事方向】${JSON.stringify(seedContext(seed))}
 【作品】${JSON.stringify(record(stages.foundation.project))}
@@ -794,6 +818,22 @@ export function parseNovelBlueprint(
       outlineBeatId: outline[outlineIndex]?.id,
       pov: text(source.pov, characters[0]?.name || project.pointOfView),
       targetWords: clamp(settings.chapterWords, 1200, 12000),
+      chapterOutline: {
+        objective: text(source.objective, text(source.summary, "完成本章核心剧情目标")),
+        opening: text(source.opening, "从相邻章节的未解冲突自然切入"),
+        scenes: list(source.scenes).map((scene) => text(scene)).filter(Boolean).slice(0, 8),
+        turningPoint: text(source.turningPoint, "人物做出不可逆选择并付出代价"),
+        endingHook: text(source.endingHook, "以新问题或危机引向下一章"),
+        foreshadowActions: list(source.foreshadowActions).filter(isJsonRecord).flatMap((action) => {
+          const title = text(action.title);
+          if (!title) return [];
+          return [{
+            title,
+            action: ["plant", "advance", "resolve"].includes(text(action.action)) ? text(action.action) as "plant" | "advance" | "resolve" : "advance",
+            instruction: text(action.instruction, "按伏笔计划在本章自然执行"),
+          }];
+        }),
+      },
     };
   });
 
@@ -822,6 +862,23 @@ export function parseNovelBlueprint(
       content: text(source.content, "在前段埋设，并在结局前完成回收。"),
       tags: list(source.tags).map((tag) => text(tag)).filter(Boolean).slice(0, 8),
       createdAt: now,
+      foreshadowPlan: (() => {
+        const explicit = list(source.plan).filter(isJsonRecord).flatMap((step) => {
+          if (!Number.isInteger(step.chapter)) return [];
+          return [{
+            chapterNumber: clamp(Number(step.chapter), 1, targetChapters),
+            action: ["plant", "advance", "resolve"].includes(text(step.action)) ? text(step.action) as "plant" | "advance" | "resolve" : "advance",
+            instruction: text(step.instruction, "按计划执行伏笔任务"),
+          }];
+        });
+        if (explicit.length) return explicit;
+        const tagged = chapterTags(source.tags).sort((a, b) => a - b);
+        return tagged.map((chapterNumber, stepIndex) => ({
+          chapterNumber,
+          action: stepIndex === 0 ? "plant" as const : stepIndex === tagged.length - 1 ? "resolve" as const : "advance" as const,
+          instruction: stepIndex === 0 ? "自然埋设伏笔" : stepIndex === tagged.length - 1 ? "回收伏笔并影响剧情" : "升级伏笔或制造误导",
+        }));
+      })(),
     };
   });
 
@@ -855,6 +912,59 @@ export function parseNovelBlueprint(
   };
 }
 
+export function canonBeforeChapter(workspace: WorkspaceData, chapterNumber: number): CanonLedger {
+  return {
+    ...workspace.canon,
+    chapterSummaries: workspace.canon.chapterSummaries.filter((item) => item.chapterNumber < chapterNumber),
+    timeline: workspace.canon.timeline.filter((item) => item.chapterNumber < chapterNumber),
+    characterStates: workspace.canon.characterStates.filter((item) => item.chapterNumber < chapterNumber),
+    facts: workspace.canon.facts.filter((item) => item.chapterNumber < chapterNumber),
+    threads: workspace.canon.threads
+      .filter((item) => item.openedChapter < chapterNumber)
+      .map((item) => item.resolvedChapter !== undefined && item.resolvedChapter >= chapterNumber ? {
+        ...item,
+        status: "open" as const,
+        resolvedChapter: undefined,
+      } : item),
+    lastAuditedChapter: Math.min(workspace.canon.lastAuditedChapter, Math.max(0, chapterNumber - 1)),
+  };
+}
+
+export function foreshadowTasksForChapter(workspace: WorkspaceData, chapterNumber: number) {
+  const fromMaterials = workspace.materials
+    .filter((material) => material.type === "伏笔")
+    .flatMap((material) => (material.foreshadowPlan || [])
+      .filter((step) => step.chapterNumber === chapterNumber)
+      .map((step) => ({ title: material.title, content: material.content, action: step.action, instruction: step.instruction })));
+  const chapter = workspace.chapters.find((item) => item.number === chapterNumber);
+  const known = new Set(fromMaterials.map((item) => `${item.title} ${item.action}`));
+  const fromOutline = (chapter?.chapterOutline?.foreshadowActions || []).flatMap((action) => {
+    const key = `${action.title} ${action.action}`;
+    if (known.has(key)) return [];
+    const material = workspace.materials.find((item) => item.type === "伏笔" && item.title === action.title);
+    return [{ title: action.title, content: material?.content || "", action: action.action, instruction: action.instruction }];
+  });
+  return [...fromMaterials, ...fromOutline];
+}
+
+export function removeChapterFromCanon(workspace: WorkspaceData, chapterNumber: number): WorkspaceData {
+  return {
+    ...workspace,
+    canon: {
+      ...workspace.canon,
+      revision: workspace.canon.revision + 1,
+      chapterSummaries: workspace.canon.chapterSummaries.filter((item) => item.chapterNumber !== chapterNumber),
+      timeline: workspace.canon.timeline.filter((item) => item.chapterNumber !== chapterNumber),
+      characterStates: workspace.canon.characterStates.filter((item) => item.chapterNumber !== chapterNumber),
+      facts: workspace.canon.facts.filter((item) => item.chapterNumber !== chapterNumber),
+      threads: workspace.canon.threads
+        .filter((item) => item.openedChapter !== chapterNumber)
+        .map((item) => item.resolvedChapter === chapterNumber ? { ...item, status: "open" as const, resolvedChapter: undefined } : item),
+      lastAuditedChapter: Math.min(workspace.canon.lastAuditedChapter, Math.max(0, chapterNumber - 1)),
+    },
+  };
+}
+
 export function buildAutomatedChapterPrompt(
   workspace: WorkspaceData,
   target: Chapter,
@@ -881,6 +991,8 @@ export function buildAutomatedChapterPrompt(
       description: relation.description,
     })),
     outlineBeat,
+    chapterOutline: target.chapterOutline,
+    foreshadowTasks: foreshadowTasksForChapter(workspace, target.number),
     currentChapter: {
       number: target.number,
       title: target.title,
@@ -901,9 +1013,8 @@ export function buildAutomatedChapterPrompt(
       title: next.title,
       summary: next.summary,
     } : null,
-    foreshadows: workspace.materials.filter((item) => item.type === "伏笔"),
-    unresolvedIssues: workspace.issues.filter((item) => !item.resolved),
-    canon: workspace.canon,
+    unresolvedIssues: workspace.issues.filter((item) => !item.resolved && (!item.chapterNumber || item.chapterNumber <= target.number)),
+    canon: canonBeforeChapter(workspace, target.number),
   };
 
   return `你是正在连续创作同一部长篇小说的中文作家。请完成第 ${target.number} 章《${target.title}》正文的第 ${segment.index + 1}/${segment.total} 段。
@@ -911,12 +1022,13 @@ export function buildAutomatedChapterPrompt(
 硬性要求：
 1. 本次目标约 ${segmentTarget} 个中文字符，允许上下浮动 20%；完整章节目标约 ${target.targetWords} 字。
 2. 严格使用“${target.pov || workspace.project.pointOfView}”视角，延续前文事实、时态、语气与人物动机。
-3. 必须落实本章梗概中的事件、选择、代价与转折，不能用总结代替场景。
+3. 必须逐项落实 chapterOutline 的 objective、scenes、turningPoint 和 endingHook，不能用总结代替场景。
 4. ${isFirstSegment ? "这是本章第一段：自然承接上一章并迅速进入场景。" : "这是本章续写段：必须紧接 existingDraftEnding，不得重写或概述已经写过的内容。"}
 5. ${isLastSegment ? "这是本章最后一段：完成本章转折，并形成下一章需要回应的钩子。" : "这不是本章最后一段：推进冲突，但不要提前完成本章转折或写章节收束。"}
 6. 不得擅自改名，不得推翻世界规则，不得把尚未发生的后续梗概提前写成既定事实。
 7. ${isFinal && isLastSegment ? "这是全书最后一章的最后一段：必须解决核心冲突、完成人物弧光、回收主要伏笔，并给出有余韵但明确的结局。" : "不要提前结束全书。"}
-8. 只输出本段新增小说正文，不要重复已有正文，不要标题、提纲、创作说明或 Markdown。
+8. foreshadowTasks 中的 plant/advance/resolve 任务必须在本章以可被读者感知、但不生硬说明的方式执行。
+9. 只输出本段新增小说正文，不要重复已有正文，不要标题、提纲、创作说明或 Markdown。
 
 【全书与相邻章节上下文】
 ${JSON.stringify(compactContext, null, 2)}`;
@@ -932,7 +1044,8 @@ export function buildChapterMemoryPrompt(workspace: WorkspaceData, chapter: Chap
   "characterUpdates": [{"name":"人物姓名","state":"本章结束时的位置、身体、情绪、已知信息、目标或关系变化"}],
   "openedThreads": ["本章新出现且尚未解决的线索或承诺"],
   "resolvedThreads": ["本章明确解决或回收的线索"],
-  "establishedFacts": ["后文不可随意推翻的明确事实"]
+  "establishedFacts": ["后文不可随意推翻的明确事实"],
+  "foreshadowUpdates": [{"title":"伏笔名称","status":"planted|advanced|resolved","evidence":"正文中的执行证据"}]
 }
 
 要求：只记录正文能够支持的内容；不要推测未来；人物姓名必须沿用现有人物档案；每个数组最多 20 条。
@@ -943,8 +1056,11 @@ ${JSON.stringify(workspace.project)}
 【人物档案】
 ${JSON.stringify(workspace.characters.map((item) => ({ name: item.name, identity: item.identity, goal: item.goal, conflict: item.conflict })))}
 
-【已有事实账本】
-${JSON.stringify(workspace.canon)}
+【本章之前的事实账本】
+${JSON.stringify(canonBeforeChapter(workspace, chapter.number))}
+
+【本章应执行的伏笔任务】
+${JSON.stringify(foreshadowTasksForChapter(workspace, chapter.number))}
 
 【第 ${chapter.number} 章《${chapter.title}》正文】
 ${chapter.content.slice(-30_000)}`;
@@ -965,6 +1081,15 @@ export function parseChapterMemory(value: string): ChapterMemory {
     openedThreads: list(payload.openedThreads).map((item) => text(item)).filter(Boolean).slice(0, 20),
     resolvedThreads: list(payload.resolvedThreads).map((item) => text(item)).filter(Boolean).slice(0, 20),
     establishedFacts: list(payload.establishedFacts).map((item) => text(item)).filter(Boolean).slice(0, 30),
+    foreshadowUpdates: list(payload.foreshadowUpdates).filter(isJsonRecord).flatMap((item) => {
+      const title = text(item.title);
+      if (!title) return [];
+      return [{
+        title,
+        status: ["planted", "advanced", "resolved"].includes(text(item.status)) ? text(item.status) as "planted" | "advanced" | "resolved" : "advanced",
+        evidence: text(item.evidence),
+      }];
+    }).slice(0, 30),
   };
 }
 
@@ -980,20 +1105,22 @@ export function applyChapterMemory(
   const characterIds = new Map(workspace.characters.map((item) => [item.name, item.id]));
   const previousSummaries = workspace.canon.chapterSummaries.filter((item) => item.chapterId !== chapterId);
   const updatedNames = new Set(memory.characterUpdates.map((item) => item.name));
-  const previousCharacterStates = workspace.canon.characterStates.filter((item) => !updatedNames.has(item.name));
-  const resolvedTitles = new Set(memory.resolvedThreads);
+  const previousCharacterStates = workspace.canon.characterStates.filter((item) => !(item.chapterNumber === chapterNumber && updatedNames.has(item.name)));
+  const foreshadowUpdates = memory.foreshadowUpdates || [];
+  const resolvedTitles = new Set([...memory.resolvedThreads, ...foreshadowUpdates.filter((item) => item.status === "resolved").map((item) => item.title)]);
   const updatedThreads = workspace.canon.threads.map((item) => resolvedTitles.has(item.title) ? {
     ...item,
     status: "resolved" as const,
     resolvedChapter: chapterNumber,
   } : item);
   const knownThreadTitles = new Set(updatedThreads.map((item) => item.title));
+  const openedThreadTitles = [...memory.openedThreads, ...foreshadowUpdates.filter((item) => item.status !== "resolved").map((item) => item.title)];
   const canon: CanonLedger = {
     ...workspace.canon,
     revision: nextRevision,
     chapterSummaries: [...previousSummaries, { chapterId, chapterNumber, summary: memory.summary }]
       .sort((a, b) => a.chapterNumber - b.chapterNumber),
-    timeline: [...workspace.canon.timeline, ...memory.timelineEvents.map((event, index) => ({
+    timeline: [...workspace.canon.timeline.filter((item) => item.chapterNumber !== chapterNumber), ...memory.timelineEvents.map((event, index) => ({
       id: `timeline-${nextRevision}-${chapterNumber}-${index + 1}`,
       chapterNumber,
       event,
@@ -1004,13 +1131,13 @@ export function applyChapterMemory(
       state: item.state,
       chapterNumber,
     }))],
-    threads: [...updatedThreads, ...memory.openedThreads.filter((title) => !knownThreadTitles.has(title)).map((title, index) => ({
+    threads: [...updatedThreads, ...openedThreadTitles.filter((title) => !knownThreadTitles.has(title)).map((title, index) => ({
       id: `thread-${nextRevision}-${chapterNumber}-${index + 1}`,
       title,
       status: "open" as const,
       openedChapter: chapterNumber,
     }))],
-    facts: [...workspace.canon.facts, ...memory.establishedFacts.map((fact, index) => ({
+    facts: [...workspace.canon.facts.filter((item) => item.chapterNumber !== chapterNumber), ...memory.establishedFacts.map((fact, index) => ({
       id: `fact-${nextRevision}-${chapterNumber}-${index + 1}`,
       chapterNumber,
       fact,
@@ -1029,37 +1156,94 @@ export function applyChapterMemory(
 }
 
 export function buildRollingAuditPrompt(workspace: WorkspaceData, throughChapter: number) {
-  return `你是长篇小说连续性审校编辑。请依据事实账本和已经完成的章节摘要，找出有文本证据支持的冲突或遗漏。
+  const chapter = workspace.chapters.find((item) => item.number === throughChapter);
+  if (!chapter) throw new Error(`找不到第 ${throughChapter} 章，无法进行一致性审校`);
+  const previousChapter = [...workspace.chapters].sort((a, b) => a.number - b.number).find((item) => item.number === throughChapter - 1);
+  return `你是长篇小说的逐章一致性审校编辑。只检查第 ${throughChapter} 章，并将它与本章之前已确定的事实、章纲和伏笔任务对比。
 
 只输出合法 JSON：
-{"issues":[{"severity":"错误|警告|提示","category":"时间线|人物|世界规则|情节|文风","title":"问题标题","description":"证据与修复建议","location":"章节位置"}]}
+{"issues":[{"severity":"错误|警告|提示","category":"时间线|人物|世界规则|情节|文风","title":"问题标题","description":"问题的影响","chapterNumber":${throughChapter},"evidence":"正文中的具体证据","suggestedFix":"不改变其他剧情的最小修复方案","location":"第${throughChapter}章的具体场景"}]}
 
-要求：最多 12 项；不要把有意伏笔误判为错误；不要虚构正文中不存在的问题；若没有问题返回 {"issues":[]}。
+必须检查：
+1. 人物的位置、知情范围、伤势、目标和关系是否与前文一致。
+2. 时间、地点、物件、世界规则和因果链是否冲突。
+3. chapterOutline 的 objective、scenes、turningPoint 和 endingHook 是否真正完成。
+4. foreshadowTasks 是否在正文中被执行，不得把尚未到回收章的伏笔判为遗漏。
+5. 只报告有明确文本证据的问题；没有问题返回 {"issues":[]}；最多 8 项。
 
-【作品设定】
-${JSON.stringify(workspace.project)}
+【作品与规则】
+${JSON.stringify({ project: workspace.project, world: workspace.world, characters: workspace.characters, relationships: workspace.relationships })}
 
-【事实账本】
-${JSON.stringify(workspace.canon)}
+【第 ${throughChapter} 章之前的事实账本】
+${JSON.stringify(canonBeforeChapter(workspace, throughChapter))}
 
-【已完成章节摘要（截至第 ${throughChapter} 章）】
-${JSON.stringify(workspace.canon.chapterSummaries.filter((item) => item.chapterNumber <= throughChapter))}`;
+【上一章结尾】
+${previousChapter?.content.slice(-6000) || "无"}
+
+【本章章纲】
+${JSON.stringify(chapter.chapterOutline || { summary: chapter.summary })}
+
+【本章伏笔任务】
+${JSON.stringify(foreshadowTasksForChapter(workspace, throughChapter))}
+
+【第 ${throughChapter} 章正文】
+${chapter.content.slice(-40_000)}`;
 }
 
-export function parseRollingAudit(value: string, runId: string): ConsistencyIssue[] {
+export function parseRollingAudit(value: string, runId: string, defaultChapterNumber?: number): ConsistencyIssue[] {
   const payload = parseJson(value);
   return list(payload.issues).map((item) => record(item)).flatMap((item, index) => {
     const title = text(item.title);
     const description = text(item.description);
     if (!title || !description) return [];
+    const chapterNumber = Number.isInteger(item.chapterNumber) ? Number(item.chapterNumber) : defaultChapterNumber;
     return [{
       id: `audit-${runId}-${Date.now()}-${index + 1}`,
       severity: ["错误", "警告", "提示"].includes(String(item.severity)) ? item.severity as ConsistencyIssue["severity"] : "提示",
       category: ["时间线", "人物", "世界规则", "情节", "文风"].includes(String(item.category)) ? item.category as ConsistencyIssue["category"] : "情节",
       title,
       description,
-      location: text(item.location, "全书"),
+      location: text(item.location, chapterNumber ? `第 ${chapterNumber} 章` : "全书"),
       resolved: false,
+      chapterNumber,
+      evidence: text(item.evidence),
+      suggestedFix: text(item.suggestedFix),
+      source: "ai" as const,
     }];
-  }).slice(0, 12);
+  }).slice(0, 8);
+}
+
+export function buildConsistencyRepairPrompt(workspace: WorkspaceData, issue: ConsistencyIssue, chapter: Chapter) {
+  return `你是长篇小说修订编辑。请对第 ${chapter.number} 章做最小必要修订，解决指定一致性问题，不得改写无关剧情、文风、人物声音或章末钩子。
+
+只输出合法 JSON：
+{"revisedContent":"修订后的完整章节正文","changeSummary":"修改了什么以及为什么"}
+
+修订规则：
+1. 必须保留完整章节，不能只输出差异片段。
+2. 只修复指定问题，不擅自增加新设定或提前泄露后续剧情。
+3. 继续完成本章章纲和伏笔任务。
+4. revisedContent 不要包含 Markdown 代码块或修订说明。
+
+【待修复问题】
+${JSON.stringify(issue)}
+
+【本章之前的事实】
+${JSON.stringify(canonBeforeChapter(workspace, chapter.number))}
+
+【本章章纲】
+${JSON.stringify(chapter.chapterOutline || { summary: chapter.summary })}
+
+【本章伏笔任务】
+${JSON.stringify(foreshadowTasksForChapter(workspace, chapter.number))}
+
+【原始正文】
+${chapter.content.slice(-80_000)}`;
+}
+
+export function parseConsistencyRepair(value: string) {
+  const payload = parseJson(value);
+  const revisedContent = text(payload.revisedContent);
+  if (revisedContent.replace(/\s+/g, "").length < 300) throw new Error("AI 修订结果过短，已拒绝覆盖原章节");
+  return { revisedContent, changeSummary: text(payload.changeSummary, "已按一致性问题完成最小修订") };
 }

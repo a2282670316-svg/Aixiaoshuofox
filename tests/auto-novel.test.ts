@@ -4,14 +4,18 @@ import {
   buildAutomatedChapterPrompt,
   buildBlueprintChaptersPrompt,
   applyChapterMemory,
+  canonBeforeChapter,
+  foreshadowTasksForChapter,
   createAutomationState,
   estimateWritingRange,
   parseChapterMemory,
   parseBlueprintStage,
   parseNovelBlueprint,
+  parseConsistencyRepair,
   parseRollingAudit,
   parseSeedOptions,
   reserveModelRequest,
+  removeChapterFromCanon,
   restartBlueprintDraft,
   rewindNovelFromChapter,
 } from "../lib/auto-novel";
@@ -94,8 +98,29 @@ function blueprintJson(chapterCount = 4) {
       { act: "第三幕", title: "记忆", summary: "归来者恢复片段并揭示沉船关联", chapterStart: 3, chapterEnd: 3 },
       { act: "终幕", title: "真相", summary: "公开证据、解决冲突并完成人物弧光", chapterStart: 4, chapterEnd: chapterCount },
     ],
-    chapters: Array.from({ length: chapterCount }, (_, index) => ({ number: index + 1, title: `潮声 ${index + 1}`, summary: `第 ${index + 1} 章发生具体选择、不可逆代价与结尾转折`, pov: "林岚", outlineIndex: Math.min(index, 3) })),
-    foreshadows: ["停摆的表", "删改档案", "缺失录音", "旧船票"].map((title, index) => ({ title, content: `第1章埋设线索 ${index + 1}，终章揭示来源并完成回收`, tags: ["第1章", `第${chapterCount}章`, "待回收"] })),
+    chapters: Array.from({ length: chapterCount }, (_, index) => ({
+      number: index + 1,
+      title: `潮声 ${index + 1}`,
+      summary: `第 ${index + 1} 章发生具体选择、不可逆代价与结尾转折`,
+      pov: "林岚",
+      outlineIndex: Math.min(index, 3),
+      objective: `完成第 ${index + 1} 章的核心调查目标`,
+      opening: "从上一章留下的危机切入",
+      scenes: ["林岚获得线索", "调查受到阻挠", "做出不可逆选择"],
+      turningPoint: "新证据迫使林岚改变计划",
+      endingHook: "一条更危险的线索出现",
+      foreshadowActions: ["停摆的表", "删改档案", "缺失录音", "旧船票"].flatMap((title) => index === 0
+        ? [{ title, action: "plant", instruction: "在调查现场自然埋设" }]
+        : index === chapterCount - 1 ? [{ title, action: "resolve", instruction: "揭示真相并影响结局" }] : []),
+    })),
+    foreshadows: ["停摆的表", "删改档案", "缺失录音", "旧船票"].map((title, index) => ({
+      title,
+      content: `第1章埋设线索 ${index + 1}，终章揭示来源并完成回收`,
+      plan: [
+        { chapter: 1, action: "plant", instruction: "在调查现场自然埋设" },
+        { chapter: chapterCount, action: "resolve", instruction: "在结局揭示并回收" },
+      ],
+    })),
   });
 }
 
@@ -119,7 +144,7 @@ test("assembles five independently validated blueprint stages", () => {
   const world = parseBlueprintStage(JSON.stringify({ world: complete.world }), { stage: "world" });
   const outline = parseBlueprintStage(JSON.stringify({ outline: complete.outline }), { stage: "outline", targetChapters: settings.targetChapters });
   const foreshadows = parseBlueprintStage(JSON.stringify({ foreshadows: complete.foreshadows }), { stage: "foreshadows", targetChapters: settings.targetChapters });
-  const chapters = parseBlueprintStage(JSON.stringify({ chapters: complete.chapters }), { stage: "chapters", targetChapters: settings.targetChapters, outlineStage: outline });
+  const chapters = parseBlueprintStage(JSON.stringify({ chapters: complete.chapters }), { stage: "chapters", targetChapters: settings.targetChapters, outlineStage: outline, foreshadowStage: foreshadows });
   const assembled = parseNovelBlueprint(JSON.stringify({ ...foundation, ...world, ...outline, ...foreshadows, ...chapters }), seed, settings);
   const chapterPrompt = buildBlueprintChaptersPrompt(seed, settings, { foundation, world, outline, foreshadows });
 
@@ -150,7 +175,7 @@ test("rejects malformed staged blueprint business rules", () => {
   const duplicateChapters = structuredClone(complete.chapters) as Array<Record<string, unknown>>;
   duplicateChapters[1].number = 1;
   assert.throws(
-    () => parseBlueprintStage(JSON.stringify({ chapters: duplicateChapters }), { stage: "chapters", targetChapters: 4, outlineStage: outline }),
+    () => parseBlueprintStage(JSON.stringify({ chapters: duplicateChapters }), { stage: "chapters", targetChapters: 4, outlineStage: outline, foreshadowStage: { foreshadows: complete.foreshadows } }),
     /不能重复/,
   );
   assert.throws(
@@ -219,6 +244,7 @@ test("chapter prompts use committed history but never future chapter prose", () 
   });
 
   assert.match(prompt, /已经提交的上一章正文/);
+  assert.match(prompt, /完成第 2 章的核心调查目标/);
   assert.doesNotMatch(prompt, /不应泄露的未来章节正文/);
 });
 
@@ -408,7 +434,7 @@ test("estimates a persisted chapter writing range and its minimum request budget
   assert.equal(estimate.chapters.length, 2);
   assert.equal(estimate.pendingChapters.length, 2);
   assert.equal(estimate.remainingSegments, 4);
-  assert.equal(estimate.minimumRequests, 7);
+  assert.equal(estimate.minimumRequests, 8);
   assert.equal(estimate.remainingRequestBudget, 25);
   assert.deepEqual(estimate.errors, []);
 });
@@ -456,4 +482,84 @@ test("preserves an active background writing phase only when explicitly requeste
 
   assert.equal(normalizeWorkspaceData(source, DEMO_WORKSPACE).automation.phase, "paused");
   assert.equal(normalizeWorkspaceData(source, DEMO_WORKSPACE, { preserveWritingPhase: true }).automation.phase, "writing");
+});
+
+
+test("filters future canon and exposes only the current chapter foreshadow tasks", () => {
+  const settings = createAutomationState({ targetChapters: 4, targetWords: 16000, chapterWords: 4000 });
+  const parsed = parseNovelBlueprint(blueprintJson(), seed, settings);
+  const workspace: WorkspaceData = {
+    ...parsed,
+    automation: settings,
+    canon: {
+      ...parsed.canon,
+      facts: [
+        { id: "fact-1", chapterNumber: 1, fact: "第一章已确认事实" },
+        { id: "fact-4", chapterNumber: 4, fact: "第四章未来真相" },
+      ],
+    },
+  };
+
+  const prior = canonBeforeChapter(workspace, 2);
+  assert.deepEqual(prior.facts.map((item) => item.fact), ["第一章已确认事实"]);
+  assert.deepEqual(foreshadowTasksForChapter(workspace, 1).map((item) => item.action), ["plant", "plant", "plant", "plant"]);
+  assert.equal(foreshadowTasksForChapter(workspace, 2).length, 0);
+});
+
+test("tracks planted and resolved foreshadows in chapter memory", () => {
+  const settings = createAutomationState({ targetChapters: 4, targetWords: 16000, chapterWords: 4000 });
+  const parsed = parseNovelBlueprint(blueprintJson(), seed, settings);
+  const workspace: WorkspaceData = { ...parsed, automation: settings };
+  const planted = parseChapterMemory(JSON.stringify({
+    summary: "第一章埋下停摆的表。",
+    timelineEvents: [], characterUpdates: [], openedThreads: [], resolvedThreads: [], establishedFacts: [],
+    foreshadowUpdates: [{ title: "停摆的表", status: "planted", evidence: "林岚在码头发现停摆手表" }],
+  }));
+  const afterPlant = applyChapterMemory(workspace, workspace.chapters[0].id, planted);
+  assert.equal(afterPlant.canon.threads.find((item) => item.title === "停摆的表")?.status, "open");
+
+  const resolved = parseChapterMemory(JSON.stringify({
+    summary: "终章揭示手表来源。",
+    timelineEvents: [], characterUpdates: [], openedThreads: [], resolvedThreads: [], establishedFacts: [],
+    foreshadowUpdates: [{ title: "停摆的表", status: "resolved", evidence: "旧船日志证明手表来源" }],
+  }));
+  const afterResolve = applyChapterMemory(afterPlant, afterPlant.chapters[3].id, resolved);
+  const thread = afterResolve.canon.threads.find((item) => item.title === "停摆的表");
+  assert.equal(thread?.status, "resolved");
+  assert.equal(thread?.resolvedChapter, 4);
+  assert.equal(afterResolve.chapters[3].memory?.foreshadowUpdates?.[0].evidence, "旧船日志证明手表来源");
+});
+
+test("parses structured chapter audit evidence and a full AI repair", () => {
+  const issues = parseRollingAudit(JSON.stringify({ issues: [{
+    severity: "错误", category: "人物", title: "知情范围冲突", description: "角色提前知道未来信息",
+    chapterNumber: 2, evidence: "角色直接说出尚未发现的档案编号", suggestedFix: "改成猜测而不是确认", location: "第2章中段",
+  }] }), "run-structured", 2);
+  assert.equal(issues[0].chapterNumber, 2);
+  assert.equal(issues[0].source, "ai");
+  assert.match(issues[0].evidence || "", /档案编号/);
+
+  const repair = parseConsistencyRepair(JSON.stringify({ revisedContent: "修".repeat(400), changeSummary: "收窄角色知情范围" }));
+  assert.equal(repair.changeSummary, "收窄角色知情范围");
+  assert.throws(() => parseConsistencyRepair(JSON.stringify({ revisedContent: "太短", changeSummary: "无" })), /过短/);
+});
+
+test("removes one chapter from canon before rebuilding it", () => {
+  const workspace: WorkspaceData = {
+    ...DEMO_WORKSPACE,
+    canon: {
+      ...DEMO_WORKSPACE.canon,
+      chapterSummaries: [
+        { chapterId: "a", chapterNumber: 1, summary: "一" },
+        { chapterId: "b", chapterNumber: 2, summary: "二" },
+      ],
+      facts: [
+        { id: "f1", chapterNumber: 1, fact: "一" },
+        { id: "f2", chapterNumber: 2, fact: "二" },
+      ],
+    },
+  };
+  const cleaned = removeChapterFromCanon(workspace, 2);
+  assert.deepEqual(cleaned.canon.chapterSummaries.map((item) => item.chapterNumber), [1]);
+  assert.deepEqual(cleaned.canon.facts.map((item) => item.chapterNumber), [1]);
 });

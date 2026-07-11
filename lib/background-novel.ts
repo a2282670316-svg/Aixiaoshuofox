@@ -134,7 +134,7 @@ function nextBackgroundStep(workspace: WorkspaceData): BackgroundStep | null {
 
   for (const chapter of ordered) {
     const generated = workspace.automation.generatedChapterIds.includes(chapter.id);
-    const shouldAudit = chapter.number % 5 === 0 || chapter.number === schedule.range.toChapter;
+    const shouldAudit = true;
     if (generated) {
       if (shouldAudit && workspace.canon.lastAuditedChapter < chapter.number) {
         return {
@@ -317,7 +317,7 @@ function applyCompletedStep(workspace: WorkspaceData, job: BackgroundJobRow, out
     return updated;
   }
 
-  const issues = parseRollingAudit(output, runId);
+  const issues = parseRollingAudit(output, runId, chapter.number);
   return {
     ...workspace,
     issues: [...workspace.issues, ...issues.filter((candidate) => !workspace.issues.some((issue) => issue.title === candidate.title && issue.location === candidate.location))],
