@@ -165,6 +165,16 @@ export interface StorySeed {
   recommended: boolean;
 }
 
+export interface BlueprintDraft {
+  seedId: string;
+  completedStage: 0 | 1 | 2 | 3 | 4 | 5;
+  foundation?: Record<string, unknown>;
+  world?: Record<string, unknown>;
+  outline?: Record<string, unknown>;
+  foreshadows?: Record<string, unknown>;
+  chapters?: Record<string, unknown>;
+}
+
 export interface NovelAutomation {
   runId?: string;
   phase: AutomationPhase;
@@ -186,6 +196,7 @@ export interface NovelAutomation {
   maxRequests: number;
   maxTokens: number;
   lastError?: string;
+  blueprintDraft?: BlueprintDraft;
   updatedAt?: string;
 }
 

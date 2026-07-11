@@ -1,4 +1,5 @@
 import type {
+  BlueprintDraft,
   CanonLedger,
   Chapter,
   ChapterMemory,
@@ -47,6 +48,34 @@ function clamp(value: number, min: number, max: number) {
 
 function safeId(prefix: string, index: number) {
   return `${prefix}-${Date.now()}-${index + 1}`;
+}
+
+export function restartBlueprintDraft(
+  draft: BlueprintDraft,
+  stage: 1 | 2 | 3 | 4 | 5,
+): BlueprintDraft {
+  const completedStage = (stage - 1) as BlueprintDraft["completedStage"];
+  return {
+    seedId: draft.seedId,
+    completedStage,
+    ...(completedStage >= 1 && draft.foundation ? { foundation: draft.foundation } : {}),
+    ...(completedStage >= 2 && draft.world ? { world: draft.world } : {}),
+    ...(completedStage >= 3 && draft.outline ? { outline: draft.outline } : {}),
+    ...(completedStage >= 4 && draft.foreshadows ? { foreshadows: draft.foreshadows } : {}),
+  };
+}
+
+export function reserveModelRequest(
+  usage: NovelAutomation["usage"],
+  limits: Pick<NovelAutomation, "maxRequests" | "maxTokens">,
+): NovelAutomation["usage"] {
+  if (usage.requestCount >= limits.maxRequests) {
+    throw new Error(`已达到 ${limits.maxRequests} 次模型调用上限`);
+  }
+  if (usage.totalTokens >= limits.maxTokens) {
+    throw new Error(`已达到 ${limits.maxTokens.toLocaleString("zh-CN")} Token 预算上限`);
+  }
+  return { ...usage, requestCount: usage.requestCount + 1 };
 }
 
 export function createAutomationState(
@@ -235,6 +264,303 @@ export function buildBlueprintPrompt(
 }
 
 质量要求：人物 5—8 个；世界观 5—10 条；大纲节点 4—8 个；chapters 必须恰好 ${settings.targetChapters} 条且 number 从 1 连续递增。每章 summary 必须具体说明新信息、选择、代价、转折和结尾钩子，不能只写“承上启下”。最后一章要完成核心冲突和人物弧光。`;
+}
+
+export type BlueprintStagePayload = Record<string, unknown>;
+export type BlueprintStageName = "characters" | "world" | "outline" | "foreshadows" | "chapters";
+
+type BlueprintStageOptions = {
+  arrays?: string[];
+  project?: boolean;
+  allowEmpty?: string[];
+  stage?: BlueprintStageName;
+  targetChapters?: number;
+  outlineStage?: BlueprintStagePayload;
+};
+
+function isJsonRecord(value: unknown): value is JsonRecord {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function requiredStageText(item: JsonRecord, key: string, label: string) {
+  if (!text(item[key])) throw new Error(`${label}缺少 ${key}`);
+}
+
+function stageObjects(payload: JsonRecord, key: string, min: number, max: number) {
+  const items = list(payload[key]);
+  if (items.length < min || items.length > max) {
+    throw new Error(`${key} 数量必须为 ${min}—${max} 条，当前为 ${items.length} 条`);
+  }
+  if (items.some((item) => !isJsonRecord(item))) {
+    throw new Error(`${key} 中包含非对象数据`);
+  }
+  return items as JsonRecord[];
+}
+
+function validateCharacterStage(payload: JsonRecord) {
+  const project = record(payload.project);
+  for (const key of ["title", "genre", "premise", "theme", "writingStyle", "pointOfView"]) {
+    requiredStageText(project, key, "作品核心信息");
+  }
+  const characters = stageObjects(payload, "characters", 5, 8);
+  const names = new Set<string>();
+  for (const [index, character] of characters.entries()) {
+    const label = `第 ${index + 1} 个人物`;
+    for (const key of ["name", "role", "age", "identity", "goal", "conflict", "arc"]) requiredStageText(character, key, label);
+    const name = text(character.name);
+    if (names.has(name)) throw new Error(`人物姓名重复：${name}`);
+    names.add(name);
+    if (!list(character.traits).some((trait) => text(trait))) throw new Error(`${label}缺少 traits`);
+  }
+  const relationships = stageObjects(payload, "relationships", 1, 24);
+  const relationKeys = new Set<string>();
+  for (const [index, relation] of relationships.entries()) {
+    const label = `第 ${index + 1} 条人物关系`;
+    for (const key of ["from", "to", "label", "tone", "description"]) requiredStageText(relation, key, label);
+    const from = text(relation.from);
+    const to = text(relation.to);
+    if (!names.has(from) || !names.has(to)) throw new Error(`${label}引用了不存在的人物`);
+    if (from === to) throw new Error(`${label}不能指向同一人物`);
+    if (!["正向", "复杂", "对立", "未知"].includes(text(relation.tone))) throw new Error(`${label}的 tone 无效`);
+    const relationKey = [from, to].sort().join("\u0000");
+    if (relationKeys.has(relationKey)) throw new Error(`${label}与已有关系重复`);
+    relationKeys.add(relationKey);
+  }
+}
+
+function validateWorldStage(payload: JsonRecord) {
+  const world = stageObjects(payload, "world", 5, 10);
+  const titles = new Set<string>();
+  for (const [index, entry] of world.entries()) {
+    const label = `第 ${index + 1} 条世界设定`;
+    for (const key of ["category", "title", "summary", "details"]) requiredStageText(entry, key, label);
+    if (!["地点", "势力", "规则", "历史", "物件"].includes(text(entry.category))) throw new Error(`${label}的 category 无效`);
+    const title = text(entry.title);
+    if (titles.has(title)) throw new Error(`世界设定标题重复：${title}`);
+    titles.add(title);
+  }
+}
+
+function validateOutlineStage(payload: JsonRecord, targetChapters?: number) {
+  const outline = stageObjects(payload, "outline", 4, 8);
+  let expectedStart = 1;
+  for (const [index, beat] of outline.entries()) {
+    const label = `第 ${index + 1} 个大纲节点`;
+    for (const key of ["act", "title", "summary"]) requiredStageText(beat, key, label);
+    if (!Number.isInteger(beat.chapterStart) || !Number.isInteger(beat.chapterEnd)) throw new Error(`${label}的章节范围必须是整数`);
+    const start = Number(beat.chapterStart);
+    const end = Number(beat.chapterEnd);
+    if (start !== expectedStart) throw new Error(`${label}必须从第 ${expectedStart} 章开始，不能断档或重叠`);
+    if (end < start) throw new Error(`${label}的结束章节不能早于开始章节`);
+    if (targetChapters && end > targetChapters) throw new Error(`${label}超出目标章节数 ${targetChapters}`);
+    expectedStart = end + 1;
+  }
+  if (targetChapters && expectedStart !== targetChapters + 1) {
+    throw new Error(`大纲必须完整覆盖第 1—${targetChapters} 章`);
+  }
+}
+
+function chapterTags(tags: unknown) {
+  return list(tags).flatMap((tag) => {
+    const match = text(tag).match(/^第\s*(\d+)\s*章$/);
+    return match ? [Number(match[1])] : [];
+  });
+}
+
+function validateForeshadowStage(payload: JsonRecord, targetChapters?: number) {
+  const foreshadows = stageObjects(payload, "foreshadows", 4, 12);
+  const titles = new Set<string>();
+  for (const [index, item] of foreshadows.entries()) {
+    const label = `第 ${index + 1} 条伏笔`;
+    for (const key of ["title", "content"]) requiredStageText(item, key, label);
+    const title = text(item.title);
+    if (titles.has(title)) throw new Error(`伏笔标题重复：${title}`);
+    titles.add(title);
+    const tags = list(item.tags).map((tag) => text(tag)).filter(Boolean);
+    if (tags.length < 2) throw new Error(`${label}至少需要两个 tags`);
+    const chapters = chapterTags(tags);
+    if (chapters.length < 2) throw new Error(`${label}必须用章节标签注明埋设和回收位置`);
+    if (targetChapters && chapters.some((chapter) => chapter < 1 || chapter > targetChapters)) {
+      throw new Error(`${label}引用了目标范围外的章节`);
+    }
+    if (Math.min(...chapters) === Math.max(...chapters)) throw new Error(`${label}的埋设与回收章节不能相同`);
+  }
+}
+
+function validateChapterStage(payload: JsonRecord, targetChapters?: number, outlineStage?: BlueprintStagePayload) {
+  if (!targetChapters) throw new Error("章节校验缺少目标章节数");
+  const chapters = stageObjects(payload, "chapters", targetChapters, targetChapters);
+  const outline = list(outlineStage?.outline).filter(isJsonRecord);
+  if (!outline.length) throw new Error("章节校验缺少大纲上下文");
+  const seenNumbers = new Set<number>();
+  const usedOutlineIndexes = new Set<number>();
+  for (const [index, chapter] of chapters.entries()) {
+    const label = `第 ${index + 1} 条章节规划`;
+    for (const key of ["title", "summary", "pov"]) requiredStageText(chapter, key, label);
+    if (!Number.isInteger(chapter.number)) throw new Error(`${label}的 number 必须是整数`);
+    const number = Number(chapter.number);
+    if (number < 1 || number > targetChapters || seenNumbers.has(number)) throw new Error(`章节编号必须从 1 到 ${targetChapters} 且不能重复`);
+    seenNumbers.add(number);
+    if (!Number.isInteger(chapter.outlineIndex)) throw new Error(`第 ${number} 章的 outlineIndex 必须是整数`);
+    const outlineIndex = Number(chapter.outlineIndex);
+    if (outlineIndex < 0 || outlineIndex >= outline.length) throw new Error(`第 ${number} 章引用了不存在的大纲节点`);
+    const beat = outline[outlineIndex];
+    const start = Number(beat.chapterStart);
+    const end = Number(beat.chapterEnd);
+    if (number < start || number > end) throw new Error(`第 ${number} 章不在所引用大纲节点的章节范围内`);
+    usedOutlineIndexes.add(outlineIndex);
+  }
+  for (let number = 1; number <= targetChapters; number += 1) {
+    if (!seenNumbers.has(number)) throw new Error(`章节规划缺少第 ${number} 章`);
+  }
+  if (usedOutlineIndexes.size !== outline.length) throw new Error("章节规划必须覆盖每一个大纲节点");
+}
+
+export function parseBlueprintStage(
+  value: string,
+  options: BlueprintStageOptions = {},
+): BlueprintStagePayload {
+  const payload = parseJson(value);
+  if (options.project && !Object.keys(record(payload.project)).length) {
+    throw new Error("人物步骤缺少作品核心信息");
+  }
+  for (const key of options.arrays || []) {
+    const items = list(payload[key]);
+    if (!items.length && !(options.allowEmpty || []).includes(key)) {
+      throw new Error(`蓝图步骤缺少 ${key} 数据`);
+    }
+  }
+  if (options.stage === "characters") validateCharacterStage(payload);
+  if (options.stage === "world") validateWorldStage(payload);
+  if (options.stage === "outline") validateOutlineStage(payload, options.targetChapters);
+  if (options.stage === "foreshadows") validateForeshadowStage(payload, options.targetChapters);
+  if (options.stage === "chapters") validateChapterStage(payload, options.targetChapters, options.outlineStage);
+  return payload;
+}
+
+function seedContext(seed: StorySeed) {
+  return {
+    title: seed.title,
+    genre: seed.genre,
+    hook: seed.hook,
+    premise: seed.premise,
+    theme: seed.theme,
+    protagonist: seed.protagonist,
+    centralConflict: seed.centralConflict,
+    endingTone: seed.endingTone,
+  };
+}
+
+export function buildBlueprintCharactersPrompt(seed: StorySeed) {
+  return `你是中文长篇小说人物总监。现在只完成全书蓝图的第 1/5 步：人物。不要生成世界观、大纲、伏笔或章节。
+
+只输出合法 JSON：
+{
+  "project":{"title":"书名","genre":"题材","status":"筹备中","premise":"一句话梗概","theme":"主题","writingStyle":"文风约束","pointOfView":"叙事视角"},
+  "characters":[{"name":"姓名","role":"角色定位","age":"年龄","identity":"身份","goal":"外在目标","conflict":"内在冲突","arc":"人物弧光","traits":["标签"]}],
+  "relationships":[{"from":"人物姓名","to":"人物姓名","label":"关系","tone":"正向|复杂|对立|未知","description":"张力与变化"}]
+}
+
+要求：人物 5—8 个；姓名唯一；目标、冲突和人物弧光必须能推动主线；关系只能引用 characters 中存在的姓名。
+
+【故事方向】
+${JSON.stringify(seedContext(seed), null, 2)}`;
+}
+
+export function buildBlueprintWorldPrompt(seed: StorySeed, foundation: BlueprintStagePayload) {
+  const project = record(foundation.project);
+  const characters = list(foundation.characters).map((item) => {
+    const character = record(item);
+    return { name: text(character.name), role: text(character.role), identity: text(character.identity), goal: text(character.goal) };
+  });
+  return `你是中文长篇小说世界观设计师。现在只完成全书蓝图的第 2/5 步：设定。不要重复人物，不要生成大纲、伏笔或章节。
+
+只输出合法 JSON：
+{"world":[{"category":"地点|势力|规则|历史|物件","title":"名称","summary":"摘要","details":"来源、限制、日常影响与剧情用途"}]}
+
+要求：生成 5—10 条可执行设定；每条都必须影响人物选择或核心冲突；规则必须写清限制和代价，避免百科式堆砌。
+
+【故事方向】${JSON.stringify(seedContext(seed))}
+【作品】${JSON.stringify(project)}
+【人物】${JSON.stringify(characters)}`;
+}
+
+export function buildBlueprintOutlinePrompt(
+  seed: StorySeed,
+  settings: Pick<NovelAutomation, "targetChapters">,
+  foundation: BlueprintStagePayload,
+  worldStage: BlueprintStagePayload,
+) {
+  const characters = list(foundation.characters).map((item) => {
+    const character = record(item);
+    return { name: text(character.name), role: text(character.role), goal: text(character.goal), arc: text(character.arc) };
+  });
+  const world = list(worldStage.world).map((item) => {
+    const entry = record(item);
+    return { category: text(entry.category), title: text(entry.title), summary: text(entry.summary), details: text(entry.details) };
+  });
+  return `你是中文长篇小说结构编辑。现在只完成全书蓝图的第 3/5 步：大纲。不要生成伏笔或逐章目录。
+
+只输出合法 JSON：
+{"outline":[{"act":"幕/阶段","title":"关键节点","summary":"事件、选择、代价和变化","chapterStart":1,"chapterEnd":4}]}
+
+要求：生成 4—8 个连续节点，完整覆盖第 1—${settings.targetChapters} 章；不能断档或越界；冲突逐级升级；最后一个节点必须解决核心冲突并完成人物弧光。
+
+【故事方向】${JSON.stringify(seedContext(seed))}
+【作品】${JSON.stringify(record(foundation.project))}
+【人物】${JSON.stringify(characters)}
+【设定】${JSON.stringify(world)}`;
+}
+
+export function buildBlueprintForeshadowsPrompt(
+  seed: StorySeed,
+  settings: Pick<NovelAutomation, "targetChapters">,
+  foundation: BlueprintStagePayload,
+  outlineStage: BlueprintStagePayload,
+) {
+  return `你是中文长篇小说伏笔编辑。现在只完成全书蓝图的第 4/5 步：伏笔。不要生成章节目录。
+
+只输出合法 JSON：
+{"foreshadows":[{"title":"伏笔名称","content":"如何埋设、误导、升级和回收","tags":["第1章","第8章","待回收"]}]}
+
+要求：生成 4—12 条伏笔；每条注明具体埋设和回收范围；至少覆盖人物秘密、世界规则与核心谜题；结局前回收主要伏笔。
+
+【故事方向】${JSON.stringify(seedContext(seed))}
+【人物】${JSON.stringify(list(foundation.characters))}
+【大纲】${JSON.stringify(list(outlineStage.outline))}`;
+}
+
+export function buildBlueprintChaptersPrompt(
+  seed: StorySeed,
+  settings: Pick<NovelAutomation, "targetChapters" | "chapterWords">,
+  stages: { foundation: BlueprintStagePayload; world: BlueprintStagePayload; outline: BlueprintStagePayload; foreshadows: BlueprintStagePayload },
+) {
+  const characters = list(stages.foundation.characters).map((item) => {
+    const character = record(item);
+    return { name: text(character.name), role: text(character.role), goal: text(character.goal), conflict: text(character.conflict), arc: text(character.arc) };
+  });
+  const world = list(stages.world.world).map((item) => {
+    const entry = record(item);
+    return { category: text(entry.category), title: text(entry.title), summary: text(entry.summary), details: text(entry.details) };
+  });
+  return `你是中文长篇小说章节规划师。现在只完成全书蓝图的第 5/5 步：章节。不要重复输出人物、设定、大纲或伏笔。
+
+只输出合法 JSON：
+{"chapters":[{"number":1,"title":"章名","summary":"本章发生的事件、人物选择、代价、转折和结尾钩子","pov":"视角人物","outlineIndex":0}]}
+
+硬性要求：
+1. chapters 必须恰好 ${settings.targetChapters} 条，number 从 1 到 ${settings.targetChapters} 连续递增。
+2. 每章目标约 ${settings.chapterWords} 字；summary 必须具体，不能写“承上启下”。
+3. outlineIndex 从 0 开始，必须对应提供的大纲节点。
+4. 相邻章节形成清晰因果；每章都产生新信息、选择或不可逆代价。
+5. 最后一章完成核心冲突、人物弧光并回收主要伏笔。
+
+【故事方向】${JSON.stringify(seedContext(seed))}
+【作品】${JSON.stringify(record(stages.foundation.project))}
+【人物】${JSON.stringify(characters)}
+【设定】${JSON.stringify(world)}
+【大纲】${JSON.stringify(list(stages.outline.outline))}
+【伏笔】${JSON.stringify(list(stages.foreshadows.foreshadows))}`;
 }
 
 function worldCategory(value: unknown): WorldEntry["category"] {

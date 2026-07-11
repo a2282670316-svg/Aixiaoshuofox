@@ -2,12 +2,16 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   buildAutomatedChapterPrompt,
+  buildBlueprintChaptersPrompt,
   applyChapterMemory,
   createAutomationState,
   parseChapterMemory,
+  parseBlueprintStage,
   parseNovelBlueprint,
   parseRollingAudit,
   parseSeedOptions,
+  reserveModelRequest,
+  restartBlueprintDraft,
 } from "../lib/auto-novel";
 import type { StorySeed, WorkspaceData } from "../lib/types";
 import { DEMO_WORKSPACE } from "../lib/demo-data";
@@ -70,12 +74,26 @@ function blueprintJson(chapterCount = 4) {
     characters: [
       { name: "林岚", role: "主角", age: "30", identity: "记者", goal: "查明真相", conflict: "害怕承担后果", arc: "从旁观到负责", traits: ["敏锐"] },
       { name: "周渡", role: "盟友", age: "34", identity: "医生", goal: "保护归来者", conflict: "隐瞒事实", arc: "公开证据", traits: ["克制"] },
+      { name: "陈屿", role: "对手", age: "45", identity: "港务主管", goal: "封锁旧案", conflict: "维护秩序与赎罪", arc: "承认责任", traits: ["强硬"] },
+      { name: "苏禾", role: "归来者", age: "26", identity: "潜水员", goal: "找回记忆", conflict: "恐惧真相", arc: "主动作证", traits: ["警觉"] },
+      { name: "许婆", role: "见证者", age: "68", identity: "钟表匠", goal: "完成旧日承诺", conflict: "沉默会保护也会伤害", arc: "交出档案", traits: ["寡言"] },
     ],
-    world: [{ category: "地点", title: "回声港", summary: "退潮异常的港城", details: "每日凌晨退潮" }],
+    world: [
+      { category: "地点", title: "回声港", summary: "退潮异常的港城", details: "每日凌晨退潮，封港会切断居民生计" },
+      { category: "规则", title: "归潮规则", summary: "退潮会送回一名失踪者", details: "归来者丢失同一小时记忆，强行回忆会昏厥" },
+      { category: "势力", title: "港务会", summary: "控制港口档案与封锁线", details: "以维持秩序为名删改事故记录" },
+      { category: "历史", title: "十年前沉船", summary: "共同失踪事件的源头", details: "官方结论与幸存者证词矛盾" },
+      { category: "物件", title: "停摆手表", summary: "所有归来者都携带同款旧表", details: "表针固定在三点十七分且无法维修" },
+    ],
     relationships: [{ from: "林岚", to: "周渡", label: "互相试探", tone: "复杂", description: "共同调查但彼此隐瞒" }],
-    outline: [{ act: "第一幕", title: "归来", summary: "第一名失踪者归来", chapterStart: 1, chapterEnd: chapterCount }],
-    chapters: Array.from({ length: chapterCount }, (_, index) => ({ number: index + 1, title: `潮声 ${index + 1}`, summary: `第 ${index + 1} 章发生具体选择与转折`, pov: "林岚", outlineIndex: 0 })),
-    foreshadows: [{ title: "停摆的表", content: "第一章埋设，终章回收", tags: ["第1章", `第${chapterCount}章`, "待回收"] }],
+    outline: [
+      { act: "第一幕", title: "归来", summary: "第一名失踪者归来并留下手表", chapterStart: 1, chapterEnd: 1 },
+      { act: "第二幕", title: "封锁", summary: "调查触及港务会并付出代价", chapterStart: 2, chapterEnd: 2 },
+      { act: "第三幕", title: "记忆", summary: "归来者恢复片段并揭示沉船关联", chapterStart: 3, chapterEnd: 3 },
+      { act: "终幕", title: "真相", summary: "公开证据、解决冲突并完成人物弧光", chapterStart: 4, chapterEnd: chapterCount },
+    ],
+    chapters: Array.from({ length: chapterCount }, (_, index) => ({ number: index + 1, title: `潮声 ${index + 1}`, summary: `第 ${index + 1} 章发生具体选择、不可逆代价与结尾转折`, pov: "林岚", outlineIndex: Math.min(index, 3) })),
+    foreshadows: ["停摆的表", "删改档案", "缺失录音", "旧船票"].map((title, index) => ({ title, content: `第1章埋设线索 ${index + 1}，终章揭示来源并完成回收`, tags: ["第1章", `第${chapterCount}章`, "待回收"] })),
   });
 }
 
@@ -88,6 +106,89 @@ test("turns a validated blueprint into a complete writable workspace", () => {
   assert.ok(parsed.chapters.every((item) => item.status === "待生成" && item.targetWords === 4000));
   assert.equal(parsed.relationships.length, 1);
   assert.equal(parsed.materials[0].type, "伏笔");
+});
+
+
+
+test("assembles five independently validated blueprint stages", () => {
+  const complete = JSON.parse(blueprintJson()) as Record<string, unknown>;
+  const settings = createAutomationState({ targetChapters: 4, targetWords: 16000, chapterWords: 4000 });
+  const foundation = parseBlueprintStage(JSON.stringify({ project: complete.project, characters: complete.characters, relationships: complete.relationships }), { stage: "characters" });
+  const world = parseBlueprintStage(JSON.stringify({ world: complete.world }), { stage: "world" });
+  const outline = parseBlueprintStage(JSON.stringify({ outline: complete.outline }), { stage: "outline", targetChapters: settings.targetChapters });
+  const foreshadows = parseBlueprintStage(JSON.stringify({ foreshadows: complete.foreshadows }), { stage: "foreshadows", targetChapters: settings.targetChapters });
+  const chapters = parseBlueprintStage(JSON.stringify({ chapters: complete.chapters }), { stage: "chapters", targetChapters: settings.targetChapters, outlineStage: outline });
+  const assembled = parseNovelBlueprint(JSON.stringify({ ...foundation, ...world, ...outline, ...foreshadows, ...chapters }), seed, settings);
+  const chapterPrompt = buildBlueprintChaptersPrompt(seed, settings, { foundation, world, outline, foreshadows });
+
+  assert.equal(assembled.chapters.length, 4);
+  assert.match(chapterPrompt, /第 5\/5 步：章节/);
+  assert.doesNotMatch(chapterPrompt, /"characters":\[/);
+  assert.throws(() => parseBlueprintStage('{"world":[]}', { arrays: ["world"] }), /缺少 world 数据/);
+});
+
+test("rejects malformed staged blueprint business rules", () => {
+  const complete = JSON.parse(blueprintJson()) as Record<string, unknown>;
+  const duplicateCharacters = structuredClone(complete) as Record<string, unknown>;
+  const characterItems = duplicateCharacters.characters as Array<Record<string, unknown>>;
+  characterItems[1].name = characterItems[0].name;
+  assert.throws(
+    () => parseBlueprintStage(JSON.stringify({ project: duplicateCharacters.project, characters: characterItems, relationships: duplicateCharacters.relationships }), { stage: "characters" }),
+    /人物姓名重复/,
+  );
+
+  const brokenOutline = structuredClone(complete.outline) as Array<Record<string, unknown>>;
+  brokenOutline[1].chapterStart = 3;
+  assert.throws(
+    () => parseBlueprintStage(JSON.stringify({ outline: brokenOutline }), { stage: "outline", targetChapters: 4 }),
+    /不能断档或重叠/,
+  );
+
+  const outline = parseBlueprintStage(JSON.stringify({ outline: complete.outline }), { stage: "outline", targetChapters: 4 });
+  const duplicateChapters = structuredClone(complete.chapters) as Array<Record<string, unknown>>;
+  duplicateChapters[1].number = 1;
+  assert.throws(
+    () => parseBlueprintStage(JSON.stringify({ chapters: duplicateChapters }), { stage: "chapters", targetChapters: 4, outlineStage: outline }),
+    /不能重复/,
+  );
+  assert.throws(
+    () => parseBlueprintStage('{"world":[null,null,null,null,null]}', { stage: "world" }),
+    /非对象数据/,
+  );
+});
+
+test("invalidates downstream blueprint stages when one stage is redone", () => {
+  const complete = JSON.parse(blueprintJson()) as Record<string, unknown>;
+  const draft = {
+    seedId: seed.id,
+    completedStage: 5 as const,
+    foundation: { project: complete.project, characters: complete.characters, relationships: complete.relationships },
+    world: { world: complete.world },
+    outline: { outline: complete.outline },
+    foreshadows: { foreshadows: complete.foreshadows },
+    chapters: { chapters: complete.chapters },
+  };
+
+  const restarted = restartBlueprintDraft(draft, 3);
+  assert.equal(restarted.completedStage, 2);
+  assert.ok(restarted.foundation);
+  assert.ok(restarted.world);
+  assert.equal(restarted.outline, undefined);
+  assert.equal(restarted.foreshadows, undefined);
+  assert.equal(restarted.chapters, undefined);
+});
+
+test("counts every model attempt before it is sent", () => {
+  const limits = { maxRequests: 2, maxTokens: 1000 };
+  let usage = createAutomationState().usage;
+  usage = reserveModelRequest(usage, limits);
+  usage = reserveModelRequest(usage, limits);
+  assert.equal(usage.requestCount, 2);
+  assert.throws(() => reserveModelRequest(usage, limits), /2 次模型调用上限/);
+  assert.throws(
+    () => reserveModelRequest({ ...usage, requestCount: 0, totalTokens: 1000 }, limits),
+    /Token 预算上限/,
+  );
 });
 
 test("rejects an incomplete chapter blueprint without mutating a workspace", () => {
@@ -138,6 +239,30 @@ test("normalizes older or partial workspace backups safely", () => {
   assert.equal(normalized.automation.phase, "idle");
   assert.equal(normalized.canon.revision, 0);
   assert.equal(normalized.automation.usage.totalTokens, 0);
+});
+
+test("preserves a valid staged blueprint checkpoint for recovery", () => {
+  const complete = JSON.parse(blueprintJson()) as Record<string, unknown>;
+  const normalized = normalizeWorkspaceData({
+    ...DEMO_WORKSPACE,
+    automation: {
+      ...DEMO_WORKSPACE.automation,
+      runId: "planning-run",
+      phase: "planning",
+      blueprintDraft: {
+        seedId: seed.id,
+        completedStage: 2,
+        foundation: { project: complete.project, characters: complete.characters, relationships: complete.relationships },
+        world: { world: complete.world },
+        outline: { outline: complete.outline },
+      },
+    },
+  }, DEMO_WORKSPACE);
+
+  assert.equal(normalized.automation.blueprintDraft?.completedStage, 2);
+  assert.ok(normalized.automation.blueprintDraft?.foundation);
+  assert.ok(normalized.automation.blueprintDraft?.world);
+  assert.equal(normalized.automation.blueprintDraft?.outline, undefined);
 });
 
 test("commits chapter memory into the long-form canon ledger", () => {

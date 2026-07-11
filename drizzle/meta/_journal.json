@@ -15,6 +15,13 @@
       "when": 1783711185812,
       "tag": "0001_black_spiral",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1783760379334,
+      "tag": "0002_flawless_mad_thinker",
+      "breakpoints": true
     }
   ]
 }

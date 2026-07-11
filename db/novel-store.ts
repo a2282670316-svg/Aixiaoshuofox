@@ -8,6 +8,7 @@ export type ProjectSummary = {
   status: string;
   createdAt: string;
   updatedAt: string;
+  revision: number;
 };
 
 export type GenerationStepInput = {
@@ -36,6 +37,7 @@ export function ensureNovelSchema() {
         genre TEXT NOT NULL DEFAULT '',
         status TEXT NOT NULL DEFAULT '筹备中',
         workspace_json TEXT NOT NULL,
+        revision INTEGER NOT NULL DEFAULT 1,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       )`),
@@ -119,6 +121,10 @@ export function ensureNovelSchema() {
         received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       )`),
     ]);
+    const projectColumns = await db.prepare("PRAGMA table_info(projects)").all<{ name: string }>();
+    if (!(projectColumns.results || []).some((column) => String(column.name) === "revision")) {
+      await db.prepare("ALTER TABLE projects ADD COLUMN revision INTEGER NOT NULL DEFAULT 1").run();
+    }
   })().catch((error) => {
     schemaReady = null;
     throw error;
@@ -128,7 +134,7 @@ export function ensureNovelSchema() {
 
 export async function listProjects(ownerId: string): Promise<ProjectSummary[]> {
   await ensureNovelSchema();
-  const result = await getD1().prepare(`SELECT id, title, genre, status, created_at, updated_at
+  const result = await getD1().prepare(`SELECT id, title, genre, status, created_at, updated_at, revision
     FROM projects WHERE owner_id = ? ORDER BY updated_at DESC LIMIT 100`).bind(ownerId).all();
   return (result.results || []).map((row) => ({
     id: String(row.id),
@@ -137,6 +143,7 @@ export async function listProjects(ownerId: string): Promise<ProjectSummary[]> {
     status: String(row.status),
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
+    revision: Number(row.revision) || 1,
   }));
 }
 
@@ -152,24 +159,35 @@ export async function getProject(ownerId: string, projectId: string) {
     workspace: JSON.parse(String(row.workspace_json)) as WorkspaceData,
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
+    revision: Number(row.revision) || 1,
   };
 }
 
-export async function saveProject(ownerId: string, projectId: string, workspace: WorkspaceData) {
+export async function saveProject(
+  ownerId: string,
+  projectId: string,
+  workspace: WorkspaceData,
+  expectedRevision?: number,
+) {
   await ensureNovelSchema();
+  const db = getD1();
   const now = new Date().toISOString();
-  await getD1().prepare(`INSERT INTO projects
-    (id, owner_id, title, genre, status, workspace_json, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(id) DO UPDATE SET
-      title = excluded.title,
-      genre = excluded.genre,
-      status = excluded.status,
-      workspace_json = excluded.workspace_json,
-      updated_at = excluded.updated_at
-    WHERE projects.owner_id = excluded.owner_id`)
-    .bind(projectId, ownerId, workspace.project.title, workspace.project.genre, workspace.project.status, JSON.stringify(workspace), now, now)
-    .run();
+  const serialized = JSON.stringify(workspace);
+  if (expectedRevision === undefined) {
+    const result = await db.prepare(`INSERT OR IGNORE INTO projects
+      (id, owner_id, title, genre, status, workspace_json, revision, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)`)
+      .bind(projectId, ownerId, workspace.project.title, workspace.project.genre, workspace.project.status, serialized, now, now)
+      .run();
+    if (!result.meta.changes) throw new Error("PROJECT_CONFLICT");
+  } else {
+    const result = await db.prepare(`UPDATE projects SET
+      title = ?, genre = ?, status = ?, workspace_json = ?, revision = revision + 1, updated_at = ?
+      WHERE id = ? AND owner_id = ? AND revision = ?`)
+      .bind(workspace.project.title, workspace.project.genre, workspace.project.status, serialized, now, projectId, ownerId, expectedRevision)
+      .run();
+    if (!result.meta.changes) throw new Error("PROJECT_CONFLICT");
+  }
   const saved = await getProject(ownerId, projectId);
   if (!saved) throw new Error("Project ownership mismatch");
   return saved;
@@ -251,5 +269,6 @@ export async function saveAutomationCheckpoint(
         step.error?.slice(0, 4000) ?? null, JSON.stringify(run.usage), now, now));
   }
   await db.batch(statements);
-  return { projectId, runId: run.runId, updatedAt: now };
+  const projectRevision = await db.prepare("SELECT revision FROM projects WHERE id = ? AND owner_id = ?").bind(projectId, ownerId).first<{ revision: number }>();
+  return { projectId, runId: run.runId, revision: Number(projectRevision?.revision) || 1, updatedAt: now };
 }

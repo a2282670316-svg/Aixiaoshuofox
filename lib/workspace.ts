@@ -1,6 +1,7 @@
 import { createAutomationState } from "./auto-novel";
 import type {
   AutomationPhase,
+  BlueprintDraft,
   CanonLedger,
   ChapterMemory,
   ChapterStatus,
@@ -233,6 +234,19 @@ export function normalizeWorkspaceData(
 
   const rawAutomation = record(source.automation);
   const rawUsage = record(rawAutomation.usage);
+  const rawBlueprintDraft = record(rawAutomation.blueprintDraft);
+  const draftStage = numberValue(rawBlueprintDraft.completedStage, 0, 0, 5) as BlueprintDraft["completedStage"];
+  const blueprintDraft: BlueprintDraft | undefined = typeof rawBlueprintDraft.seedId === "string" && rawBlueprintDraft.seedId.trim()
+    ? {
+        seedId: rawBlueprintDraft.seedId.slice(0, 160),
+        completedStage: draftStage,
+        ...(draftStage >= 1 && Object.keys(record(rawBlueprintDraft.foundation)).length ? { foundation: record(rawBlueprintDraft.foundation) } : {}),
+        ...(draftStage >= 2 && Object.keys(record(rawBlueprintDraft.world)).length ? { world: record(rawBlueprintDraft.world) } : {}),
+        ...(draftStage >= 3 && Object.keys(record(rawBlueprintDraft.outline)).length ? { outline: record(rawBlueprintDraft.outline) } : {}),
+        ...(draftStage >= 4 && Object.keys(record(rawBlueprintDraft.foreshadows)).length ? { foreshadows: record(rawBlueprintDraft.foreshadows) } : {}),
+        ...(draftStage >= 5 && Object.keys(record(rawBlueprintDraft.chapters)).length ? { chapters: record(rawBlueprintDraft.chapters) } : {}),
+      }
+    : undefined;
   const allowedPhases: AutomationPhase[] = ["idle", "ideating", "choosing", "planning", "ready", "writing", "paused", "completed", "error"];
   const storedPhase = enumValue<AutomationPhase>(rawAutomation.phase, allowedPhases, "idle");
   const automation = createAutomationState({
@@ -256,6 +270,7 @@ export function normalizeWorkspaceData(
     maxRequests: numberValue(rawAutomation.maxRequests, 250, 1, 10_000),
     maxTokens: numberValue(rawAutomation.maxTokens, 5_000_000, 1_000, 1_000_000_000),
     lastError: typeof rawAutomation.lastError === "string" ? rawAutomation.lastError.slice(0, 2000) : undefined,
+    blueprintDraft,
     updatedAt: typeof rawAutomation.updatedAt === "string" ? dateValue(rawAutomation.updatedAt) : undefined,
   } as Partial<NovelAutomation>);
 

@@ -2,6 +2,7 @@
 
 import {
   useRef,
+  useState,
   type Dispatch,
   type SetStateAction,
 } from "react";
@@ -28,19 +29,28 @@ import {
 } from "lucide-react";
 import {
   buildAutomatedChapterPrompt,
-  buildBlueprintPrompt,
+  buildBlueprintCharactersPrompt,
+  buildBlueprintChaptersPrompt,
+  buildBlueprintForeshadowsPrompt,
+  buildBlueprintOutlinePrompt,
+  buildBlueprintWorldPrompt,
   buildChapterMemoryPrompt,
   buildRollingAuditPrompt,
   buildSeedPrompt,
   applyChapterMemory,
   createAutomationState,
   parseChapterMemory,
+  parseBlueprintStage,
   parseNovelBlueprint,
   parseRollingAudit,
   parseSeedOptions,
+  reserveModelRequest,
+  restartBlueprintDraft,
 } from "@/lib/auto-novel";
+import type { BlueprintStagePayload } from "@/lib/auto-novel";
 import type {
   AIConfig,
+  BlueprintDraft,
   NovelAutomation,
   StorySeed,
   WorkspaceData,
@@ -125,11 +135,12 @@ export default function AutoNovelStudio({
   const runTokenRef = useRef("");
   const usageRef = useRef(workspace.automation.usage);
   const budgetRef = useRef({ maxRequests: workspace.automation.maxRequests, maxTokens: workspace.automation.maxTokens });
+  const [blueprintStage, setBlueprintStage] = useState("");
   const automation = workspace.automation;
-  const isRunning = activePhases.includes(automation.phase);
+  const isRunning = activePhases.includes(automation.phase) && !(automation.phase === "planning" && !aiBusy);
   const generatedCount = workspace.chapters.filter((item) => automation.generatedChapterIds.includes(item.id)).length;
   const estimatedSegments = Math.max(1, Math.ceil(automation.chapterWords / 2200));
-  const estimatedCalls = 2 + automation.targetChapters * (estimatedSegments + 1) + Math.ceil(automation.targetChapters / 5);
+  const estimatedCalls = 6 + automation.targetChapters * (estimatedSegments + 1) + Math.ceil(automation.targetChapters / 5);
 
   const patchAutomation = (patch: Partial<NovelAutomation>) => {
     setWorkspace((current) => ({
@@ -150,14 +161,9 @@ export default function AutoNovelStudio({
   };
 
   const requestText = async (prompt: string, signal?: AbortSignal) => {
-    if (usageRef.current.requestCount >= budgetRef.current.maxRequests) {
-      throw new Error(`已达到 ${budgetRef.current.maxRequests} 次模型调用上限`);
-    }
-    if (usageRef.current.totalTokens >= budgetRef.current.maxTokens) {
-      throw new Error(`已达到 ${budgetRef.current.maxTokens.toLocaleString("zh-CN")} Token 预算上限`);
-    }
     let lastError = "AI 请求失败";
     for (let attempt = 0; attempt < 3; attempt += 1) {
+      usageRef.current = reserveModelRequest(usageRef.current, budgetRef.current);
       try {
         const response = await fetch("/api/ai", {
           method: "POST",
@@ -165,7 +171,7 @@ export default function AutoNovelStudio({
           body: JSON.stringify({
             ...config,
             prompt,
-            maxOutputTokens: prompt.includes("完整全书蓝图") ? 32_768 : 16_384,
+            maxOutputTokens: prompt.includes("第 5/5 步：章节") ? 32_768 : 16_384,
           }),
           signal,
         });
@@ -174,19 +180,17 @@ export default function AutoNovelStudio({
           error?: string;
           usage?: Record<string, unknown>;
         };
-        if (response.ok && payload.text?.trim()) {
-          const usage = payload.usage || {};
-          const inputTokens = Number(usage.prompt_tokens ?? usage.input_tokens ?? 0) || 0;
-          const outputTokens = Number(usage.completion_tokens ?? usage.output_tokens ?? 0) || 0;
-          const totalTokens = Number(usage.total_tokens ?? inputTokens + outputTokens) || inputTokens + outputTokens;
-          usageRef.current = {
-            requestCount: usageRef.current.requestCount + 1,
-            inputTokens: usageRef.current.inputTokens + inputTokens,
-            outputTokens: usageRef.current.outputTokens + outputTokens,
-            totalTokens: usageRef.current.totalTokens + totalTokens,
-          };
-          return payload.text.trim();
-        }
+        const usage = payload.usage || {};
+        const inputTokens = Number(usage.prompt_tokens ?? usage.input_tokens ?? 0) || 0;
+        const outputTokens = Number(usage.completion_tokens ?? usage.output_tokens ?? 0) || 0;
+        const totalTokens = Number(usage.total_tokens ?? inputTokens + outputTokens) || inputTokens + outputTokens;
+        usageRef.current = {
+          ...usageRef.current,
+          inputTokens: usageRef.current.inputTokens + inputTokens,
+          outputTokens: usageRef.current.outputTokens + outputTokens,
+          totalTokens: usageRef.current.totalTokens + totalTokens,
+        };
+        if (response.ok && payload.text?.trim()) return payload.text.trim();
         lastError = payload.error || `模型接口返回 ${response.status}`;
         if (![408, 429, 500, 502, 503, 504].includes(response.status) || attempt === 2) {
           throw new Error(lastError);
@@ -210,6 +214,148 @@ export default function AutoNovelStudio({
       const repaired = await requestText(`请修复下面的模型输出，使其严格满足原任务要求。只输出修复后的合法 JSON，不要解释，也不要 Markdown。\n\n【校验错误】\n${reason}\n\n【原任务】\n${prompt}\n\n【待修复输出】\n${first}`, signal);
       return parser(repaired);
     }
+  };
+
+  const generateBlueprintStages = async (
+    source: WorkspaceData,
+    seed: StorySeed,
+    settings: NovelAutomation,
+  ) => {
+    const runId = source.automation.runId || "";
+    const requestStage = async <T,>(prompt: string, parser: (value: string) => T) => {
+      if (stopRequested.current || runTokenRef.current !== runId) throw new DOMException("蓝图生成已暂停", "AbortError");
+      controllerRef.current = new AbortController();
+      const result = await requestStructured(prompt, parser, controllerRef.current.signal);
+      if (stopRequested.current || runTokenRef.current !== runId) throw new DOMException("蓝图生成已暂停", "AbortError");
+      return result;
+    };
+
+    let working = source;
+    let draft: BlueprintDraft = source.automation.blueprintDraft?.seedId === seed.id
+      ? source.automation.blueprintDraft
+      : { seedId: seed.id, completedStage: 0 };
+
+    const persistStage = async (
+      completedStage: BlueprintDraft["completedStage"],
+      key: "foundation" | "world" | "outline" | "foreshadows" | "chapters",
+      payload: BlueprintStagePayload,
+    ) => {
+      draft = { ...draft, [key]: payload, completedStage };
+      working = {
+        ...working,
+        automation: {
+          ...working.automation,
+          phase: "planning",
+          selectedSeedId: seed.id,
+          usage: usageRef.current,
+          blueprintDraft: draft,
+          updatedAt: new Date().toISOString(),
+        },
+      };
+      setWorkspace(working);
+      await onDurableCheckpoint?.(working, {
+        stepKey: `${working.automation.runId}:blueprint-stage-${completedStage}`,
+        kind: `blueprint_${key}`,
+        status: "completed",
+        outputExcerpt: JSON.stringify(payload).slice(0, 1000),
+      });
+    };
+
+    let foundation: BlueprintStagePayload | undefined;
+    if (draft.completedStage >= 1 && draft.foundation) {
+      try {
+        foundation = parseBlueprintStage(JSON.stringify(draft.foundation), { stage: "characters" });
+      } catch {
+        draft = { seedId: seed.id, completedStage: 0 };
+      }
+    }
+    if (!foundation) {
+      setBlueprintStage("1/5 · 正在生成人物与关系");
+      foundation = await requestStage(
+        buildBlueprintCharactersPrompt(seed),
+        (value) => parseBlueprintStage(value, { stage: "characters" }),
+      );
+      await persistStage(1, "foundation", foundation);
+    }
+
+    let world: BlueprintStagePayload | undefined;
+    if (draft.completedStage >= 2 && draft.world) {
+      try {
+        world = parseBlueprintStage(JSON.stringify(draft.world), { stage: "world" });
+      } catch {
+        draft = { seedId: seed.id, completedStage: 1, foundation };
+      }
+    }
+    if (!world) {
+      setBlueprintStage("2/5 · 正在生成世界设定");
+      world = await requestStage(
+        buildBlueprintWorldPrompt(seed, foundation),
+        (value) => parseBlueprintStage(value, { stage: "world" }),
+      );
+      await persistStage(2, "world", world);
+    }
+
+    let outline: BlueprintStagePayload | undefined;
+    if (draft.completedStage >= 3 && draft.outline) {
+      try {
+        outline = parseBlueprintStage(JSON.stringify(draft.outline), { stage: "outline", targetChapters: settings.targetChapters });
+      } catch {
+        draft = { seedId: seed.id, completedStage: 2, foundation, world };
+      }
+    }
+    if (!outline) {
+      setBlueprintStage("3/5 · 正在生成故事大纲");
+      outline = await requestStage(
+        buildBlueprintOutlinePrompt(seed, settings, foundation, world),
+        (value) => parseBlueprintStage(value, { stage: "outline", targetChapters: settings.targetChapters }),
+      );
+      await persistStage(3, "outline", outline);
+    }
+
+    let foreshadows: BlueprintStagePayload | undefined;
+    if (draft.completedStage >= 4 && draft.foreshadows) {
+      try {
+        foreshadows = parseBlueprintStage(JSON.stringify(draft.foreshadows), { stage: "foreshadows", targetChapters: settings.targetChapters });
+      } catch {
+        draft = { seedId: seed.id, completedStage: 3, foundation, world, outline };
+      }
+    }
+    if (!foreshadows) {
+      setBlueprintStage("4/5 · 正在设计伏笔回收");
+      foreshadows = await requestStage(
+        buildBlueprintForeshadowsPrompt(seed, settings, foundation, outline),
+        (value) => parseBlueprintStage(value, { stage: "foreshadows", targetChapters: settings.targetChapters }),
+      );
+      await persistStage(4, "foreshadows", foreshadows);
+    }
+
+    let chapters: BlueprintStagePayload | undefined;
+    if (draft.completedStage >= 5 && draft.chapters) {
+      try {
+        chapters = parseBlueprintStage(JSON.stringify(draft.chapters), {
+          stage: "chapters",
+          targetChapters: settings.targetChapters,
+          outlineStage: outline,
+        });
+      } catch {
+        draft = { seedId: seed.id, completedStage: 4, foundation, world, outline, foreshadows };
+      }
+    }
+    if (!chapters) {
+      setBlueprintStage("5/5 · 正在生成逐章目录");
+      chapters = await requestStage(
+        buildBlueprintChaptersPrompt(seed, settings, { foundation, world, outline, foreshadows }),
+        (value) => parseBlueprintStage(value, {
+          stage: "chapters",
+          targetChapters: settings.targetChapters,
+          outlineStage: outline,
+        }),
+      );
+      await persistStage(5, "chapters", chapters);
+    }
+
+    const merged: BlueprintStagePayload = { ...foundation, ...world, ...outline, ...foreshadows, ...chapters };
+    return { blueprint: parseNovelBlueprint(JSON.stringify(merged), seed, settings), draft };
   };
 
   const writeNovel = async (source: WorkspaceData) => {
@@ -458,21 +604,43 @@ export default function AutoNovelStudio({
     }
   };
 
+  const preparePlanningWorkspace = (source: WorkspaceData, seed: StorySeed): WorkspaceData => {
+    const resumableDraft = source.automation.blueprintDraft?.seedId === seed.id
+      ? source.automation.blueprintDraft
+      : { seedId: seed.id, completedStage: 0 as const };
+    return {
+      ...source,
+      automation: {
+        ...source.automation,
+        runId: source.automation.blueprintDraft?.seedId === seed.id && source.automation.runId
+          ? source.automation.runId
+          : nextRunId(),
+        phase: "planning",
+        selectedSeedId: seed.id,
+        lastError: undefined,
+        blueprintDraft: resumableDraft,
+        updatedAt: new Date().toISOString(),
+      },
+    };
+  };
+
   const buildBlueprint = async (seed: StorySeed, writeAfter = false) => {
     if (!ensureConfigured()) return;
     const currentSettings = workspace.automation;
     usageRef.current = currentSettings.usage;
     budgetRef.current = { maxRequests: currentSettings.maxRequests, maxTokens: currentSettings.maxTokens };
     setAiBusy(true);
-    patchAutomation({ phase: "planning", selectedSeedId: seed.id, lastError: undefined });
+    const planningWorkspace = preparePlanningWorkspace(workspace, seed);
+    stopRequested.current = false;
+    runTokenRef.current = planningWorkspace.automation.runId || nextRunId();
+    setWorkspace(planningWorkspace);
     try {
-      const prompt = buildBlueprintPrompt(seed, currentSettings);
-      const blueprint = await requestStructured(prompt, (value) => parseNovelBlueprint(value, seed, currentSettings));
+      const { blueprint, draft } = await generateBlueprintStages(planningWorkspace, seed, planningWorkspace.automation);
       onBackup(workspace, "AI 全书创作前自动备份");
       const nextWorkspace: WorkspaceData = {
         ...blueprint,
         automation: createAutomationState({
-          runId: nextRunId(),
+          runId: planningWorkspace.automation.runId,
           phase: "ready",
           brief: currentSettings.brief,
           seeds: currentSettings.seeds,
@@ -486,6 +654,7 @@ export default function AutoNovelStudio({
           usage: usageRef.current,
           maxRequests: currentSettings.maxRequests,
           maxTokens: currentSettings.maxTokens,
+          blueprintDraft: draft,
           updatedAt: new Date().toISOString(),
         }),
       };
@@ -499,14 +668,17 @@ export default function AutoNovelStudio({
       notify(`《${nextWorkspace.project.title}》全书蓝图已生成`);
       if (writeAfter) await writeNovel(nextWorkspace);
     } catch (error) {
+      const paused = stopRequested.current || (error instanceof DOMException && error.name === "AbortError");
       patchAutomation({
-        phase: "error",
-        lastError: error instanceof Error ? error.message : "全书蓝图生成失败",
+        phase: paused ? "paused" : "error",
+        lastError: paused ? undefined : error instanceof Error ? error.message : "全书蓝图生成失败",
         usage: usageRef.current,
       });
-      notify(error instanceof Error ? error.message : "全书蓝图生成失败");
+      notify(paused ? "蓝图生成已暂停，阶段结果已经保存" : error instanceof Error ? error.message : "全书蓝图生成失败");
     } finally {
-      if (!writeAfter) setAiBusy(false);
+      controllerRef.current = null;
+      setBlueprintStage("");
+      if (!writeAfter || stopRequested.current) setAiBusy(false);
     }
   };
 
@@ -516,7 +688,7 @@ export default function AutoNovelStudio({
     usageRef.current = currentSettings.usage;
     budgetRef.current = { maxRequests: currentSettings.maxRequests, maxTokens: currentSettings.maxTokens };
     setAiBusy(true);
-    patchAutomation({ phase: "ideating", seeds: [], selectedSeedId: undefined, lastError: undefined });
+    patchAutomation({ phase: "ideating", seeds: [], selectedSeedId: undefined, blueprintDraft: undefined, lastError: undefined });
     try {
       const prompt = buildSeedPrompt(currentSettings.brief, currentSettings);
       const seeds = await requestStructured(prompt, parseSeedOptions);
@@ -556,18 +728,17 @@ export default function AutoNovelStudio({
     usageRef.current = source.automation.usage;
     budgetRef.current = { maxRequests: source.automation.maxRequests, maxTokens: source.automation.maxTokens };
     setAiBusy(true);
-    setWorkspace({
-      ...source,
-      automation: { ...source.automation, phase: "planning", selectedSeedId: seed.id, lastError: undefined },
-    });
+    const planningWorkspace = preparePlanningWorkspace(source, seed);
+    stopRequested.current = false;
+    runTokenRef.current = planningWorkspace.automation.runId || nextRunId();
+    setWorkspace(planningWorkspace);
     try {
-      const prompt = buildBlueprintPrompt(seed, source.automation);
-      const blueprint = await requestStructured(prompt, (value) => parseNovelBlueprint(value, seed, source.automation));
+      const { blueprint, draft } = await generateBlueprintStages(planningWorkspace, seed, planningWorkspace.automation);
       onBackup(source, "AI 全书创作前自动备份");
       const nextWorkspace: WorkspaceData = {
         ...blueprint,
         automation: createAutomationState({
-          runId: nextRunId(),
+          runId: planningWorkspace.automation.runId,
           phase: "ready",
           brief: source.automation.brief,
           seeds: source.automation.seeds,
@@ -581,6 +752,7 @@ export default function AutoNovelStudio({
           usage: usageRef.current,
           maxRequests: source.automation.maxRequests,
           maxTokens: source.automation.maxTokens,
+          blueprintDraft: draft,
           updatedAt: new Date().toISOString(),
         }),
       };
@@ -594,20 +766,41 @@ export default function AutoNovelStudio({
       notify(`《${nextWorkspace.project.title}》全书蓝图已生成`);
       if (writeAfter) await writeNovel(nextWorkspace);
     } catch (error) {
+      const paused = stopRequested.current || (error instanceof DOMException && error.name === "AbortError");
       setWorkspace((current) => ({
         ...current,
         automation: {
           ...current.automation,
-          phase: "error",
-          lastError: error instanceof Error ? error.message : "全书蓝图生成失败",
+          phase: paused ? "paused" : "error",
+          lastError: paused ? undefined : error instanceof Error ? error.message : "全书蓝图生成失败",
           usage: usageRef.current,
         },
       }));
-      notify(error instanceof Error ? error.message : "全书蓝图生成失败");
-      setAiBusy(false);
+      notify(paused ? "蓝图生成已暂停，阶段结果已经保存" : error instanceof Error ? error.message : "全书蓝图生成失败");
     } finally {
-      if (!writeAfter) setAiBusy(false);
+      controllerRef.current = null;
+      setBlueprintStage("");
+      if (!writeAfter || stopRequested.current) setAiBusy(false);
     }
+  };
+
+  const redoBlueprintStage = async (stage: 1 | 2 | 3 | 4 | 5) => {
+    const draft = workspace.automation.blueprintDraft;
+    const seed = draft ? workspace.automation.seeds.find((item) => item.id === draft.seedId) : undefined;
+    if (!draft || !seed || aiBusy) return;
+    const labels = ["人物与关系", "世界设定", "故事大纲", "伏笔回收", "逐章目录"];
+    if (!window.confirm(`将从“${labels[stage - 1]}”开始重新生成，并清除依赖它的后续蓝图结果。现有作品会先自动备份，是否继续？`)) return;
+    const source: WorkspaceData = {
+      ...workspace,
+      automation: {
+        ...workspace.automation,
+        phase: "paused",
+        blueprintDraft: restartBlueprintDraft(draft, stage),
+        lastError: undefined,
+        updatedAt: new Date().toISOString(),
+      },
+    };
+    await buildBlueprintFrom(source, seed, false);
   };
 
   const pause = () => {
@@ -640,6 +833,9 @@ export default function AutoNovelStudio({
   };
 
   const selectedSeed = automation.seeds.find((item) => item.id === automation.selectedSeedId);
+  const resumableSeed = automation.blueprintDraft
+    ? automation.seeds.find((item) => item.id === automation.blueprintDraft?.seedId)
+    : undefined;
   const progress = workspace.chapters.length
     ? Math.round(generatedCount / workspace.chapters.length * 100)
     : 0;
@@ -649,7 +845,8 @@ export default function AutoNovelStudio({
       <div className="view-heading">
         <div><span className="eyebrow">AI AUTOPILOT</span><h1>AI 全书创作</h1><p>即使没有灵感，也能从故事选择开始，自动完成蓝图和全书初稿。</p></div>
         <div className="heading-actions">
-          {automation.phase === "writing" ? <button className="secondary-button" onClick={() => backgroundActive ? void onPauseBackground?.() : pause()}><Pause size={16} />暂停</button> : null}
+          {["writing", "planning"].includes(automation.phase) && aiBusy ? <button className="secondary-button" onClick={() => backgroundActive ? void onPauseBackground?.() : pause()}><Pause size={16} />暂停</button> : null}
+          {resumableSeed && ["planning", "paused", "error"].includes(automation.phase) && automation.blueprintDraft && automation.blueprintDraft.completedStage < 5 ? <button className="primary-button" disabled={aiBusy} onClick={() => void buildBlueprintFrom(workspace, resumableSeed, false)}><RotateCcw size={16} />从第 {Math.min(5, automation.blueprintDraft!.completedStage + 1)} 步继续蓝图</button> : null}
           {["paused", "error", "ready"].includes(automation.phase) && workspace.chapters.length ? <><button className="secondary-button" disabled={aiBusy || backgroundBusy} onClick={() => void writeNovel(workspace)}><Play size={16} />浏览器连续写作</button><button className="primary-button" disabled={backgroundBusy || !backgroundConfigured} onClick={() => void onStartBackground?.(workspace)}><Cloud size={16} />{backgroundBusy ? "正在启动…" : "云端后台写作"}</button></> : null}
         </div>
       </div>
@@ -671,7 +868,7 @@ export default function AutoNovelStudio({
 
       <div className="auto-step-grid">
         <article className={automation.seeds.length ? "done" : automation.phase === "ideating" ? "active" : ""}><span>01</span><div><b>故事方向</b><small>无灵感也能生成 3 个选择</small></div>{automation.seeds.length ? <Check size={17} /> : <Lightbulb size={17} />}</article>
-        <article className={workspace.chapters.length && automation.runId ? "done" : automation.phase === "planning" ? "active" : ""}><span>02</span><div><b>全书蓝图</b><small>人物、设定、大纲、伏笔、章节</small></div>{workspace.chapters.length && automation.runId ? <Check size={17} /> : <Route size={17} />}</article>
+        <article className={workspace.chapters.length && automation.runId ? "done" : automation.phase === "planning" ? "active" : ""}><span>02</span><div><b>全书蓝图</b><small>{automation.phase === "planning" && blueprintStage ? blueprintStage : "人物 → 设定 → 大纲 → 伏笔 → 章节"}</small></div>{workspace.chapters.length && automation.runId ? <Check size={17} /> : automation.phase === "planning" ? <LoaderCircle className="spin" size={17} /> : <Route size={17} />}</article>
         <article className={automation.phase === "completed" ? "done" : automation.phase === "writing" ? "active" : ""}><span>03</span><div><b>连续写作</b><small>逐章分段，随时暂停续跑</small></div>{automation.phase === "completed" ? <Check size={17} /> : <PenLine size={17} />}</article>
         <article className={automation.phase === "completed" ? "done" : ""}><span>04</span><div><b>完稿交付</b><small>进入章节审阅并导出全书</small></div><BookOpenCheck size={17} /></article>
       </div>
@@ -703,6 +900,13 @@ export default function AutoNovelStudio({
           </article>)}
         </div>
         <div className="auto-seed-actions"><span>应用蓝图前会自动备份当前作品。</span><button className="primary-button" disabled={!selectedSeed || aiBusy} onClick={() => selectedSeed && void buildBlueprint(selectedSeed)}><WandSparkles size={16} />采用此方向并生成全书蓝图</button><button className="secondary-button" disabled={aiBusy} onClick={() => { const chosen = automation.seeds.find((item) => item.recommended) || automation.seeds[0]; patchAutomation({ selectedSeedId: chosen.id }); void buildBlueprint(chosen); }}><BrainCircuit size={16} />AI 替我选择</button></div>
+      </section>}
+
+      {automation.blueprintDraft?.completedStage === 5 && selectedSeed && <section className="auto-settings-card card">
+        <div className="auto-section-title"><div><span>蓝图维护</span><h2>单独重做一个阶段</h2></div><small>重做上游阶段会自动刷新依赖它的后续阶段</small></div>
+        <div className="heading-actions">
+          {(["人物与关系", "世界设定", "故事大纲", "伏笔回收", "逐章目录"] as const).map((label, index) => <button key={label} className="secondary-button compact" disabled={aiBusy || automation.phase === "writing"} onClick={() => void redoBlueprintStage((index + 1) as 1 | 2 | 3 | 4 | 5)}><RotateCcw size={14} />重做{label}</button>)}
+        </div>
       </section>}
 
       {automation.runId && workspace.chapters.length > 0 && <section className="auto-progress-card card">

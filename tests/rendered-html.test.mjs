@@ -171,6 +171,23 @@ test("blocks private and malformed AI proxy endpoints", async () => {
   }
 });
 
+test("rejects malformed cloud project revisions before saving", async () => {
+  const worker = await workerPromise;
+  const response = await worker.fetch(
+    new Request("http://localhost/api/projects", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workspace: { project: { title: "版本测试" } }, expectedRevision: "1" }),
+    }),
+    env,
+    context,
+  );
+
+  assert.equal(response.status, 400);
+  const payload = await response.json();
+  assert.match(payload.error, /版本号无效/);
+});
+
 test("requires an authenticated owner for hosted cloud projects", async () => {
   const worker = await workerPromise;
   const response = await worker.fetch(

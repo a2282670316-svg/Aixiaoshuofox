@@ -99,7 +99,7 @@ const navItems: Array<{ label: NavKey; icon: typeof PenLine }> = [
 
 type AIResult = { task: string; text: string; chapterId?: string };
 type WorkspaceBackup = { id: string; label: string; createdAt: string; workspace: WorkspaceData };
-type CloudProjectSummary = { id: string; title: string; genre: string; status: string; createdAt: string; updatedAt: string };
+type CloudProjectSummary = { id: string; title: string; genre: string; status: string; createdAt: string; updatedAt: string; revision: number };
 type BackgroundConfiguration = { apiKey: boolean; model: string; baseUrl?: string; provider?: string; webhookSecret: boolean; workerSecret?: boolean };
 
 function id(prefix: string) {
@@ -172,7 +172,9 @@ export default function Home() {
   const searchRef = useRef<HTMLInputElement>(null);
   const toastTimer = useRef<number | null>(null);
   const activeCloudProjectIdRef = useRef<string | null>(null);
+  const activeCloudRevisionRef = useRef<number | null>(null);
   const cloudBootstrappedRef = useRef(false);
+  const cloudSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
 
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => {
@@ -230,14 +232,18 @@ export default function Home() {
   useEffect(() => {
     if (!hydrated || !activeCloudProjectId || !cloudBootstrappedRef.current || workspace.automation.phase === "writing") return;
     const timer = window.setTimeout(() => {
-      void fetch("/api/projects", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ projectId: activeCloudProjectId, workspace }),
-      }).then(async (response) => {
+      cloudSaveQueueRef.current = cloudSaveQueueRef.current.then(async () => {
+        const response = await fetch("/api/projects", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ projectId: activeCloudProjectId, workspace, expectedRevision: activeCloudRevisionRef.current }),
+        });
+        const payload = await response.json().catch(() => ({})) as { project?: { revision?: number }; error?: string; conflict?: boolean };
         if (!response.ok) {
-          const payload = await response.json().catch(() => ({})) as { error?: string };
           setCloudError(payload.error || "云端自动保存失败");
+        } else if (payload.project?.revision) {
+          activeCloudRevisionRef.current = payload.project.revision;
+          setCloudError("");
         }
       }).catch(() => setCloudError("云端自动保存失败，当前内容仍保存在本机"));
     }, 1800);
@@ -252,10 +258,11 @@ export default function Home() {
     }
     void fetch(`/api/projects?id=${encodeURIComponent(activeCloudProjectId)}`)
       .then(async (response) => {
-        const payload = await response.json().catch(() => ({})) as { project?: { workspace?: unknown }; error?: string };
+        const payload = await response.json().catch(() => ({})) as { project?: { workspace?: unknown; revision?: number }; error?: string };
         if (!response.ok || !payload.project?.workspace) throw new Error(payload.error || "云端恢复失败");
         const restored = normalizeWorkspaceData(payload.project.workspace, DEMO_WORKSPACE);
         setWorkspace(restored);
+        if (payload.project.revision) activeCloudRevisionRef.current = payload.project.revision;
         setBackgroundActive(restored.project.status === "AI 后台创作中" && restored.automation.phase === "writing");
         setChapterId(restored.chapters[0]?.id || "");
         setCharacterId(restored.characters[0]?.id || "");
@@ -277,10 +284,11 @@ export default function Home() {
     const sync = async () => {
       try {
         const response = await fetch(`/api/automation/background?projectId=${encodeURIComponent(activeCloudProjectId)}`);
-        const payload = await response.json() as { project?: { workspace?: unknown }; active?: { status?: string } | null; configuration?: BackgroundConfiguration; error?: string };
+        const payload = await response.json() as { project?: { workspace?: unknown; revision?: number }; active?: { status?: string } | null; configuration?: BackgroundConfiguration; error?: string };
         if (!response.ok || !payload.project?.workspace) throw new Error(payload.error || "读取后台进度失败");
         const next = normalizeWorkspaceData(payload.project.workspace, DEMO_WORKSPACE);
         setWorkspace(next);
+        if (payload.project.revision) activeCloudRevisionRef.current = payload.project.revision;
         if (payload.configuration) setBackgroundConfiguration(payload.configuration);
         const stillActive = ["queued", "processing"].includes(payload.active?.status || "") && next.automation.phase === "writing";
         setBackgroundActive(stillActive);
@@ -376,9 +384,14 @@ export default function Home() {
     notify("已恢复所选作品备份");
   };
 
-  const rememberActiveCloudProject = (projectId: string | null) => {
+  const rememberActiveCloudProject = (projectId: string | null, revision?: number) => {
     activeCloudProjectIdRef.current = projectId;
     setActiveCloudProjectId(projectId);
+    if (revision !== undefined) {
+      activeCloudRevisionRef.current = revision;
+    } else if (!projectId) {
+      activeCloudRevisionRef.current = null;
+    }
     if (projectId) localStorage.setItem(ACTIVE_PROJECT_KEY, projectId);
     else localStorage.removeItem(ACTIVE_PROJECT_KEY);
   };
@@ -407,6 +420,7 @@ export default function Home() {
     setCloudBusy(true);
     setCloudError("");
     try {
+      await cloudSaveQueueRef.current;
       const projectId = createCopy ? undefined : activeCloudProjectIdRef.current || undefined;
       const response = await fetch("/api/projects", {
         method: "POST",
@@ -414,13 +428,14 @@ export default function Home() {
         body: JSON.stringify({
           projectId,
           workspace: source,
+          expectedRevision: projectId ? activeCloudRevisionRef.current : undefined,
           createSnapshot: Boolean(projectId),
           snapshotLabel: createCopy ? "复制作品" : "手动云端保存前快照",
         }),
       });
-      const payload = await response.json().catch(() => ({})) as { projectId?: string; error?: string };
+      const payload = await response.json().catch(() => ({})) as { projectId?: string; project?: { revision?: number }; error?: string; conflict?: boolean };
       if (!response.ok || !payload.projectId) throw new Error(payload.error || "保存云端作品失败");
-      rememberActiveCloudProject(payload.projectId);
+      rememberActiveCloudProject(payload.projectId, payload.project?.revision);
       notify(createCopy ? "已复制为新的云端作品" : "作品已保存到云端");
       await loadCloudProjects();
       return payload.projectId;
@@ -483,7 +498,7 @@ export default function Home() {
     setCloudError("");
     try {
       const response = await fetch(`/api/projects?id=${encodeURIComponent(projectId)}`);
-      const payload = await response.json().catch(() => ({})) as { project?: { workspace?: unknown }; error?: string };
+      const payload = await response.json().catch(() => ({})) as { project?: { workspace?: unknown; revision?: number }; error?: string };
       if (!response.ok || !payload.project?.workspace) throw new Error(payload.error || "读取云端作品失败");
       const next = normalizeWorkspaceData(payload.project.workspace, DEMO_WORKSPACE);
       createBackup(workspace, "切换云端作品前自动备份");
@@ -491,7 +506,7 @@ export default function Home() {
       setBackgroundActive(next.project.status === "AI 后台创作中" && next.automation.phase === "writing");
       setChapterId(next.chapters[0]?.id || "");
       setCharacterId(next.characters[0]?.id || "");
-      rememberActiveCloudProject(projectId);
+      rememberActiveCloudProject(projectId, payload.project.revision);
       setProjectLibraryOpen(false);
       notify(`已打开《${next.project.title}》`);
     } catch (error) {
@@ -547,9 +562,10 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ projectId: activeCloudProjectIdRef.current, workspace: source, step }),
       });
-      const payload = await response.json().catch(() => ({})) as { projectId?: string; error?: string };
+      const payload = await response.json().catch(() => ({})) as { projectId?: string; revision?: number; error?: string };
       if (!response.ok || !payload.projectId) throw new Error(payload.error || "云端检查点保存失败");
-      if (activeCloudProjectIdRef.current !== payload.projectId) rememberActiveCloudProject(payload.projectId);
+      if (activeCloudProjectIdRef.current !== payload.projectId) rememberActiveCloudProject(payload.projectId, payload.revision);
+      else if (payload.revision) activeCloudRevisionRef.current = payload.revision;
       setCloudError("");
     } catch (error) {
       setCloudError(error instanceof Error ? `${error.message}；已继续使用本地检查点` : "云端检查点失败；已继续使用本地检查点");
