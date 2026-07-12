@@ -28,6 +28,17 @@ export const DEMO_WORKSPACE: WorkspaceData = {
     targetChapters: 48,
     writingStyle: "克制、冷峻、富有电影感，重视环境意象与细节伏笔",
     pointOfView: "第三人称限知 · 沈砚",
+    bookContract: {
+      readingPromise: "跟随调查记者逐层破解雾港旧案，每卷获得可验证的新证据，同时保留超自然与人为解释的双重悬念。",
+      protagonistFantasy: "主角凭调查、推理与承担代价的勇气，穿透地方权力和家族沉默，夺回解释父亲与自身过去的权利。",
+      coreSellingPoint: "海雾港城的电影感调查、会变化的匿名信、潮汐限定密道，以及不断改写亲情记忆的证词谜局。",
+      chapter3Payoff: "确认匿名信能准确预告下一起失踪，并让沈砚拿到父亲留下的第一件可验证证物。",
+      chapter10Payoff: "揭开黑潮事故并非零伤亡，确认港务档案被系统性替换，核心同盟关系发生第一次破裂。",
+      chapter30Payoff: "证明父亲曾主动参与隐瞒却另有目的，让调查从寻找受害者升级为阻止新港工程销毁最后证据。",
+      escalationLadder: "个人失踪预告 → 十二年前集体失踪 → 官方档案篡改 → 新港工程掩埋证据 → 全城必须为旧事故承担现实代价。",
+      relationshipMainline: "沈砚与林见夏从互相利用、交换半真证据，到因隐瞒决裂，最终在公开真相的代价上重新建立信任。",
+      absoluteRedLines: ["不以纯梦境解释全部谜团", "关键证据必须能在正文中回查", "反派不能靠临终自白一次性交代真相"],
+    },
   },
   ideas: [
     {

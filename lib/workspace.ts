@@ -1,5 +1,6 @@
 import { MAX_STAGE_OUTPUT_TOKENS } from "./ai-limits";
 import { createAutomationState } from "./auto-novel";
+import { EMPTY_BOOK_CONTRACT, sceneCardLabel } from "./story-control";
 import type {
   AutomationPhase,
   BlueprintDraft,
@@ -143,11 +144,24 @@ export function normalizeWorkspaceData(
       : undefined;
     const rawChapterOutline = record(item.chapterOutline);
     const summaryFallback = stringValue(item.summary, "", 20_000);
+    const sceneCards = objects(rawChapterOutline.sceneCards, 12).map((scene, sceneIndex) => ({
+      id: stringValue(scene.id, `scene-${chapterNumber}-${sceneIndex + 1}`, 160),
+      title: stringValue(scene.title, `场景 ${sceneIndex + 1}`, 500),
+      objective: stringValue(scene.objective, "", 4000),
+      conflict: stringValue(scene.conflict, "", 4000),
+      reveal: stringValue(scene.reveal, "", 4000),
+      emotionBeat: stringValue(scene.emotionBeat, "", 4000),
+    }));
     const rawScenes = stringList(rawChapterOutline.scenes, 12);
+    const normalizedScenes = rawScenes.length ? rawScenes : sceneCards.map(sceneCardLabel);
     const chapterOutline = {
       objective: stringValue(rawChapterOutline.objective, summaryFallback || "推进本章核心冲突", 4000),
       opening: stringValue(rawChapterOutline.opening, "承接上一章的未解问题进入场景", 4000),
-      scenes: rawScenes.length ? rawScenes : [summaryFallback || "人物在场景中行动、受阻并做出选择"],
+      scenes: normalizedScenes.length ? normalizedScenes : [summaryFallback || "人物在场景中行动、受阻并做出选择"],
+      ...(sceneCards.length ? { sceneCards } : {}),
+      mustAdvance: stringList(rawChapterOutline.mustAdvance, 20),
+      mustPreserve: stringList(rawChapterOutline.mustPreserve, 20),
+      mustAvoid: stringList(rawChapterOutline.mustAvoid, 20),
       turningPoint: stringValue(rawChapterOutline.turningPoint, "主角做出不可逆选择并付出代价", 4000),
       endingHook: stringValue(rawChapterOutline.endingHook, "以新问题或危机引向下一章", 4000),
       foreshadowActions: objects(rawChapterOutline.foreshadowActions, 20).flatMap((action) => {
@@ -191,6 +205,15 @@ export function normalizeWorkspaceData(
       factEvidence: objects(rawMemory.factEvidence, 200).flatMap((entry) => {
         const fact = stringValue(entry.fact, "", 4000).trim();
         return fact ? [{ fact, quote: typeof entry.quote === "string" ? entry.quote.slice(0, 2000) : undefined, verified: Boolean(entry.verified) }] : [];
+      }),
+      narrativeEvents: objects(rawMemory.narrativeEvents, 100).flatMap((entry, eventIndex) => {
+        const event = stringValue(entry.event, "", 4000).trim();
+        return event ? [{ id: stringValue(entry.id, `event-${chapterNumber}-${eventIndex + 1}`, 200), chapterNumber, event, actualOrder: numberValue(entry.actualOrder, eventIndex + 1, 0, 100000), revealOrder: numberValue(entry.revealOrder, eventIndex + 1, 0, 100000), participants: stringList(entry.participants, 30), location: typeof entry.location === "string" ? entry.location.slice(0, 1000) : undefined, causeIds: stringList(entry.causeIds, 30), effectIds: stringList(entry.effectIds, 30), quote: typeof entry.quote === "string" ? entry.quote.slice(0, 2000) : undefined, verified: Boolean(entry.verified) }] : [];
+      }),
+      knowledgeChanges: objects(rawMemory.knowledgeChanges, 200).flatMap((entry, knowledgeIndex) => {
+        const characterName = stringValue(entry.characterName, "", 200).trim();
+        const fact = stringValue(entry.fact, "", 4000).trim();
+        return characterName && fact ? [{ id: stringValue(entry.id, `knowledge-${chapterNumber}-${knowledgeIndex + 1}`, 200), chapterNumber, characterName, fact, status: enumValue(entry.status, ["knows", "believes", "suspects", "conceals"] as const, "knows"), sourceEventId: typeof entry.sourceEventId === "string" ? entry.sourceEventId.slice(0, 200) : undefined, quote: typeof entry.quote === "string" ? entry.quote.slice(0, 2000) : undefined, verified: Boolean(entry.verified) }] : [];
       }),
       outlineEvidence: objects(rawMemory.outlineEvidence, 100).map((entry, index) => ({
         key: enumValue(entry.key, ["objective", "opening", "scene", "turningPoint", "endingHook"] as const, "scene"),
@@ -237,9 +260,36 @@ export function normalizeWorkspaceData(
     const repairReview = typeof rawRepairReview.beforeVersionId === "string" ? {
       beforeVersionId: rawRepairReview.beforeVersionId.slice(0, 200),
       changeSummary: stringValue(rawRepairReview.changeSummary, "", 4000),
+      edits: objects(rawRepairReview.edits, 12).map((entry) => ({
+        oldText: stringValue(entry.oldText, "", 4000),
+        newText: stringValue(entry.newText, "", 4000),
+        reason: stringValue(entry.reason, "", 1000),
+      })).filter((entry) => entry.oldText && entry.newText),
+      outlineEvidence: objects(rawRepairReview.outlineEvidence, 100).map((entry, index) => ({
+        key: enumValue(entry.key, ["objective", "opening", "scene", "turningPoint", "endingHook"] as const, "scene"),
+        label: stringValue(entry.label, `outline-${index + 1}`, 1000),
+        status: enumValue(entry.status, ["executed", "partial", "missing"] as const, "missing"),
+        score: numberValue(entry.score, 0, 0, 100),
+        evidence: typeof entry.evidence === "string" ? entry.evidence.slice(0, 4000) : undefined,
+        quote: typeof entry.quote === "string" ? entry.quote.slice(0, 2000) : undefined,
+        verified: Boolean(entry.verified),
+      })),
       createdAt: dateValue(rawRepairReview.createdAt),
       status: enumValue(rawRepairReview.status, ["pending", "accepted", "reverted"] as const, "pending"),
     } : undefined;
+    const rawContextManifest = record(item.contextManifest);
+    const contextManifest = Number.isInteger(rawContextManifest.chapterNumber) ? {
+      chapterNumber: numberValue(rawContextManifest.chapterNumber, chapterNumber, 1, 9999),
+      generatedAt: dateValue(rawContextManifest.generatedAt),
+      budgetTokens: numberValue(rawContextManifest.budgetTokens, 16000, 1000, 1000000),
+      estimatedTokens: numberValue(rawContextManifest.estimatedTokens, 0, 0, 1000000),
+      items: objects(rawContextManifest.items, 100).map((entry, manifestIndex) => ({ id: stringValue(entry.id, `context-${manifestIndex + 1}`, 200), section: stringValue(entry.section, "上下文", 300), source: stringValue(entry.source, "unknown", 500), reason: stringValue(entry.reason, "", 2000), priority: numberValue(entry.priority, 0, 0, 100), included: entry.included === true, estimatedTokens: numberValue(entry.estimatedTokens, 0, 0, 1000000), contentPreview: stringValue(entry.contentPreview, "", 1000) })),
+      warnings: stringList(rawContextManifest.warnings, 30),
+    } : undefined;
+    const candidates = objects(item.candidates, 5).flatMap((entry, candidateIndex) => {
+      const content = stringValue(entry.content, "", 2_000_000);
+      return content ? [{ id: stringValue(entry.id, `candidate-${chapterNumber}-${candidateIndex + 1}`, 200), content, createdAt: dateValue(entry.createdAt), score: numberValue(entry.score, 0, 0, 100), reasons: stringList(entry.reasons, 20), selected: entry.selected === true }] : [];
+    });
     const rawGeneration = record(item.generation);
     const generation = typeof rawGeneration.runId === "string" ? {
       runId: rawGeneration.runId.slice(0, 200),
@@ -266,6 +316,8 @@ export function normalizeWorkspaceData(
       memory,
       quality,
       repairReview,
+      contextManifest,
+      candidates: candidates.length ? candidates : undefined,
       generation,
     };
   }).sort((a, b) => a.number - b.number);
@@ -307,6 +359,10 @@ export function normalizeWorkspaceData(
     suggestedFix: typeof item.suggestedFix === "string" ? item.suggestedFix.slice(0, 10_000) : undefined,
     source: enumValue(item.source, ["local", "ai"] as const, "local"),
     fingerprint: typeof item.fingerprint === "string" ? item.fingerprint.slice(0, 200) : undefined,
+    confidence: ["high", "medium", "low"].includes(String(item.confidence)) ? item.confidence as ConsistencyIssue["confidence"] : undefined,
+    evidenceClass: ["deterministic", "quoted", "inferred", "subjective"].includes(String(item.evidenceClass)) ? item.evidenceClass as ConsistencyIssue["evidenceClass"] : undefined,
+    autoRepairable: typeof item.autoRepairable === "boolean" ? item.autoRepairable : undefined,
+    verificationNote: typeof item.verificationNote === "string" ? item.verificationNote.slice(0, 2000) : undefined,
   }));
 
   const materialIds = new Set<string>();
@@ -372,11 +428,11 @@ export function normalizeWorkspaceData(
         ...(draftStage >= 5 && Object.keys(record(rawBlueprintDraft.chapters)).length ? { chapters: record(rawBlueprintDraft.chapters) } : {}),
       }
     : undefined;
-  const allowedPhases: AutomationPhase[] = ["idle", "ideating", "choosing", "planning", "ready", "writing", "paused", "completed", "error"];
+  const allowedPhases: AutomationPhase[] = ["idle", "ideating", "choosing", "planning", "ready", "writing", "reviewing", "paused", "completed", "error"];
   const storedPhase = enumValue<AutomationPhase>(rawAutomation.phase, allowedPhases, "idle");
   const automation = createAutomationState({
     runId: typeof rawAutomation.runId === "string" ? rawAutomation.runId.slice(0, 200) : undefined,
-    phase: storedPhase === "writing" && !options.preserveWritingPhase ? "paused" : storedPhase,
+    phase: ["writing", "reviewing"].includes(storedPhase) && !options.preserveWritingPhase ? "paused" : storedPhase,
     brief: stringValue(rawAutomation.brief, "", 10_000),
     seeds: normalizeSeeds(rawAutomation.seeds),
     selectedSeedId: typeof rawAutomation.selectedSeedId === "string" ? rawAutomation.selectedSeedId.slice(0, 160) : undefined,
@@ -398,6 +454,7 @@ export function normalizeWorkspaceData(
     },
     maxRequests: numberValue(rawAutomation.maxRequests, 250, 1, 10_000),
     maxTokens: numberValue(rawAutomation.maxTokens, 5_000_000, 1_000, 1_000_000_000),
+    candidateCount: ([1, 2, 3].includes(Number(rawAutomation.candidateCount)) ? Number(rawAutomation.candidateCount) : 1) as 1 | 2 | 3,
     stageModels: Object.fromEntries(Object.entries(record(rawAutomation.stageModels)).flatMap(([stage, value]) => {
       if (!["ideation", "blueprint", "chapter", "memory", "audit", "repair"].includes(stage)) return [];
       const config = record(value);
@@ -420,6 +477,24 @@ export function normalizeWorkspaceData(
     })),
     lastError: typeof rawAutomation.lastError === "string" ? rawAutomation.lastError.slice(0, 2000) : undefined,
     blueprintDraft,
+    finalReview: (() => {
+      const raw = record(rawAutomation.finalReview);
+      if (!Object.keys(raw).length) return undefined;
+      const attempts = record(raw.repairAttempts);
+      return {
+        status: enumValue(raw.status, ["pending", "reviewing", "repairing", "passed", "blocked"] as const, "pending"),
+        round: numberValue(raw.round, 0, 0, 100),
+        issueIds: stringList(raw.issueIds, 1000),
+        repairQueue: Array.from(new Set((Array.isArray(raw.repairQueue) ? raw.repairQueue : []).map((value) => numberValue(value, 0, 0, 9999)).filter(Boolean))).sort((a, b) => a - b),
+        repairAttempts: Object.fromEntries(Object.entries(attempts).flatMap(([key, value]) => {
+          const chapterNumber = numberValue(Number(key), 0, 0, 9999);
+          return chapterNumber ? [[String(chapterNumber), numberValue(value, 0, 0, 20)]] : [];
+        })),
+        startedAt: typeof raw.startedAt === "string" ? dateValue(raw.startedAt) : undefined,
+        completedAt: typeof raw.completedAt === "string" ? dateValue(raw.completedAt) : undefined,
+        lastError: typeof raw.lastError === "string" ? raw.lastError.slice(0, 2000) : undefined,
+      };
+    })(),
     updatedAt: typeof rawAutomation.updatedAt === "string" ? dateValue(rawAutomation.updatedAt) : undefined,
   } as Partial<NovelAutomation>);
 
@@ -465,7 +540,71 @@ export function normalizeWorkspaceData(
       level: enumValue(item.level, ["author", "text", "ai_verified", "inferred"] as const, "inferred"),
       evidence: typeof item.evidence === "string" ? item.evidence.slice(0, 2000) : undefined,
     })),
+    narrativeEvents: objects(rawCanon.narrativeEvents, 10000).flatMap((item, index) => {
+      const event = stringValue(item.event, "", 4000).trim();
+      return event ? [{ id: stringValue(item.id, `event-${index + 1}`, 200), chapterNumber: numberValue(item.chapterNumber, 1, 1, 9999), event, actualOrder: numberValue(item.actualOrder, index + 1, 0, 1000000), revealOrder: numberValue(item.revealOrder, index + 1, 0, 1000000), participants: stringList(item.participants, 30), location: typeof item.location === "string" ? item.location.slice(0, 1000) : undefined, causeIds: stringList(item.causeIds, 30), effectIds: stringList(item.effectIds, 30), quote: typeof item.quote === "string" ? item.quote.slice(0, 2000) : undefined, verified: Boolean(item.verified) }] : [];
+    }),
+    knowledgeStates: objects(rawCanon.knowledgeStates, 10000).flatMap((item, index) => {
+      const characterName = stringValue(item.characterName, "", 200).trim();
+      const fact = stringValue(item.fact, "", 4000).trim();
+      return characterName && fact ? [{ id: stringValue(item.id, `knowledge-${index + 1}`, 200), chapterNumber: numberValue(item.chapterNumber, 1, 1, 9999), characterName, fact, status: enumValue(item.status, ["knows", "believes", "suspects", "conceals"] as const, "knows"), sourceEventId: typeof item.sourceEventId === "string" ? item.sourceEventId.slice(0, 200) : undefined, quote: typeof item.quote === "string" ? item.quote.slice(0, 2000) : undefined, verified: Boolean(item.verified) }] : [];
+    }),
     lastAuditedChapter: numberValue(rawCanon.lastAuditedChapter, 0, 0, 9999),
+  };
+
+  const rawStoryControl = record(source.storyControl);
+  const rawSnapshot = record(rawStoryControl.snapshot);
+  const snapshot = typeof rawSnapshot.projectSignature === "string" ? {
+    createdAt: dateValue(rawSnapshot.createdAt),
+    projectSignature: stringValue(rawSnapshot.projectSignature, "", 200_000),
+    bookContractSignature: stringValue(rawSnapshot.bookContractSignature, "", 200_000),
+    characters: objects(rawSnapshot.characters, 200).map((item) => ({ id: stringValue(item.id, "", 160), label: stringValue(item.label, "", 300), signature: stringValue(item.signature, "", 20_000) })).filter((item) => item.id),
+    world: objects(rawSnapshot.world, 300).map((item) => ({ id: stringValue(item.id, "", 160), label: stringValue(item.label, "", 300), signature: stringValue(item.signature, "", 40_000) })).filter((item) => item.id),
+    outline: objects(rawSnapshot.outline, 300).map((item) => ({ id: stringValue(item.id, "", 160), label: stringValue(item.label, "", 300), signature: stringValue(item.signature, "", 40_000) })).filter((item) => item.id),
+  } : undefined;
+  const storyControl = {
+    ...(snapshot ? { snapshot } : {}),
+    propagationDebts: objects(rawStoryControl.propagationDebts, 100).map((item, index) => ({
+      id: stringValue(item.id, `debt-${index + 1}`, 200),
+      sourceType: enumValue(item.sourceType, ["整书契约", "人物", "世界规则", "大纲"] as const, "整书契约"),
+      sourceId: stringValue(item.sourceId, "unknown", 200),
+      sourceTitle: stringValue(item.sourceTitle, "未命名设定", 500),
+      changeType: enumValue(item.changeType, ["新增", "修改", "删除"] as const, "修改"),
+      reason: stringValue(item.reason, "设定发生变化，需要重新审校受影响章节。", 4000),
+      affectedChapters: Array.isArray(item.affectedChapters) ? item.affectedChapters.map(Number).filter((value) => Number.isInteger(value) && value > 0 && value <= 9999).slice(0, 200) : [],
+      createdAt: dateValue(item.createdAt),
+      status: enumValue(item.status, ["待复审", "复审中", "已清偿"] as const, "待复审"),
+    })),
+    storylines: objects(rawStoryControl.storylines, 200).map((item, index) => ({
+      id: stringValue(item.id, `storyline-${index + 1}`, 200),
+      title: stringValue(item.title, `故事线 ${index + 1}`, 500),
+      type: enumValue(item.type, ["主线", "感情线", "人物线", "谜题线"] as const, "人物线"),
+      status: enumValue(item.status, ["活跃", "停滞", "待回收", "已完成"] as const, "活跃"),
+      summary: stringValue(item.summary, "", 8000),
+      characterIds: stringList(item.characterIds, 100).filter((id) => characterIds.has(id)),
+      openedChapter: numberValue(item.openedChapter, 1, 1, 9999),
+      lastAdvancedChapter: numberValue(item.lastAdvancedChapter, 1, 0, 9999),
+      targetChapter: item.targetChapter === undefined ? undefined : numberValue(item.targetChapter, 1, 1, 9999),
+      linkedThreadId: typeof item.linkedThreadId === "string" ? item.linkedThreadId.slice(0, 200) : undefined,
+    })),
+    writingPreferences: (() => {
+      const preference = record(rawStoryControl.writingPreferences);
+      if (!Object.keys(preference).length) return undefined;
+      return { version: 1 as const, updatedAt: dateValue(preference.updatedAt), acceptedCandidateSignals: stringList(preference.acceptedCandidateSignals, 20), rejectedCandidateSignals: stringList(preference.rejectedCandidateSignals, 20), preferredPacing: enumValue(preference.preferredPacing, ["fast", "balanced", "slow"] as const, "balanced"), preferredDialogueRatio: enumValue(preference.preferredDialogueRatio, ["low", "balanced", "high"] as const, "balanced"), notes: stringList(preference.notes, 20) };
+    })(),
+    resourceLedger: objects(rawStoryControl.resourceLedger, 300).map((item, index) => ({
+      id: stringValue(item.id, `resource-${index + 1}`, 200),
+      ownerId: typeof item.ownerId === "string" && characterIds.has(item.ownerId) ? item.ownerId : undefined,
+      ownerName: stringValue(item.ownerName, "全局", 300),
+      type: enumValue(item.type, ["金钱", "伤势", "道具", "秘密", "能力"] as const, "道具"),
+      name: stringValue(item.name, `资源 ${index + 1}`, 500),
+      state: stringValue(item.state, "", 4000),
+      quantity: item.quantity === undefined ? undefined : numberValue(item.quantity, 0, -1_000_000_000, 1_000_000_000),
+      unit: typeof item.unit === "string" ? item.unit.slice(0, 100) : undefined,
+      lastChapter: numberValue(item.lastChapter, 0, 0, 9999),
+      source: enumValue(item.source, ["manual", "canon"] as const, "manual"),
+      status: enumValue(item.status, ["持有", "消耗", "丢失", "解决"] as const, "持有"),
+    })),
   };
 
   return {
@@ -479,6 +618,23 @@ export function normalizeWorkspaceData(
       targetChapters: numberValue(rawProject.targetChapters, fallback.project.targetChapters, 1, 200),
       writingStyle: stringValue(rawProject.writingStyle, fallback.project.writingStyle, 20_000),
       pointOfView: stringValue(rawProject.pointOfView, fallback.project.pointOfView, 1000),
+      bookContract: (() => {
+        const sourceContract = record(rawProject.bookContract);
+        const fallbackContract = fallback.project.bookContract || EMPTY_BOOK_CONTRACT;
+        return {
+          readingPromise: stringValue(sourceContract.readingPromise, fallbackContract.readingPromise, 4000),
+          protagonistFantasy: stringValue(sourceContract.protagonistFantasy, fallbackContract.protagonistFantasy, 4000),
+          coreSellingPoint: stringValue(sourceContract.coreSellingPoint, fallbackContract.coreSellingPoint, 4000),
+          chapter3Payoff: stringValue(sourceContract.chapter3Payoff, fallbackContract.chapter3Payoff, 4000),
+          chapter10Payoff: stringValue(sourceContract.chapter10Payoff, fallbackContract.chapter10Payoff, 4000),
+          chapter30Payoff: stringValue(sourceContract.chapter30Payoff, fallbackContract.chapter30Payoff, 4000),
+          escalationLadder: stringValue(sourceContract.escalationLadder, fallbackContract.escalationLadder, 8000),
+          relationshipMainline: stringValue(sourceContract.relationshipMainline, fallbackContract.relationshipMainline, 8000),
+          absoluteRedLines: stringList(sourceContract.absoluteRedLines, 30).length
+            ? stringList(sourceContract.absoluteRedLines, 30)
+            : [...fallbackContract.absoluteRedLines],
+        };
+      })(),
     },
     ideas,
     world,
@@ -491,6 +647,7 @@ export function normalizeWorkspaceData(
     versions,
     canon,
     automation,
+    storyControl,
   };
 }
 
@@ -510,6 +667,7 @@ export function createBlankWorkspace(fallback: WorkspaceData): WorkspaceData {
       targetChapters: 16,
       writingStyle: "",
       pointOfView: "第三人称限知",
+      bookContract: { ...EMPTY_BOOK_CONTRACT, absoluteRedLines: [] },
     },
     ideas: [],
     world: [],
@@ -536,6 +694,7 @@ export function createBlankWorkspace(fallback: WorkspaceData): WorkspaceData {
       maxRequests: fallback.automation.maxRequests,
       maxTokens: fallback.automation.maxTokens,
     }),
+    storyControl: { propagationDebts: [], storylines: [], resourceLedger: [] },
   };
 }
 

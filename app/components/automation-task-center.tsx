@@ -17,13 +17,13 @@ type Props = {
 };
 
 function phaseLabel(phase: NovelAutomation["phase"]) {
-  return ({ idle: "\u5c1a\u672a\u5f00\u59cb", ideating: "\u6b63\u5728\u751f\u6210\u6545\u4e8b\u65b9\u5411", choosing: "\u7b49\u5f85\u9009\u62e9\u6545\u4e8b", planning: "\u6b63\u5728\u642d\u5efa\u5168\u4e66\u84dd\u56fe", ready: "\u84dd\u56fe\u5df2\u5c31\u7eea", writing: "\u6b63\u5728\u8fde\u7eed\u5199\u4f5c", paused: "\u5df2\u6682\u505c\uff0c\u53ef\u7ee7\u7eed", completed: "\u5168\u4e66\u521d\u7a3f\u5df2\u5b8c\u6210", error: "\u4efb\u52a1\u9047\u5230\u95ee\u9898" } as const)[phase];
+  return ({ idle: "\u5c1a\u672a\u5f00\u59cb", ideating: "\u6b63\u5728\u751f\u6210\u6545\u4e8b\u65b9\u5411", choosing: "\u7b49\u5f85\u9009\u62e9\u6545\u4e8b", planning: "\u6b63\u5728\u642d\u5efa\u5168\u4e66\u84dd\u56fe", ready: "\u84dd\u56fe\u5df2\u5c31\u7eea", writing: "\u6b63\u5728\u8fde\u7eed\u5199\u4f5c", reviewing: "\u6b63\u5728\u8fdb\u884c\u5168\u4e66\u7ec8\u5ba1", paused: "\u5df2\u6682\u505c\uff0c\u53ef\u7ee7\u7eed", completed: "\u5168\u4e66\u7ec8\u5ba1\u5df2\u901a\u8fc7", error: "\u4efb\u52a1\u9047\u5230\u95ee\u9898" } as const)[phase];
 }
 
 function kindLabel(kind: string) {
   return ({
     blueprint_foundation: "\u4eba\u7269\u4e0e\u5173\u7cfb", blueprint_world: "\u4e16\u754c\u8bbe\u5b9a", blueprint_outline: "\u6545\u4e8b\u5927\u7eb2", blueprint_foreshadows: "\u4f0f\u7b14\u56de\u6536", blueprint_chapters: "\u9010\u7ae0\u76ee\u5f55",
-    chapter_segment: "\u6574\u7ae0\u6b63\u6587", chapter_memory: "\u7ae0\u8282\u8bb0\u5fc6", rolling_audit: "\u4e00\u81f4\u6027\u5ba1\u6821", consistency_repair: "\u4e00\u81f4\u6027\u4fee\u590d",
+    chapter_segment: "\u6574\u7ae0\u6b63\u6587", chapter_memory: "\u7ae0\u8282\u8bb0\u5fc6", rolling_audit: "\u4e00\u81f4\u6027\u5ba1\u6821", consistency_repair: "\u4e00\u81f4\u6027\u4fee\u590d", whole_book_audit: "\u5168\u4e66\u7ec8\u5ba1", whole_book_repair: "\u5168\u4e66\u8fd4\u4fee", whole_book_memory_reaudit: "\u8bb0\u5fc6\u91cd\u5efa\u4e0e\u590d\u5ba1", whole_book_accepted: "\u5168\u4e66\u9a8c\u6536\u5b8c\u6210",
   } as Record<string, string>)[kind] || kind.replaceAll("_", " ");
 }
 

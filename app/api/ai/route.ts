@@ -13,6 +13,7 @@ type AIRequestBody = {
   reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh";
   verbosity?: "low" | "medium" | "high";
   maxOutputTokens?: number;
+  stream?: boolean;
   prompt?: string;
 };
 
@@ -108,6 +109,114 @@ function extractText(payload: Record<string, unknown>) {
   return "";
 }
 
+function encodeSSE(event: "delta" | "done" | "error", data: Record<string, unknown>) {
+  return new TextEncoder().encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+}
+
+function normalizedProviderStream(upstream: Response, mode: "chat" | "responses", onFinalize: () => void) {
+  if (!upstream.body) throw new Error("模型没有返回流式响应");
+  const reader = upstream.body.getReader();
+  const decoder = new TextDecoder();
+  let closed = false;
+  let finalized = false;
+  const finalize = () => {
+    if (finalized) return;
+    finalized = true;
+    onFinalize();
+  };
+  return new ReadableStream<Uint8Array>({
+    async start(controller) {
+      let buffer = "";
+      let usage: Record<string, unknown> | undefined;
+      let finishReason: string | undefined;
+      const fail = (message: string) => {
+        if (closed) return;
+        controller.enqueue(encodeSSE("error", { error: message }));
+        closed = true;
+        controller.close();
+      };
+      const emitDone = () => {
+        if (closed) return;
+        controller.enqueue(encodeSSE("done", { usage, finishReason, apiMode: mode }));
+        closed = true;
+        controller.close();
+      };
+      const processBlock = (block: string) => {
+        const data = block.split("\n").filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trimStart()).join("\n");
+        if (!data) return;
+        if (data === "[DONE]") return emitDone();
+        let payload: Record<string, unknown>;
+        try {
+          const parsed = JSON.parse(data) as unknown;
+          if (!isRecord(parsed)) return;
+          payload = parsed;
+        } catch {
+          return;
+        }
+        if (mode === "chat") {
+          const choices = payload.choices as Array<Record<string, unknown>> | undefined;
+          const delta = choices?.[0]?.delta as Record<string, unknown> | undefined;
+          const content = delta?.content;
+          const text = typeof content === "string" ? content : Array.isArray(content)
+            ? content.map((part) => isRecord(part) && typeof part.text === "string" ? part.text : "").join("")
+            : "";
+          if (text) controller.enqueue(encodeSSE("delta", { text }));
+          if (isRecord(payload.usage)) usage = payload.usage;
+          if (typeof choices?.[0]?.finish_reason === "string") finishReason = choices[0].finish_reason;
+          if (finishReason === "length") fail("模型输出因长度限制被截断，请提高输出上限或减少单次生成内容");
+          return;
+        }
+        const eventType = typeof payload.type === "string" ? payload.type : "";
+        if (eventType === "response.output_text.delta" && typeof payload.delta === "string") {
+          controller.enqueue(encodeSSE("delta", { text: payload.delta }));
+        }
+        if (eventType === "response.completed") {
+          const response = isRecord(payload.response) ? payload.response : payload;
+          if (isRecord(response.usage)) usage = response.usage;
+          emitDone();
+        }
+        if (eventType === "response.incomplete") {
+          const response = isRecord(payload.response) ? payload.response : payload;
+          const details = isRecord(response.incomplete_details) ? response.incomplete_details : undefined;
+          finishReason = typeof details?.reason === "string" ? details.reason : "incomplete";
+          fail("模型输出因长度限制被截断，请提高输出上限或减少单次生成内容");
+        }
+        if (eventType === "error") {
+          const error = isRecord(payload.error) ? payload.error : payload;
+          fail(typeof error.message === "string" ? error.message : "模型流式输出失败");
+        }
+      };
+      try {
+        while (!closed) {
+          const chunk = await reader.read();
+          buffer += decoder.decode(chunk.value || new Uint8Array(), { stream: !chunk.done }).replace(/\r\n/g, "\n");
+          let boundary = buffer.indexOf("\n\n");
+          while (boundary >= 0 && !closed) {
+            const block = buffer.slice(0, boundary);
+            buffer = buffer.slice(boundary + 2);
+            processBlock(block);
+            boundary = buffer.indexOf("\n\n");
+          }
+          if (chunk.done) break;
+        }
+        if (!closed && buffer.trim()) processBlock(buffer);
+        if (!closed) emitDone();
+      } catch (error) {
+        fail(error instanceof Error ? error.message : "读取模型流式响应失败");
+      } finally {
+        await reader.cancel().catch(() => undefined);
+        finalize();
+      }
+    },
+    async cancel() {
+      closed = true;
+      finalize();
+      await reader.cancel().catch(() => undefined);
+    },
+  });
+}
+
+
 export async function POST(request: Request) {
   const requestOrigin = request.headers.get("origin");
   if (requestOrigin && requestOrigin !== new URL(request.url).origin) {
@@ -167,6 +276,9 @@ export async function POST(request: Request) {
   if (body.verbosity !== undefined && !["low", "medium", "high"].includes(body.verbosity)) {
     return NextResponse.json({ error: "输出详细度无效" }, { status: 400 });
   }
+  if (body.stream !== undefined && typeof body.stream !== "boolean") {
+    return NextResponse.json({ error: "流式输出开关必须是布尔值" }, { status: 400 });
+  }
   if (body.apiMode !== undefined && !["auto", "chat", "responses"].includes(body.apiMode)) {
     return NextResponse.json({ error: "接口模式无效" }, { status: 400 });
   }
@@ -190,9 +302,10 @@ export async function POST(request: Request) {
   const slot = reserveAIRequestSlot(request);
   if ("error" in slot) return NextResponse.json({ error: slot.error }, { status: slot.status });
 
+  let releaseDeferredToStream = false;
   try {
     const upstreamSignal = AbortSignal.any([request.signal, AbortSignal.timeout(UPSTREAM_TIMEOUT_MS)]);
-    const callUpstream = (url: string, mode: "chat" | "responses") => fetch(url, {
+    const callUpstream = (url: string, mode: "chat" | "responses", compatibility = false, useMaxCompletionTokens = false, outputTokens = maxOutputTokens) => fetch(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -200,18 +313,20 @@ export async function POST(request: Request) {
       },
       body: JSON.stringify({
         model,
+        ...(body.stream ? { stream: true } : {}),
         ...(mode === "responses" ? {
           instructions: "你是严谨、尊重作者意图的中文长篇小说创作助手。",
-          input: prompt,
-          ...(body.temperature !== undefined ? { temperature } : {}),
-          ...(body.reasoningEffort ? { reasoning: { effort: body.reasoningEffort } } : {}),
-          ...(body.verbosity ? { text: { verbosity: body.verbosity } } : {}),
-          max_output_tokens: maxOutputTokens,
+          input: compatibility ? [{ role: "user", content: [{ type: "input_text", text: prompt }] }] : prompt,
+          ...(!compatibility && body.temperature !== undefined ? { temperature } : {}),
+          ...(!compatibility && body.reasoningEffort ? { reasoning: { effort: body.reasoningEffort } } : {}),
+          ...(!compatibility && body.verbosity ? { text: { verbosity: body.verbosity } } : {}),
+          ...(!compatibility ? { max_output_tokens: outputTokens } : {}),
         } : {
-          temperature,
-          ...(body.reasoningEffort ? { reasoning_effort: body.reasoningEffort } : {}),
-          ...(body.verbosity ? { verbosity: body.verbosity } : {}),
-          max_tokens: maxOutputTokens,
+          ...(!compatibility ? { temperature } : {}),
+          ...(!compatibility && body.reasoningEffort ? { reasoning_effort: body.reasoningEffort } : {}),
+          ...(!compatibility && body.verbosity ? { verbosity: body.verbosity } : {}),
+          ...(useMaxCompletionTokens ? { max_completion_tokens: outputTokens } : { max_tokens: outputTokens }),
+          ...(body.stream && !compatibility ? { stream_options: { include_usage: true } } : {}),
           messages: [
             { role: "system", content: "你是严谨、尊重作者意图的中文长篇小说创作助手。" },
             { role: "user", content: prompt },
@@ -223,6 +338,19 @@ export async function POST(request: Request) {
     });
     let selectedMode = endpoint.mode;
     let upstream = await callUpstream(endpoint.url, selectedMode);
+    let rawPayload = "";
+    if (upstream.status === 400) {
+      rawPayload = await readLimitedText(upstream);
+      const alternateTokenName = selectedMode === "chat" && /max_tokens|max completion|max_completion_tokens/i.test(rawPayload);
+      const requiresListInput = selectedMode === "responses" && /input.{0,40}(?:must be|should be|expected).{0,20}(?:a )?list|list.{0,40}input/i.test(rawPayload);
+      const unsupportedResponseTokenLimit = selectedMode === "responses" && /(?:unsupported|unknown|invalid).{0,40}max_output_tokens|max_output_tokens.{0,40}(?:unsupported|unknown|invalid)/i.test(rawPayload);
+      const hasOptionalParameters = body.temperature !== undefined || Boolean(body.reasoningEffort) || Boolean(body.verbosity);
+      const fallbackOutputTokens = Math.min(maxOutputTokens, 8_192);
+      if (maxOutputTokens > fallbackOutputTokens || hasOptionalParameters || alternateTokenName || requiresListInput || unsupportedResponseTokenLimit) {
+        upstream = await callUpstream(endpoint.url, selectedMode, true, alternateTokenName, fallbackOutputTokens);
+        rawPayload = "";
+      }
+    }
     if (upstream.status === 404 && endpoint.automatic) {
       await upstream.body?.cancel();
       const responsesEndpoint = resolveAIEndpoint(body.baseUrl, {
@@ -231,12 +359,21 @@ export async function POST(request: Request) {
       });
       selectedMode = "responses";
       upstream = await callUpstream(responsesEndpoint.url, selectedMode);
+      rawPayload = "";
     }
 
     if (upstream.status >= 300 && upstream.status < 400) {
       return NextResponse.json({ error: "模型接口不允许重定向" }, { status: 502 });
     }
-    const rawPayload = await readLimitedText(upstream);
+    if (body.stream && upstream.ok && (upstream.headers.get("content-type") || "").includes("text/event-stream")) {
+      const normalizedStream = normalizedProviderStream(upstream, selectedMode, slot.release);
+      releaseDeferredToStream = true;
+      return new Response(normalizedStream, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no" },
+      });
+    }
+    if (!rawPayload) rawPayload = await readLimitedText(upstream);
     const payload = (() => {
       try {
         const parsed = JSON.parse(rawPayload) as unknown;
@@ -247,12 +384,19 @@ export async function POST(request: Request) {
     })();
     if (!upstream.ok) {
       const providerError = payload.error as Record<string, unknown> | string | undefined;
+      const rawError = rawPayload.trim();
       const message =
         typeof providerError === "string"
           ? providerError
           : typeof providerError?.message === "string"
             ? providerError.message
-            : `模型接口返回 ${upstream.status}`;
+            : typeof payload.message === "string"
+              ? payload.message
+              : typeof payload.detail === "string"
+                ? payload.detail
+                : rawError && rawError.length <= 1000 && !/<html|<!doctype/i.test(rawError)
+                  ? rawError
+                  : `模型接口返回 ${upstream.status}`;
       const hint = upstream.status === 404 ? "；请检查接口模式与地址，Responses 地址通常以 /v1/responses 结尾" : "";
       return NextResponse.json({ error: `${message}${hint}` }, { status: upstream.status });
     }
@@ -289,6 +433,6 @@ export async function POST(request: Request) {
           : "无法连接模型接口";
     return NextResponse.json({ error: message }, { status: cancelled ? 499 : timedOut ? 504 : 502 });
   } finally {
-    slot.release();
+    if (!releaseDeferredToStream) slot.release();
   }
 }
