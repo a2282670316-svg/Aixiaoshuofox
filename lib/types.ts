@@ -1,6 +1,7 @@
 export type NavKey =
   | "创作台"
   | "AI 全书"
+  | "整书控制"
   | "灵感"
   | "世界观"
   | "人物"
@@ -12,6 +13,18 @@ export type NavKey =
 
 export type ChapterStatus = "待生成" | "草稿" | "修订中" | "已完成";
 
+export interface BookContract {
+  readingPromise: string;
+  protagonistFantasy: string;
+  coreSellingPoint: string;
+  chapter3Payoff: string;
+  chapter10Payoff: string;
+  chapter30Payoff: string;
+  escalationLadder: string;
+  relationshipMainline: string;
+  absoluteRedLines: string[];
+}
+
 export interface ProjectInfo {
   title: string;
   genre: string;
@@ -22,6 +35,7 @@ export interface ProjectInfo {
   targetChapters: number;
   writingStyle: string;
   pointOfView: string;
+  bookContract?: BookContract;
 }
 
 export interface Idea {
@@ -74,10 +88,23 @@ export interface OutlineBeat {
 
 export type ForeshadowAction = "plant" | "advance" | "resolve";
 
+export interface ChapterSceneCard {
+  id: string;
+  title: string;
+  objective: string;
+  conflict: string;
+  reveal: string;
+  emotionBeat: string;
+}
+
 export interface ChapterOutline {
   objective: string;
   opening: string;
   scenes: string[];
+  sceneCards?: ChapterSceneCard[];
+  mustAdvance?: string[];
+  mustPreserve?: string[];
+  mustAvoid?: string[];
   turningPoint: string;
   endingHook: string;
   foreshadowActions: Array<{
@@ -112,6 +139,8 @@ export interface ChapterQualityReport {
 export interface ChapterRepairReview {
   beforeVersionId: string;
   changeSummary: string;
+  edits?: Array<{ oldText: string; newText: string; reason: string }>;
+  outlineEvidence?: OutlineExecutionEvidence[];
   createdAt: string;
   status: "pending" | "accepted" | "reverted";
 }
@@ -132,6 +161,8 @@ export interface Chapter {
   memory?: ChapterMemory;
   quality?: ChapterQualityReport;
   repairReview?: ChapterRepairReview;
+  contextManifest?: ContextManifest;
+  candidates?: ChapterCandidate[];
   generation?: {
     runId: string;
     status: "planned" | "generating" | "generated" | "audited" | "repairing" | "accepted" | "blocked";
@@ -141,6 +172,84 @@ export interface Chapter {
     draftAttempts?: number;
     acceptedAt?: string;
   };
+}
+
+export type EvidenceClass = "deterministic" | "quoted" | "inferred" | "subjective";
+export type AuditConfidence = "high" | "medium" | "low";
+
+export interface NarrativeEvent {
+  id: string;
+  chapterNumber: number;
+  event: string;
+  actualOrder: number;
+  revealOrder: number;
+  participants: string[];
+  location?: string;
+  causeIds: string[];
+  effectIds: string[];
+  quote?: string;
+  verified: boolean;
+}
+
+export interface KnowledgeState {
+  id: string;
+  chapterNumber: number;
+  characterName: string;
+  fact: string;
+  status: "knows" | "believes" | "suspects" | "conceals";
+  sourceEventId?: string;
+  quote?: string;
+  verified: boolean;
+}
+
+export interface ContextManifestItem {
+  id: string;
+  section: string;
+  source: string;
+  reason: string;
+  priority: number;
+  included: boolean;
+  estimatedTokens: number;
+  contentPreview: string;
+}
+
+export interface ContextManifest {
+  chapterNumber: number;
+  generatedAt: string;
+  budgetTokens: number;
+  estimatedTokens: number;
+  items: ContextManifestItem[];
+  warnings: string[];
+}
+
+export interface PacingPoint {
+  chapterNumber: number;
+  tension: number;
+  action: number;
+  revelation: number;
+  emotion: number;
+  change: number;
+  label: string;
+}
+
+export interface CharacterVoiceProfile {
+  characterName: string;
+  sampleCount: number;
+  averageLength: number;
+  questionRate: number;
+  exclamationRate: number;
+  modalWords: string[];
+  signaturePhrases: string[];
+  updatedThroughChapter: number;
+}
+
+export interface ChapterCandidate {
+  id: string;
+  content: string;
+  createdAt: string;
+  score: number;
+  reasons: string[];
+  selected?: boolean;
 }
 
 export interface ChapterMemory {
@@ -166,6 +275,8 @@ export interface ChapterMemory {
   resolvedThreads: string[];
   establishedFacts: string[];
   outlineEvidence?: OutlineExecutionEvidence[];
+  narrativeEvents?: NarrativeEvent[];
+  knowledgeChanges?: KnowledgeState[];
   foreshadowUpdates?: Array<{
     title: string;
     status: "planted" | "advanced" | "resolved";
@@ -195,6 +306,8 @@ export interface CanonLedger {
   }>;
   threads: Array<{ id: string; title: string; status: "open" | "resolved"; openedChapter: number; resolvedChapter?: number }>;
   facts: Array<{ id: string; chapterNumber: number; fact: string; level?: CanonFactLevel; evidence?: string }>;
+  narrativeEvents?: NarrativeEvent[];
+  knowledgeStates?: KnowledgeState[];
   lastAuditedChapter: number;
 }
 
@@ -211,6 +324,10 @@ export interface ConsistencyIssue {
   suggestedFix?: string;
   source?: "local" | "ai";
   fingerprint?: string;
+  confidence?: AuditConfidence;
+  evidenceClass?: EvidenceClass;
+  autoRepairable?: boolean;
+  verificationNote?: string;
 }
 
 export interface Material {
@@ -243,6 +360,7 @@ export type AutomationPhase =
   | "planning"
   | "ready"
   | "writing"
+  | "reviewing"
   | "paused"
   | "completed"
   | "error";
@@ -336,6 +454,17 @@ export interface AutomationRecoveryData {
   runs: AutomationRecoveryRun[];
 }
 
+export interface WholeBookReviewState {
+  status: "pending" | "reviewing" | "repairing" | "passed" | "blocked";
+  round: number;
+  issueIds: string[];
+  repairQueue: number[];
+  repairAttempts: Record<string, number>;
+  startedAt?: string;
+  completedAt?: string;
+  lastError?: string;
+}
+
 export interface NovelAutomation {
   runId?: string;
   phase: AutomationPhase;
@@ -358,10 +487,87 @@ export interface NovelAutomation {
   maxRequests: number;
   maxTokens: number;
   stageModels?: Partial<Record<AIStage, StageModelConfig>>;
+  candidateCount?: 1 | 2 | 3;
   taskLog?: AutomationTaskLog[];
   lastError?: string;
   blueprintDraft?: BlueprintDraft;
+  finalReview?: WholeBookReviewState;
   updatedAt?: string;
+}
+
+export type StoryControlSourceType = "整书契约" | "人物" | "世界规则" | "大纲";
+export type PropagationDebtStatus = "待复审" | "复审中" | "已清偿";
+
+export interface StoryControlSnapshot {
+  createdAt: string;
+  projectSignature: string;
+  bookContractSignature: string;
+  characters: Array<{ id: string; label: string; signature: string }>;
+  world: Array<{ id: string; label: string; signature: string }>;
+  outline: Array<{ id: string; label: string; signature: string }>;
+}
+
+export interface PropagationDebt {
+  id: string;
+  sourceType: StoryControlSourceType;
+  sourceId: string;
+  sourceTitle: string;
+  changeType: "新增" | "修改" | "删除";
+  reason: string;
+  affectedChapters: number[];
+  createdAt: string;
+  status: PropagationDebtStatus;
+}
+
+export type StorylineType = "主线" | "感情线" | "人物线" | "谜题线";
+export type StorylineStatus = "活跃" | "停滞" | "待回收" | "已完成";
+
+export interface Storyline {
+  id: string;
+  title: string;
+  type: StorylineType;
+  status: StorylineStatus;
+  summary: string;
+  characterIds: string[];
+  openedChapter: number;
+  lastAdvancedChapter: number;
+  targetChapter?: number;
+  linkedThreadId?: string;
+}
+
+export type ResourceLedgerType = "金钱" | "伤势" | "道具" | "秘密" | "能力";
+export type ResourceLedgerStatus = "持有" | "消耗" | "丢失" | "解决";
+
+export interface ResourceLedgerEntry {
+  id: string;
+  ownerId?: string;
+  ownerName: string;
+  type: ResourceLedgerType;
+  name: string;
+  state: string;
+  quantity?: number;
+  unit?: string;
+  lastChapter: number;
+  source: "manual" | "canon";
+  status: ResourceLedgerStatus;
+}
+
+export interface WritingPreferenceProfile {
+  version: 1;
+  updatedAt: string;
+  acceptedCandidateSignals: string[];
+  rejectedCandidateSignals: string[];
+  preferredPacing: "fast" | "balanced" | "slow";
+  preferredDialogueRatio: "low" | "balanced" | "high";
+  notes: string[];
+}
+
+export interface StoryControlState {
+  snapshot?: StoryControlSnapshot;
+  propagationDebts: PropagationDebt[];
+  storylines: Storyline[];
+  resourceLedger: ResourceLedgerEntry[];
+  writingPreferences?: WritingPreferenceProfile;
 }
 
 export interface WorkspaceData {
@@ -377,6 +583,7 @@ export interface WorkspaceData {
   versions: ChapterVersion[];
   canon: CanonLedger;
   automation: NovelAutomation;
+  storyControl?: StoryControlState;
 }
 
 export interface AIConfig {

@@ -1,15 +1,21 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readAIResponse } from "../lib/ai-stream";
 import {
   buildAutomatedChapterPrompt,
   applyConsistencyRepairEdits,
   chapterDraftWordRange,
   buildCharacterContinuityIssues,
+  buildConsistencyRepairPrompt,
   buildRepairDependencyQueue,
+  buildRollingAuditPrompt,
   buildBlueprintChaptersPrompt,
+  buildBlueprintCharactersPrompt,
   buildChapterQualityIssues,
   buildChapterPlanDeviationIssues,
   buildMemoryEvidenceIssues,
+  buildNarrativeHealthIssues,
+  buildMechanicalStyleIssues,
   chapterSegmentObligations,
   applyChapterMemory,
   canonBeforeChapter,
@@ -24,6 +30,7 @@ import {
   evaluateChapterQuality,
   buildForeshadowLedger,
   latestCharacterTracking,
+  mergeRepairOutlineEvidence,
   parseChapterMemory,
   parseBlueprintStage,
   parseNovelBlueprint,
@@ -32,11 +39,13 @@ import {
   parseSeedOptions,
   reserveModelRequest,
   removeChapterFromCanon,
+  recoverOutlineEvidenceValidationBlock,
   replaceChapterAuditIssues,
   restartBlueprintDraft,
   stabilizeRepairAuditIssues,
   unresolvedChapterErrors,
   rewindNovelFromChapter,
+  validateConsistencyRepairOutlineEvidence,
   validateGeneratedChapterDraft,
   validateGeneratedChapterSegment,
 } from "../lib/auto-novel";
@@ -44,7 +53,39 @@ import type { StorySeed, WorkspaceData } from "../lib/types";
 import { DEMO_WORKSPACE } from "../lib/demo-data";
 import { mergeAutomationWorkspace, normalizeWorkspaceData, pruneWorkspaceHistory } from "../lib/workspace";
 import { normalizeAIEndpoint } from "../lib/ai-endpoint";
+import { buildNarrativeIntelligenceIssues, compileContextManifest, contextPayloadFromManifest, deriveCharacterVoiceProfiles, derivePacingCurve, learnWritingPreference, rankChapterCandidates } from "../lib/narrative-intelligence";
 import { reconcileInterruptedTasks, recoverWorkspaceFromStep } from "../lib/workspace-recovery";
+import { buildStoryControlSnapshot, deriveResourceLedger, detectPropagationDebts, mergePropagationDebts, syncStorylinesFromWorkspace } from "../lib/story-governance";
+import {
+  buildWholeBookRepairQueue,
+  clearPropagationDebtsAfterReview,
+  markWholeBookReviewPassed,
+  parseWholeBookAudit,
+  prepareWholeBookReview,
+  removeCanonFromChapterOnward,
+  replaceWholeBookReviewIssues,
+  wholeBookBlockingIssues,
+} from "../lib/whole-book-review";
+
+test("reads normalized SSE deltas incrementally", async () => {
+  const sse = [
+    'event: delta',
+    'data: {"text":"第一段"}',
+    '',
+    'event: delta',
+    'data: {"text":"第二段"}',
+    '',
+    'event: done',
+    'data: {"usage":{"total_tokens":12},"finishReason":"stop","apiMode":"chat"}',
+    '',
+  ].join("\n");
+  const chunks: string[] = [];
+  const payload = await readAIResponse(new Response(sse, { headers: { "content-type": "text/event-stream" } }), (chunk) => chunks.push(chunk));
+  assert.deepEqual(chunks, ["第一段", "第二段"]);
+  assert.equal(payload.text, "第一段第二段");
+  assert.equal(payload.usage?.total_tokens, 12);
+  assert.equal(payload.apiMode, "chat");
+});
 
 test("accepts public HTTP model endpoints and non-default ports", () => {
   assert.equal(
@@ -155,6 +196,45 @@ test("turns a validated blueprint into a complete writable workspace", () => {
   assert.ok(parsed.chapters.every((item) => item.status === "待生成" && item.targetWords === 4000));
   assert.equal(parsed.relationships.length, 1);
   assert.equal(parsed.materials[0].type, "伏笔");
+});
+
+test("preserves a book contract and structured executable scene cards", () => {
+  const complete = JSON.parse(blueprintJson()) as Record<string, unknown>;
+  const project = complete.project as Record<string, unknown>;
+  project.bookContract = {
+    readingPromise: "每章都有可回查的新证据",
+    protagonistFantasy: "凭调查能力夺回真相解释权",
+    coreSellingPoint: "潮汐归来者与停摆手表",
+    chapter3Payoff: "确认归来规则真实存在",
+    chapter10Payoff: "揭穿港务会删改档案",
+    chapter30Payoff: "让全城面对沉船代价",
+    escalationLadder: "个案 → 旧案 → 城市危机",
+    relationshipMainline: "互相试探的同盟走向公开信任",
+    absoluteRedLines: ["证据必须能从正文回查"],
+  };
+  const chapters = complete.chapters as Array<Record<string, unknown>>;
+  chapters[0].scenes = [
+    { title: "退潮现场", objective: "确认归来者身份", conflict: "港务人员封锁现场", reveal: "手表停在同一时刻", emotionBeat: "怀疑转为警觉" },
+    { title: "医院问询", objective: "取得第一份证词", conflict: "归来者强行回忆会昏厥", reveal: "证词提到不存在的船舱", emotionBeat: "希望转为不安" },
+    { title: "档案室", objective: "核对沉船记录", conflict: "关键页被人为替换", reveal: "替换日期就在昨天", emotionBeat: "不安转为决心" },
+  ];
+  chapters[0].mustAdvance = ["确认归潮规则"];
+  chapters[0].mustPreserve = ["林岚尚不知道沉船真相"];
+  chapters[0].mustAvoid = ["不能让反派直接自白"];
+  const settings = createAutomationState({ targetChapters: 4, targetWords: 16000, chapterWords: 4000 });
+  const parsed = parseNovelBlueprint(JSON.stringify(complete), seed, settings);
+
+  assert.equal(parsed.project.bookContract?.coreSellingPoint, "潮汐归来者与停摆手表");
+  assert.equal(parsed.chapters[0].chapterOutline?.sceneCards?.length, 3);
+  assert.match(parsed.chapters[0].chapterOutline?.scenes[0] || "", /目标：确认归来者身份/);
+  assert.deepEqual(parsed.chapters[0].chapterOutline?.mustAvoid, ["不能让反派直接自白"]);
+  assert.match(buildBlueprintCharactersPrompt(seed), /bookContract/);
+  assert.match(buildBlueprintChaptersPrompt(seed, settings, {
+    foundation: { project: complete.project, characters: complete.characters },
+    world: { world: complete.world },
+    outline: { outline: complete.outline },
+    foreshadows: { foreshadows: complete.foreshadows },
+  }), /mustAdvance/);
 });
 
 
@@ -289,6 +369,52 @@ test("normalizes older or partial workspace backups safely", () => {
   assert.equal(normalized.automation.phase, "idle");
   assert.equal(normalized.canon.revision, 0);
   assert.equal(normalized.automation.usage.totalTokens, 0);
+  assert.equal(normalized.project.bookContract?.coreSellingPoint, DEMO_WORKSPACE.project.bookContract?.coreSellingPoint);
+});
+
+test("normalizes persisted scene cards and execution constraints", () => {
+  const normalized = normalizeWorkspaceData({
+    ...DEMO_WORKSPACE,
+    project: { ...DEMO_WORKSPACE.project, title: "场景卡备份", bookContract: { ...DEMO_WORKSPACE.project.bookContract, coreSellingPoint: "结构化场景执行" } },
+    chapters: [{
+      id: "chapter-card",
+      number: 1,
+      title: "第一章",
+      content: "",
+      chapterOutline: {
+        objective: "建立异常",
+        opening: "六点醒来",
+        scenes: [],
+        sceneCards: [{ id: "scene-1", title: "冷柜", objective: "核对遗体", conflict: "记录被重置", reveal: "遗体保留变化", emotionBeat: "怀疑转为确认" }],
+        mustAdvance: ["确认循环"],
+        mustPreserve: ["只有主角保留记忆"],
+        mustAvoid: ["不能提前解释幕后原因"],
+        turningPoint: "预言送达时间",
+        endingHook: "遗体在指认什么",
+        foreshadowActions: [],
+      },
+    }],
+  }, DEMO_WORKSPACE);
+
+  assert.equal(normalized.project.bookContract?.coreSellingPoint, "结构化场景执行");
+  assert.equal(normalized.chapters[0].chapterOutline?.sceneCards?.[0].conflict, "记录被重置");
+  assert.match(normalized.chapters[0].chapterOutline?.scenes[0] || "", /目标：核对遗体/);
+  assert.deepEqual(normalized.chapters[0].chapterOutline?.mustAdvance, ["确认循环"]);
+});
+
+test("normalizes propagation debt, storyline and resource ledger state", () => {
+  const normalized = normalizeWorkspaceData({
+    ...DEMO_WORKSPACE,
+    storyControl: {
+      propagationDebts: [{ id: "debt-1", sourceType: "人物", sourceId: "char-1", sourceTitle: "沈砚", changeType: "修改", reason: "人物目标改变", affectedChapters: [2, 3], createdAt: new Date().toISOString(), status: "待复审" }],
+      storylines: [{ id: "line-1", title: "父亲失踪案", type: "谜题线", status: "待回收", summary: "追查真相", characterIds: ["char-1"], openedChapter: 1, lastAdvancedChapter: 3, targetChapter: 15 }],
+      resourceLedger: [{ id: "resource-1", ownerId: "char-1", ownerName: "沈砚", type: "道具", name: "旧船票", state: "仍在手中", lastChapter: 7, source: "manual", status: "持有" }],
+    },
+  }, DEMO_WORKSPACE);
+
+  assert.deepEqual(normalized.storyControl?.propagationDebts[0].affectedChapters, [2, 3]);
+  assert.equal(normalized.storyControl?.storylines[0].status, "待回收");
+  assert.equal(normalized.storyControl?.resourceLedger[0].name, "旧船票");
 });
 
 test("preserves a valid staged blueprint checkpoint for recovery", () => {
@@ -335,6 +461,85 @@ test("commits chapter memory into the long-form canon ledger", () => {
   assert.equal(updated.canon.threads[0].status, "open");
   assert.equal(updated.canon.facts[0].level, "ai_verified");
   assert.equal(updated.chapters[0].memory?.summary, memory.summary);
+});
+
+test("tracks setting changes as ordered propagation debt", () => {
+  const workspace = structuredClone(DEMO_WORKSPACE);
+  const previous = buildStoryControlSnapshot(workspace);
+  workspace.project.bookContract = { ...workspace.project.bookContract!, readingPromise: "新的读者承诺" };
+  const current = buildStoryControlSnapshot(workspace);
+  const debts = detectPropagationDebts(previous, current, workspace);
+  const drafted = workspace.chapters.filter((chapter) => chapter.content.trim()).map((chapter) => chapter.number).sort((a, b) => a - b);
+
+  assert.equal(debts.length, 1);
+  assert.equal(debts[0].sourceType, "整书契约");
+  assert.deepEqual(debts[0].affectedChapters, drafted);
+  const merged = mergePropagationDebts(debts, [{ ...debts[0], id: "new-debt", affectedChapters: [99] }]);
+  assert.equal(merged.length, 1);
+  assert.ok(merged[0].affectedChapters.includes(99));
+});
+
+test("synchronizes storyline lanes and derives character resources from canon", () => {
+  const workspace = structuredClone(DEMO_WORKSPACE);
+  workspace.canon.threads = [{ id: "mystery", title: "失踪名单", status: "open", openedChapter: 1 }];
+  workspace.canon.characterStates = [{ name: "沈砚", state: "带伤调查", physical: "左臂骨折", inventory: ["蓝色船票"], knowledge: ["港务档案被替换"], chapterNumber: 8 }];
+  const lines = syncStorylinesFromWorkspace(workspace);
+  const resources = deriveResourceLedger(workspace);
+
+  assert.ok(lines.some((line) => line.type === "主线"));
+  assert.ok(lines.some((line) => line.type === "谜题线" && line.title === "失踪名单"));
+  assert.ok(resources.some((entry) => entry.type === "伤势" && entry.ownerName === "沈砚"));
+  assert.ok(resources.some((entry) => entry.type === "道具" && entry.name === "蓝色船票"));
+  assert.ok(resources.some((entry) => entry.type === "秘密" && /港务档案/.test(entry.name)));
+});
+
+test("mechanical style immune scan finds deterministic prose patterns", () => {
+  const workspace = structuredClone(DEMO_WORKSPACE);
+  const paragraph = "沈砚看向灯塔，空气仿佛凝固，他心中一震，却没有立刻开口，只把那张被海水泡软的船票重新塞回口袋。";
+  workspace.chapters = [{ ...workspace.chapters[0], number: 1, content: [paragraph, paragraph, "沈砚缓缓走进门内。沈砚缓缓走到窗边。沈砚缓缓走向船票。沈砚缓缓走过长廊。", "然而他停下。然而雾更浓。然而门开了。然而灯灭了。", "不是恐惧而是警觉。不是迟疑而是等待。不是退缩而是选择。", "一切才刚刚开始。"].join("\n\n") }];
+  const issues = buildMechanicalStyleIssues(workspace, 1);
+
+  assert.ok(issues.some((issue) => /重复段落/.test(issue.title)));
+  assert.ok(issues.some((issue) => /句式开头机械重复/.test(issue.title)));
+  assert.ok(issues.some((issue) => /转折连接词过密/.test(issue.title)));
+  assert.ok(issues.some((issue) => /高频模板句式/.test(issue.title)));
+  assert.ok(issues.some((issue) => /总结式模板结尾/.test(issue.title)));
+});
+
+test("detects dormant story threads, missing core characters and repair plateaus", () => {
+  const workspace = structuredClone(DEMO_WORKSPACE);
+  const base = workspace.chapters[0];
+  workspace.project.targetChapters = 24;
+  workspace.characters = [{ ...workspace.characters[0], id: "core-1", name: "核心主角", role: "主角" }];
+  workspace.chapters = Array.from({ length: 8 }, (_, index) => ({
+    ...structuredClone(base),
+    id: `health-chapter-${index + 1}`,
+    number: index + 1,
+    title: `健康检查 ${index + 1}`,
+    content: `第 ${index + 1} 章有效正文`,
+    pov: index === 0 ? "核心主角" : "其他人物",
+    quality: index >= 5 ? { overall: 60, length: 80, outline: 55, continuity: 70, foreshadow: 60, style: 65, evaluatedAt: new Date().toISOString(), notes: [] } : undefined,
+    memory: index === 0 ? { summary: "主角登场", timelineEvents: [], characterUpdates: [{ name: "核心主角", state: "开始调查" }], openedThreads: [], resolvedThreads: [], establishedFacts: [] } : undefined,
+    chapterOutline: index === 7 ? {
+      objective: "推进主线",
+      opening: "进入现场",
+      scenes: ["未完成场景"],
+      sceneCards: [{ id: "scene-gap", title: "现场", objective: "", conflict: "阻力", reveal: "", emotionBeat: "" }],
+      turningPoint: "发现证据",
+      endingHook: "新问题",
+      foreshadowActions: [],
+    } : base.chapterOutline,
+  }));
+  workspace.canon.threads = [{ id: "thread-old", title: "失踪名单", status: "open", openedChapter: 1 }];
+  workspace.issues = [{ id: "existing-error", severity: "错误", category: "情节", title: "旧错误", description: "仍未修复", location: "第8章", resolved: false, chapterNumber: 8 }];
+  workspace.chapters[7].generation = { runId: "health-run", baseRevision: 1, repairAttempts: 3, status: "blocked", completedSegments: 1 };
+
+  const issues = buildNarrativeHealthIssues(workspace);
+  assert.ok(issues.some((issue) => /长期未推进的故事线/.test(issue.title)));
+  assert.ok(issues.some((issue) => /核心人物长期离场/.test(issue.title)));
+  assert.ok(issues.some((issue) => /场景执行卡不完整/.test(issue.title)));
+  assert.ok(issues.some((issue) => /连续章节质量进入平台期/.test(issue.title)));
+  assert.ok(issues.some((issue) => /自动修复已进入平台期/.test(issue.title)));
 });
 
 test("parses rolling continuity audit issues", () => {
@@ -576,8 +781,22 @@ test("applies only bounded unique repair patches", () => {
   assert.match(repair.revisedContent, /already been removed/);
   assert.match(repair.revisedContent, /ending detail/);
   assert.equal(repair.edits.length, 1);
+  assert.match(repair.changeSummary, /实际应用 1 处/);
+  assert.throws(() => applyConsistencyRepairEdits(original, [{ oldText: "The brass key remained locked in the drawer.", newText: "The brass key remained locked in the drawer.", reason: "no-op" }]), /实际变化/);
+  assert.throws(() => applyConsistencyRepairEdits(original, [{ oldText: "The brass key remained locked in the drawer.", newText: "The brass key remained locked in the drawer.   ", reason: "whitespace only" }]), /实际变化/);
+  assert.throws(() => parseConsistencyRepair(JSON.stringify({ revisedContent: original, changeSummary: "same chapter" }), original), /edits/);
   assert.throws(() => applyConsistencyRepairEdits("repeat phrase repeat phrase", [{ oldText: "repeat phrase", newText: "changed", reason: "ambiguous" }]), /oldText/);
   assert.throws(() => applyConsistencyRepairEdits("a".repeat(1000) + " unique target", [{ oldText: "a".repeat(400), newText: "replacement", reason: "too broad" }]), /oldText/);
+});
+
+test("repair re-audit prompt explicitly verifies the repaired issue", () => {
+  const issue = { ...DEMO_WORKSPACE.issues[0], chapterNumber: 1, title: "Knowledge conflict", description: "The character knows too much", evidence: "archive code" };
+  const prompt = buildRollingAuditPrompt(DEMO_WORKSPACE, 1, [issue]);
+  assert.match(prompt, /Knowledge conflict/);
+  assert.match(prompt, /本轮修复前问题/);
+  assert.match(prompt, /信息增量/);
+  assert.match(prompt, /人物情绪弧/);
+  assert.match(prompt, /节奏平台期/);
 });
 
 test("creates stable fingerprints for the same continuity issue", () => {
@@ -682,11 +901,12 @@ test("calculates chapter quality and tracks foreshadows and character state", ()
 });
 
 test("normalizes stage models, task logs, quality and repair review", () => {
-  const source: WorkspaceData = { ...DEMO_WORKSPACE, chapters: [{ ...DEMO_WORKSPACE.chapters[0], quality: { overall: 88, length: 90, outline: 80, continuity: 92, foreshadow: 100, style: 85, evaluatedAt: new Date().toISOString(), notes: [] }, repairReview: { beforeVersionId: "v1", changeSummary: "修复冲突", createdAt: new Date().toISOString(), status: "pending" } }], automation: { ...DEMO_WORKSPACE.automation, stageModels: { audit: { model: "audit-model", maxOutputTokens: 4096, temperature: 0.1, reasoningEffort: "high", verbosity: "medium" } }, taskLog: [{ id: "task-1", kind: "audit", label: "审校", status: "completed", startedAt: new Date().toISOString() }] } };
+  const source: WorkspaceData = { ...DEMO_WORKSPACE, chapters: [{ ...DEMO_WORKSPACE.chapters[0], quality: { overall: 88, length: 90, outline: 80, continuity: 92, foreshadow: 100, style: 85, evaluatedAt: new Date().toISOString(), notes: [] }, repairReview: { beforeVersionId: "v1", changeSummary: "修复冲突", outlineEvidence: [{ key: "scene", label: "核对七具遗体", status: "executed", score: 90, quote: "核对七具遗体", verified: false }], createdAt: new Date().toISOString(), status: "pending" } }], automation: { ...DEMO_WORKSPACE.automation, stageModels: { audit: { model: "audit-model", maxOutputTokens: 4096, temperature: 0.1, reasoningEffort: "high", verbosity: "medium" } }, taskLog: [{ id: "task-1", kind: "audit", label: "审校", status: "completed", startedAt: new Date().toISOString() }] } };
   source.chapters[0].generation = { runId: "draft-retry", status: "planned", completedSegments: 0, baseRevision: 0, draftAttempts: 3 };
   const normalized = normalizeWorkspaceData(source, DEMO_WORKSPACE);
   assert.equal(normalized.chapters[0].quality?.overall, 88);
   assert.equal(normalized.chapters[0].repairReview?.status, "pending");
+  assert.equal(normalized.chapters[0].repairReview?.outlineEvidence?.[0].label, "核对七具遗体");
   assert.equal(normalized.automation.stageModels?.audit?.model, "audit-model");
   assert.equal(normalized.automation.stageModels?.audit?.temperature, 0.1);
   assert.equal(normalized.automation.stageModels?.audit?.reasoningEffort, "high");
@@ -801,7 +1021,7 @@ test("does not expose the next chapter summary to the current prose prompt", () 
   workspace.chapters[1].summary = "UNIQUE_FUTURE_REVEAL_92831";
   const prompt = buildAutomatedChapterPrompt(workspace, workspace.chapters[0], { index: 0, total: 2, existingDraft: "" });
   assert.equal(prompt.includes("UNIQUE_FUTURE_REVEAL_92831"), false);
-  assert.match(prompt, /wholeChapterObligations/);
+  assert.match(prompt, /chapterOutline/);
   assert.match(prompt, /whole_chapter_single_pass/);
   assert.doesNotMatch(prompt, /\u5206\u6bb5\u4efb\u52a1/);
 });
@@ -845,6 +1065,58 @@ test("turns missing verified outline evidence into blocking errors", () => {
   assert.ok(issues.every((issue) => issue.severity === String.fromCodePoint(0x9519, 0x8bef)));
   assert.ok(issues.some((issue) => issue.id.endsWith("turningPoint")));
   assert.ok(issues.some((issue) => issue.id.endsWith("scenes")));
+});
+
+test("carries repair outline evidence into rebuilt memory so fixed plan errors do not repeat", () => {
+  const workspace = structuredClone(DEMO_WORKSPACE);
+  const chapter = workspace.chapters[0];
+  chapter.chapterOutline = {
+    objective: "确认城市正在重置",
+    opening: "早上六点从海腥味中醒来",
+    scenes: ["检查手机日期", "核对七具遗体"],
+    turningPoint: "第二次在同一个六点醒来",
+    endingHook: "七具遗体究竟在指认什么",
+    foreshadowActions: [],
+  };
+  chapter.content = [
+    "早上六点从海腥味中醒来，她检查手机日期，日期没有变化。",
+    "她赶到殡仪馆核对七具遗体，并确认城市正在重置。",
+    "第二次在同一个六点醒来时，她提前说出遗体送达时间。",
+    "她盯着冷柜想：七具遗体究竟在指认什么？",
+    "现场记录与人物反应持续推进。".repeat(80),
+    "唯一待修句：补充现场动作与人物反应。",
+  ].join("\n");
+  workspace.chapters = [chapter];
+  const repair = parseConsistencyRepair(JSON.stringify({
+    edits: [{ oldText: "唯一待修句：补充现场动作与人物反应。", newText: "唯一待修句：补充现场行动、冲突与人物反应。", reason: "补足动作" }],
+    outlineEvidence: [
+      { key: "objective", label: chapter.chapterOutline.objective, status: "executed", score: 90, quote: "确认城市正在重置" },
+      { key: "opening", label: chapter.chapterOutline.opening, status: "executed", score: 90, quote: "早上六点从海腥味中醒来" },
+      { key: "scene", label: chapter.chapterOutline.scenes[0], status: "executed", score: 90, quote: "检查手机日期" },
+      { key: "scene", label: chapter.chapterOutline.scenes[1], status: "executed", score: 90, quote: "核对七具遗体" },
+      { key: "turningPoint", label: chapter.chapterOutline.turningPoint, status: "executed", score: 90, quote: "第二次在同一个六点醒来" },
+      { key: "endingHook", label: chapter.chapterOutline.endingHook, status: "executed", score: 90, quote: "七具遗体究竟在指认什么" },
+    ],
+    changeSummary: "补足章纲执行",
+  }), chapter.content);
+  chapter.content = repair.revisedContent;
+  const rebuilt = parseChapterMemory(JSON.stringify({ evidenceVersion: 1, summary: "重建记忆", timelineEvents: [], characterUpdates: [], openedThreads: [], resolvedThreads: [], establishedFacts: [], outlineEvidence: [], foreshadowUpdates: [] }));
+  const repairIssue = { id: "plan-fix", severity: "错误" as const, category: "情节" as const, title: "章纲场景执行不完整", description: "目标、开场、场景、转折和钩子缺少证据", location: "第 1 章", resolved: false, chapterNumber: 1, source: "local" as const };
+  assert.deepEqual(validateConsistencyRepairOutlineEvidence(chapter, repairIssue, repair), []);
+  assert.ok(validateConsistencyRepairOutlineEvidence(chapter, repairIssue, { ...repair, outlineEvidence: repair.outlineEvidence?.slice(0, -1) }).some((entry) => entry.includes("七具遗体究竟在指认什么")));
+  const applied = applyChapterMemory(workspace, chapter.id, mergeRepairOutlineEvidence(rebuilt, repair.outlineEvidence));
+  assert.equal(applied.chapters[0].memory?.outlineEvidence?.filter((entry) => entry.verified).length, 6);
+  assert.deepEqual(buildChapterPlanDeviationIssues(applied, chapter.number, "repair-regression"), []);
+});
+
+test("repair prompt requires all chapter gaps and exact post-repair evidence", () => {
+  const workspace = structuredClone(DEMO_WORKSPACE);
+  const chapter = workspace.chapters[0];
+  const issue = { id: "combined", severity: "错误" as const, category: "情节" as const, title: "第 1 章一键修复（6 项）", description: "目标、开场、场景、转折和钩子均未验证", location: "第 1 章", resolved: false, chapterNumber: 1, source: "local" as const };
+  const prompt = buildConsistencyRepairPrompt(workspace, issue, chapter);
+  assert.match(prompt, /完整 outlineEvidence/);
+  assert.match(prompt, /必须在同一轮补丁中一起处理/);
+  assert.match(prompt, /label 必须逐字复制/);
 });
 
 test("preserves structured character memory and evidence across persistence normalization", () => {
@@ -928,4 +1200,227 @@ test("cancels an automation run without deleting completed chapters", () => {
   assert.equal(cancelled.automation.taskLog?.[1].status, "cancelled");
   assert.equal(cancelled.automation.taskLog?.[2].status, "completed");
   assert.equal(cancelled.chapters[0].content, originalContent);
+});
+
+
+test("parses whole-book audit only when chapter evidence is exact", () => {
+  const workspace = structuredClone(DEMO_WORKSPACE);
+  workspace.chapters[0].content = "沈砚把潮汐表压在桌面上，确认父亲留下的时间并不可能。";
+  const issues = parseWholeBookAudit(JSON.stringify({ issues: [
+    { severity: "错误", category: "情节", title: "兑现节点缺少结果", description: "关键证据没有形成决定", chapterNumber: workspace.chapters[0].number, evidence: "沈砚把潮汐表压在桌面上", suggestedFix: "补足决定" },
+    { severity: "错误", category: "人物", title: "编造证据", description: "不应被接受", chapterNumber: workspace.chapters[0].number, evidence: "正文中并不存在的句子" },
+  ] }), "final-run", workspace);
+  assert.equal(issues.length, 1);
+  assert.equal(issues[0].title, "兑现节点缺少结果");
+});
+
+test("whole-book review queues chapters in dependency order and rewinds downstream canon", () => {
+  const workspace = structuredClone(DEMO_WORKSPACE);
+  const issues = [
+    { id: "b", severity: "警告", category: "文风", title: "第八章模板结尾", description: "重复", location: "第8章", resolved: false, chapterNumber: 8, source: "local" },
+    { id: "a", severity: "错误", category: "情节", title: "第三章承诺未兑现", description: "缺失", location: "第3章", resolved: false, chapterNumber: 3, source: "local" },
+  ] as WorkspaceData["issues"];
+  assert.deepEqual(buildWholeBookRepairQueue(issues), [3, 8]);
+  let reviewed = prepareWholeBookReview(workspace);
+  reviewed = replaceWholeBookReviewIssues(reviewed, issues, "repairing");
+  assert.equal(reviewed.automation.phase, "reviewing");
+  assert.deepEqual(reviewed.automation.finalReview?.repairQueue, [3, 8]);
+  assert.equal(prepareWholeBookReview(reviewed).automation.finalReview?.status, "repairing");
+  const rewound = removeCanonFromChapterOnward(reviewed, 3);
+  assert.ok(rewound.canon.chapterSummaries.every((item) => item.chapterNumber < 3));
+  assert.ok(rewound.chapters.filter((chapter) => chapter.number >= 3).every((chapter) => !chapter.memory));
+});
+
+test("passing whole-book review clears propagation debt and is the only completed state", () => {
+  const workspace = structuredClone(DEMO_WORKSPACE);
+  workspace.storyControl = {
+    propagationDebts: [{ id: "debt", sourceType: "大纲", sourceId: "beat", sourceTitle: "结局", changeType: "修改", reason: "结局改变", affectedChapters: [3, 4], createdAt: new Date().toISOString(), status: "复审中" }],
+    storylines: [],
+    resourceLedger: [],
+  };
+  const cleared = clearPropagationDebtsAfterReview(workspace);
+  assert.equal(cleared.storyControl?.propagationDebts[0].status, "已清偿");
+  const passed = markWholeBookReviewPassed(prepareWholeBookReview(cleared));
+  assert.equal(passed.automation.phase, "completed");
+  assert.equal(passed.automation.finalReview?.status, "passed");
+  assert.equal(passed.project.status, "全书验收完成");
+  assert.ok(passed.storyControl?.propagationDebts.every((debt) => debt.status === "已清偿"));
+});
+
+test("normalization preserves reviewing only for active durable automation", () => {
+  const workspace = structuredClone(DEMO_WORKSPACE);
+  workspace.automation.phase = "reviewing";
+  workspace.automation.finalReview = { status: "repairing", round: 2, issueIds: ["x"], repairQueue: [8, 3, 3], repairAttempts: { "3": 1 } };
+  const local = normalizeWorkspaceData(workspace, DEMO_WORKSPACE);
+  const durable = normalizeWorkspaceData(workspace, DEMO_WORKSPACE, { preserveWritingPhase: true });
+  assert.equal(local.automation.phase, "paused");
+  assert.equal(durable.automation.phase, "reviewing");
+  assert.deepEqual(durable.automation.finalReview?.repairQueue, [3, 8]);
+});
+
+
+test("partial repair evidence cannot overwrite stronger rebuilt memory evidence", () => {
+  const memory = parseChapterMemory(JSON.stringify({
+    evidenceVersion: 1, summary: "rebuilt", timelineEvents: [], characterUpdates: [], openedThreads: [], resolvedThreads: [], establishedFacts: [],
+    outlineEvidence: [{ key: "objective", label: "chapter objective", status: "executed", score: 92, quote: "exact chapter evidence" }], foreshadowUpdates: [],
+  }));
+  const merged = mergeRepairOutlineEvidence(memory, [{ key: "objective", label: "chapter objective", status: "partial", score: 40, evidence: "uncertain", quote: "exact chapter evidence", verified: false }]);
+  assert.equal(merged.outlineEvidence?.[0].status, "executed");
+  assert.equal(merged.outlineEvidence?.[0].score, 92);
+});
+
+test("legacy outline-evidence failure reopens the blocked chapter and can continue", () => {
+  const workspace = structuredClone(DEMO_WORKSPACE);
+  const chapter = workspace.chapters[1];
+  chapter.content = "valid repaired chapter content".repeat(200);
+  chapter.generation = { runId: "legacy", status: "blocked", completedSegments: 1, baseRevision: 0, repairAttempts: 3 };
+  workspace.automation.phase = "error";
+  workspace.automation.currentChapterNumber = chapter.number;
+  workspace.automation.lastError = "\u4fee\u590d\u7ed3\u679c\u7f3a\u5c11\u53ef\u6838\u5bf9\u7684\u7ae0\u7eb2\u8bc1\u636e\uff1a\u7ae0\u7eb2\u8bc1\u636e\u672a\u6807\u8bb0\u4e3a\u5df2\u6267\u884c";
+  const recovered = recoverOutlineEvidenceValidationBlock(workspace);
+  assert.equal(recovered.automation.phase, "paused");
+  assert.equal(recovered.automation.lastError, undefined);
+  assert.equal(recovered.chapters[1].generation?.status, "generating");
+  assert.equal(recovered.chapters[1].generation?.repairAttempts, 0);
+  assert.equal(recovered.chapters[1].memory, undefined);
+  assert.ok(!estimateWritingRange(recovered).errors.some((error) => error.includes("\u4eba\u5de5\u5904\u7406")));
+});
+
+
+test("narrative world memory only promotes quoted events and knowledge", () => {
+  const workspace = structuredClone(DEMO_WORKSPACE);
+  const chapter = workspace.chapters[0];
+  const characterName = workspace.characters[0].name;
+  chapter.content = "“别碰那只钟。”" + characterName + "按住了铜钟，终于知道潮声来自井底。";
+  const applied = applyChapterMemory(workspace, chapter.id, {
+    evidenceVersion: 1,
+    summary: "人物阻止触碰铜钟，并确认潮声来源。",
+    timelineEvents: [], characterUpdates: [], openedThreads: [], resolvedThreads: [], establishedFacts: [],
+    narrativeEvents: [{ id: "pending", chapterNumber: 0, event: "人物按住铜钟", actualOrder: 1, revealOrder: 1, participants: [characterName], causeIds: [], effectIds: [], quote: characterName + "按住了铜钟", verified: false }],
+    knowledgeChanges: [{ id: "pending-k", chapterNumber: 0, characterName, fact: "潮声来自井底", status: "knows", quote: "终于知道潮声来自井底", verified: false }],
+  });
+  assert.equal(applied.canon.narrativeEvents?.length, 1);
+  assert.equal(applied.canon.narrativeEvents?.[0].verified, true);
+  assert.equal(applied.canon.knowledgeStates?.[0].characterName, characterName);
+});
+
+test("context compiler traces included and excluded context blocks", () => {
+  const workspace = structuredClone(DEMO_WORKSPACE);
+  const target = workspace.chapters[1];
+  workspace.canon.knowledgeStates = [{ id: "k1", chapterNumber: 1, characterName: target.pov || workspace.characters[0].name, fact: "铜钟不能触碰", status: "knows", verified: true }];
+  const manifest = compileContextManifest(workspace, target, 1000);
+  assert.equal(manifest.chapterNumber, target.number);
+  assert.ok(manifest.items.some((item) => item.id === "knowledge" && item.included));
+  assert.ok(manifest.items.some((item) => !item.included));
+});
+
+test("candidate ranking selects a best draft and learns user preference", () => {
+  const workspace = structuredClone(DEMO_WORKSPACE);
+  const chapter = { ...workspace.chapters[0], targetWords: 80, chapterOutline: { ...workspace.chapters[0].chapterOutline!, opening: "铜钟响起", scenes: ["沈砚追进雨巷"], turningPoint: "他交出钥匙", endingHook: "井底传来敲击" } };
+  const ranked = rankChapterCandidates(workspace, chapter, ["很短。", "铜钟响起。沈砚追进雨巷，他交出钥匙。井底传来敲击。“快走！”他喊。".repeat(4)]);
+  assert.equal(ranked[0].selected, true);
+  assert.ok(ranked[0].score >= ranked[1].score);
+  assert.equal(rankChapterCandidates(workspace, chapter, [ranked[0].content, `  ${ranked[0].content}  `]).length, 1);
+  const preference = learnWritingPreference(undefined, ranked[0], ranked.slice(1));
+  assert.equal(preference.version, 1);
+  assert.equal(preference.acceptedCandidateSignals.length, 1);
+});
+
+test("low confidence issues never enter automatic repair queue", () => {
+  const workspace = structuredClone(DEMO_WORKSPACE);
+  workspace.issues = [{ id: "low", severity: "错误", category: "情节", title: "主观判断", description: "没有证据", location: "第 1 章", resolved: false, chapterNumber: 1, source: "ai", confidence: "low", evidenceClass: "subjective", autoRepairable: false }];
+  assert.equal(unresolvedChapterErrors(workspace, 1).length, 0);
+});
+
+test("pacing and voice engines produce explainable metrics", () => {
+  const workspace = structuredClone(DEMO_WORKSPACE);
+  const name = workspace.characters[0].name;
+  workspace.chapters[0].content = Array.from({ length: 6 }, (_, index) => name + "说：“你必须现在走吗？”他冲出门，追进雨里。" + index).join("\n\n");
+  workspace.chapters[0].memory = { summary: "追逐", timelineEvents: [], characterUpdates: [], openedThreads: ["雨夜追逐"], resolvedThreads: [], establishedFacts: ["他离开房间"] };
+  const curve = derivePacingCurve(workspace);
+  const voices = deriveCharacterVoiceProfiles(workspace);
+  assert.ok(curve[0].action > 0);
+  assert.ok(voices.find((item) => item.characterName === name)!.sampleCount >= 5);
+  assert.ok(Array.isArray(buildNarrativeIntelligenceIssues(workspace)));
+});
+
+
+test("multi-candidate request estimates count unfinished candidate drafts", () => {
+  const workspace = structuredClone(DEMO_WORKSPACE);
+  workspace.automation.generatedChapterIds = [];
+  workspace.automation.writingRange = { fromChapter: 1, toChapter: 1 };
+  workspace.automation.maxRequests = 1000;
+  const validDraft = "潮声推着人物继续向前。".repeat(workspace.chapters[0].targetWords);
+  workspace.chapters[0].content = validDraft;
+  workspace.chapters[0].candidates = [{ id: "c1", content: validDraft, createdAt: new Date().toISOString(), score: 50, reasons: [] }];
+  workspace.chapters[0].generation = { runId: "interrupted", status: "generating", completedSegments: 0, baseRevision: workspace.canon.revision };
+  workspace.automation.candidateCount = 3;
+  assert.equal(estimateWritingRange(workspace).remainingSegments, 2);
+  workspace.automation.candidateCount = 1;
+  assert.equal(estimateWritingRange(workspace).remainingSegments, 0);
+  workspace.chapters[0].content = "";
+  workspace.chapters[0].candidates = undefined;
+  assert.equal(estimateWritingRange(workspace).remainingSegments, 1);
+});
+
+test("rewinding clears downstream narrative intelligence and stale candidates", () => {
+  const workspace = structuredClone(DEMO_WORKSPACE);
+  workspace.canon.narrativeEvents = [{ id: "e1", chapterNumber: 1, event: "one", actualOrder: 1, revealOrder: 1, participants: [], causeIds: [], effectIds: [], verified: true }, { id: "e2", chapterNumber: 2, event: "two", actualOrder: 2, revealOrder: 2, participants: [], causeIds: [], effectIds: [], verified: true }];
+  workspace.canon.knowledgeStates = [{ id: "k2", chapterNumber: 2, characterName: workspace.characters[0].name, fact: "secret", status: "knows", verified: true }];
+  workspace.chapters[1].candidates = [{ id: "c2", content: "alternate", createdAt: new Date().toISOString(), score: 80, reasons: [] }];
+  workspace.chapters[1].contextManifest = compileContextManifest(workspace, workspace.chapters[1]);
+  workspace.issues = [{ id: "i2", severity: "错误", category: "情节", title: "stale", description: "stale", location: "第 2 章", resolved: false, chapterNumber: 2 }];
+  const rewound = rewindNovelFromChapter(workspace, 2, "rewind-test");
+  assert.deepEqual(rewound.canon.narrativeEvents?.map((item) => item.id), ["e1"]);
+  assert.equal(rewound.canon.knowledgeStates?.length, 0);
+  assert.equal(rewound.chapters[1].candidates, undefined);
+  assert.equal(rewound.chapters[1].contextManifest, undefined);
+  assert.equal(rewound.issues.some((item) => item.chapterNumber === 2), false);
+});
+
+test("normalization preserves narrative traces, candidates and learned preferences", () => {
+  const workspace = structuredClone(DEMO_WORKSPACE);
+  workspace.canon.narrativeEvents = [{ id: "event-1", chapterNumber: 1, event: "door opened", actualOrder: 1, revealOrder: 1, participants: [workspace.characters[0].name], causeIds: [], effectIds: [], verified: true }];
+  workspace.chapters[0].contextManifest = compileContextManifest(workspace, workspace.chapters[0]);
+  workspace.chapters[0].candidates = [{ id: "candidate-1", content: "complete alternate", createdAt: new Date().toISOString(), score: 88, reasons: ["章纲覆盖"] }];
+  workspace.storyControl = { ...(workspace.storyControl || { propagationDebts: [], storylines: [], resourceLedger: [] }), writingPreferences: { version: 1, updatedAt: new Date().toISOString(), acceptedCandidateSignals: ["signal"], rejectedCandidateSignals: [], preferredPacing: "fast", preferredDialogueRatio: "high", notes: [] } };
+  const normalized = normalizeWorkspaceData(workspace, DEMO_WORKSPACE);
+  assert.equal(normalized.canon.narrativeEvents?.[0].verified, true);
+  assert.equal(normalized.chapters[0].contextManifest?.items.length, workspace.chapters[0].contextManifest.items.length);
+  assert.equal(normalized.chapters[0].candidates?.[0].score, 88);
+  assert.equal(normalized.storyControl?.writingPreferences?.preferredPacing, "fast");
+});
+test("context payload contains only blocks admitted by the manifest", () => {
+  const workspace = structuredClone(DEMO_WORKSPACE);
+  const target = workspace.chapters[1];
+  workspace.world = [{ id: "excluded-world", category: "规则", title: "EXCLUDED_WORLD_MARKER", summary: "x".repeat(8000), details: "x".repeat(8000) }];
+  workspace.relationships = [{ id: "excluded-relation", fromId: workspace.characters[0].id, toId: workspace.characters[1].id, label: "EXCLUDED_RELATION_MARKER", tone: "复杂", description: "x".repeat(8000) }];
+  const inputs = { verifiedCanon: workspace.canon, existingDraft: "EXISTING_DRAFT_MARKER".repeat(2000), narrativeRecaps: [{ chapterNumber: 1, summary: "RECAP_MARKER" }] };
+  const manifest = compileContextManifest(workspace, target, 1000, inputs);
+  const payload = contextPayloadFromManifest(workspace, target, manifest, inputs);
+  const serialized = JSON.stringify(payload);
+  for (const item of manifest.items.filter((item) => !item.included)) {
+    if (item.id === "world-rules") assert.ok(!serialized.includes("EXCLUDED_WORLD_MARKER"));
+    if (item.id === "relationships") assert.ok(!serialized.includes("EXCLUDED_RELATION_MARKER"));
+    if (item.id === "existing-draft") assert.ok(!serialized.includes("EXISTING_DRAFT_MARKER"));
+    if (item.id === "narrative-recaps") assert.ok(!serialized.includes("RECAP_MARKER"));
+  }
+});
+
+test("automated chapter prompt includes verified facts once through compiled context", () => {
+  const workspace = structuredClone(DEMO_WORKSPACE);
+  const target = workspace.chapters[1];
+  workspace.chapters[0].memory = { evidenceVersion: 1, summary: "verified", timelineEvents: [], characterUpdates: [], openedThreads: [], resolvedThreads: [], establishedFacts: [] };
+  workspace.canon.facts = [{ id: "fact-one", chapterNumber: 1, fact: "UNIQUE_VERIFIED_FACT_MARKER", level: "text", evidence: "quote" }];
+  const prompt = buildAutomatedChapterPrompt(workspace, target, { existingDraft: "" });
+  assert.equal(prompt.split("UNIQUE_VERIFIED_FACT_MARKER").length - 1, 1);
+});
+
+test("whole-book blockers retain human-only findings without auto-queuing them", () => {
+  const issues = [
+    { id: "human", severity: "错误", category: "情节", title: "需要人工决定", description: "高置信但不能自动修", location: "第 2 章", resolved: false, chapterNumber: 2, confidence: "high", autoRepairable: false },
+    { id: "low", severity: "错误", category: "情节", title: "低置信判断", description: "不阻塞", location: "第 3 章", resolved: false, chapterNumber: 3, confidence: "low", autoRepairable: true },
+  ] as WorkspaceData["issues"];
+  assert.deepEqual(wholeBookBlockingIssues(issues).map((item) => item.id), ["human"]);
+  assert.deepEqual(buildWholeBookRepairQueue(issues), []);
 });

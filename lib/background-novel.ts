@@ -6,6 +6,7 @@ import { ensureNovelSchema, getProject, saveAutomationCheckpoint } from "@/db/no
 import {
   applyChapterMemory,
   buildAutomatedChapterPrompt,
+  compileAutomatedChapterContext,
   cancelAutomationRun,
   chapterDraftWordRange,
   MAX_AUTOMATED_REPAIR_ATTEMPTS,
@@ -14,11 +15,13 @@ import {
   buildChapterPlanDeviationIssues,
   buildMemoryEvidenceIssues,
   buildCharacterContinuityIssues,
+  buildMechanicalStyleIssues,
   buildConsistencyRepairPrompt,
   buildRollingAuditPrompt,
   estimateWritingRange,
   evaluateChapterQuality,
   parseChapterMemory,
+  mergeRepairOutlineEvidence,
   parseConsistencyRepair,
   parseRollingAudit,
   removeChapterFromCanon,
@@ -28,15 +31,28 @@ import {
   validateGeneratedChapterDraft,
   validateGeneratedChapterFormat,
 } from "@/lib/auto-novel";
-import type { Chapter, ConsistencyIssue, WorkspaceData } from "@/lib/types";
+import type { ConsistencyIssue, WorkspaceData } from "@/lib/types";
+import { buildNarrativeIntelligenceIssues, rankChapterCandidates } from "@/lib/narrative-intelligence";
+import {
+  buildWholeBookAuditPrompt,
+  buildWholeBookRepairQueue,
+  clearPropagationDebtsAfterReview,
+  collectWholeBookReviewIssues,
+  markWholeBookReviewPassed,
+  parseWholeBookAudit,
+  prepareWholeBookReview,
+  removeCanonFromChapterOnward,
+  replaceWholeBookReviewIssues,
+  wholeBookBlockingIssues,
+} from "@/lib/whole-book-review";
 
-type BackgroundKind = "chapter_segment" | "chapter_memory" | "rolling_audit" | "consistency_repair";
+type BackgroundKind = "chapter_segment" | "chapter_memory" | "rolling_audit" | "consistency_repair" | "whole_book_audit";
 
 type BackgroundStep = {
   stepKey: string;
   kind: BackgroundKind;
   prompt: string;
-  chapterNumber: number;
+  chapterNumber?: number;
   segmentNumber?: number;
 };
 
@@ -88,11 +104,6 @@ function openAIClient() {
 
 function backgroundModel() {
   return configuredValue(env.BACKGROUND_AI_MODEL) || configuredValue(env.OPENAI_MODEL);
-}
-
-function chapterSegments(chapter: Chapter) {
-  void chapter;
-  return 1;
 }
 
 function reserveBackgroundRequest(workspace: WorkspaceData): WorkspaceData {
@@ -172,15 +183,20 @@ function nextBackgroundStep(workspace: WorkspaceData): BackgroundStep | null {
     if (accepted) continue;
     if (generation?.status === "blocked") return null;
 
-    const total = chapterSegments(chapter);
-    const completedSegments = Math.min(total, generation?.completedSegments || 0);
-    if (completedSegments < total) {
+    const candidateCount = workspace.automation.candidateCount || 1;
+    const contentComplete = Boolean(chapter.content.trim()) && !validateGeneratedChapterDraft(chapter, chapter.content).length;
+    const validStoredCandidateCount = chapter.candidates?.filter((candidate) => !validateGeneratedChapterDraft(chapter, candidate.content).length).length || 0;
+    const existingCandidateCount = validStoredCandidateCount || (contentComplete ? 1 : 0);
+    const candidatesReady = contentComplete && (generation?.completedSegments || 0) >= 1 && existingCandidateCount >= candidateCount;
+    if (!candidatesReady) {
+      const candidateIndex = Math.min(candidateCount, existingCandidateCount + 1);
+      const variation = candidateCount > 1 ? `\n\n\u3010\u5019\u9009\u5206\u652f ${candidateIndex}/${candidateCount}\u3011\u4fdd\u6301\u5168\u90e8\u4e8b\u5b9e\u4e0e\u7ae0\u7eb2\u4e0d\u53d8\uff0c\u4f46\u5728\u573a\u666f\u8c03\u5ea6\u3001\u5bf9\u767d\u8282\u594f\u548c\u610f\u8c61\u9009\u62e9\u4e0a\u63d0\u4f9b\u4e0e\u5176\u4ed6\u5019\u9009\u660e\u663e\u4e0d\u540c\u7684\u5b8c\u6574\u5199\u6cd5\u3002` : "";
       return {
-        stepKey: `${runId}:chapter:${chapter.number}:draft:${(generation?.draftAttempts || 0) + 1}`,
+        stepKey: `${runId}:chapter:${chapter.number}:draft:${(generation?.draftAttempts || 0) + 1}:candidate:${candidateIndex}`,
         kind: "chapter_segment",
         chapterNumber: chapter.number,
-        segmentNumber: 1,
-        prompt: buildAutomatedChapterPrompt(workspace, chapter, { existingDraft: chapter.content }),
+        segmentNumber: candidateIndex,
+        prompt: `${buildAutomatedChapterPrompt(workspace, chapter, { existingDraft: chapter.content })}${variation}`,
       };
     }
     if (!chapter.memory) {
@@ -210,10 +226,39 @@ function nextBackgroundStep(workspace: WorkspaceData): BackgroundStep | null {
       stepKey: `${runId}:audit:${chapter.number}:${repairAttempts}`,
       kind: "rolling_audit",
       chapterNumber: chapter.number,
-      prompt: buildRollingAuditPrompt(workspace, chapter.number),
+      prompt: buildRollingAuditPrompt(workspace, chapter.number, repairAttempts > 0
+        ? workspace.issues.filter((issue) => issue.chapterNumber === chapter.number && issue.severity === "错误").slice(-8)
+        : []),
     };
   }
-  return null;
+  const finalReview = workspace.automation.finalReview;
+  if (finalReview?.status === "passed" || finalReview?.status === "blocked") return null;
+  if (finalReview?.status === "repairing" && finalReview.repairQueue.length) {
+    const chapterNumber = finalReview.repairQueue[0];
+    const chapter = workspace.chapters.find((item) => item.number === chapterNumber);
+    const reviewIds = new Set(finalReview.issueIds);
+    const chapterIssues = workspace.issues.filter((issue) => reviewIds.has(issue.id) && !issue.resolved && issue.chapterNumber === chapterNumber);
+    if (chapter && chapterIssues.length) {
+      const combinedIssue: ConsistencyIssue = {
+        ...chapterIssues[0],
+        title: `全书终审返修：第 ${chapterNumber} 章共 ${chapterIssues.length} 项`,
+        description: chapterIssues.map((issue, index) => `${index + 1}. ${issue.title}?${issue.description}`).join("\n"),
+        suggestedFix: chapterIssues.map((issue) => issue.suggestedFix).filter(Boolean).join("?"),
+      };
+      const attempt = (finalReview.repairAttempts[String(chapterNumber)] || 0) + 1;
+      return {
+        stepKey: `${runId}:whole-book-repair:${finalReview.round}:${chapterNumber}:${attempt}`,
+        kind: "consistency_repair",
+        chapterNumber,
+        prompt: buildConsistencyRepairPrompt(workspace, combinedIssue, chapter),
+      };
+    }
+  }
+  return {
+    stepKey: `${runId}:whole-book-audit:${(finalReview?.round || 0) + 1}`,
+    kind: "whole_book_audit",
+    prompt: buildWholeBookAuditPrompt(workspace),
+  };
 }
 
 async function finishRun(ownerId: string, projectId: string, workspace: WorkspaceData) {
@@ -256,7 +301,7 @@ async function submitStep(ownerId: string, projectId: string, workspace: Workspa
 
   if (workspace.automation.usage.requestCount >= workspace.automation.maxRequests) throw new Error("已达到最大模型调用次数");
   if (workspace.automation.usage.totalTokens >= workspace.automation.maxTokens) throw new Error("已达到最大 Token 预算");
-  const stage = step.kind === "chapter_segment" ? "chapter" : step.kind === "chapter_memory" ? "memory" : step.kind === "rolling_audit" ? "audit" : "repair";
+  const stage = step.kind === "chapter_segment" ? "chapter" : step.kind === "chapter_memory" ? "memory" : ["rolling_audit", "whole_book_audit"].includes(step.kind) ? "audit" : "repair";
   const stageConfig = workspace.automation.stageModels?.[stage];
   const model = stageConfig?.model?.trim() || backgroundModel();
   if (!model) throw new Error("服务器尚未配置 BACKGROUND_AI_MODEL");
@@ -270,7 +315,7 @@ async function submitStep(ownerId: string, projectId: string, workspace: Workspa
       status = 'queued', attempts = background_responses.attempts + 1,
       last_error = NULL, updated_at = excluded.updated_at`)
     .bind(jobId, `pending:${jobId}`, runId, projectId, ownerId, step.stepKey, step.kind,
-      step.chapterNumber, step.segmentNumber ?? null, now, now)
+      step.chapterNumber ?? null, step.segmentNumber ?? null, now, now)
     .run();
   if (respectPause) {
     const latest = await getProject(ownerId, projectId);
@@ -314,10 +359,14 @@ export async function enqueueNextBackgroundStep(ownerId: string, projectId: stri
     return { status: "paused", workspace: project.workspace };
   }
   let workspace = prepareWritingWorkspace(source || project.workspace);
+  if (workspace.chapters.length && workspace.chapters.every((chapter) => workspace.automation.generatedChapterIds.includes(chapter.id)) && workspace.automation.finalReview?.status !== "passed") {
+    workspace = prepareWholeBookReview(workspace);
+  }
   if (!workspace.chapters.length) throw new Error("请先生成全书蓝图和章节目录");
   await saveAutomationCheckpoint(ownerId, projectId, workspace);
   const step = nextBackgroundStep(workspace);
   if (!step) {
+    if (workspace.automation.finalReview?.status === "blocked" || workspace.automation.phase === "paused") return { status: "paused", workspace };
     workspace = await finishRun(ownerId, projectId, workspace);
     return { status: workspace.automation.phase === "completed" ? "completed" : "range_completed", workspace };
   }
@@ -331,6 +380,31 @@ export async function enqueueNextBackgroundStep(ownerId: string, projectId: stri
 
 function applyCompletedStep(workspace: WorkspaceData, job: BackgroundJobRow, output: string) {
   const runId = workspace.automation.runId!;
+  if (job.kind === "whole_book_audit") {
+    const aiIssues = parseWholeBookAudit(output, runId, workspace);
+    workspace = clearPropagationDebtsAfterReview(workspace);
+    const reviewIssues = collectWholeBookReviewIssues(workspace, aiIssues);
+    let updated = replaceWholeBookReviewIssues(workspace, reviewIssues, reviewIssues.length ? "repairing" : "reviewing");
+    const blockers = wholeBookBlockingIssues(reviewIssues);
+    if (!blockers.length) return markWholeBookReviewPassed(updated);
+    const queue = buildWholeBookRepairQueue(blockers);
+    const round = updated.automation.finalReview?.round || 1;
+    if (!queue.length || round >= 3) {
+      const reason = !queue.length ? "全书终审存在无法自动定位的问题" : `全书终审已自动返修 ${round - 1} 轮，仍有 ${blockers.length} 项问题`;
+      updated = {
+        ...updated,
+        project: { ...updated.project, status: "全书终审待确认" },
+        automation: {
+          ...updated.automation,
+          phase: "paused",
+          lastError: reason,
+          finalReview: updated.automation.finalReview ? { ...updated.automation.finalReview, status: "blocked", repairQueue: queue, lastError: reason } : updated.automation.finalReview,
+          updatedAt: new Date().toISOString(),
+        },
+      };
+    }
+    return updated;
+  }
   const chapter = workspace.chapters.find((item) => item.number === job.chapter_number);
   if (!chapter) throw new Error(`找不到第 ${job.chapter_number} 章`);
   const now = new Date().toISOString();
@@ -369,18 +443,25 @@ function applyCompletedStep(workspace: WorkspaceData, job: BackgroundJobRow, out
         },
       };
     }
+    const candidateCount = workspace.automation.candidateCount || 1;
+    const candidateContents = [...(chapter.candidates || []).map((item) => item.content), output.trim()].slice(-candidateCount);
+    const rankedCandidates = rankChapterCandidates(workspace, chapter, candidateContents);
+    const candidatesReady = rankedCandidates.length >= candidateCount;
+    const contextManifest = compileAutomatedChapterContext(workspace, chapter, chapter.content).manifest;
     return {
       ...cleaned,
       chapters: cleaned.chapters.map((item) => item.id === chapter.id ? {
         ...item,
-        content: output.trim(),
+        content: rankedCandidates[0]?.content || output.trim(),
         memory: undefined,
+        contextManifest,
+        candidates: rankedCandidates,
         status: "\u4fee\u8ba2\u4e2d" as const,
         updatedAt: now,
         generation: {
           runId,
-          status: "generating" as const,
-          completedSegments: 1,
+          status: candidatesReady ? "generating" as const : "planned" as const,
+          completedSegments: candidatesReady ? 1 : 0,
           baseRevision: item.generation?.baseRevision ?? item.revision ?? 0,
           repairAttempts: item.generation?.repairAttempts || 0,
           draftAttempts: item.generation?.draftAttempts || 0,
@@ -390,7 +471,7 @@ function applyCompletedStep(workspace: WorkspaceData, job: BackgroundJobRow, out
         ...cleaned.automation,
         phase: "writing" as const,
         currentChapterNumber: chapter.number,
-        currentSegment: 1,
+        currentSegment: candidatesReady ? 1 : 0,
         updatedAt: now,
       },
     };
@@ -398,11 +479,14 @@ function applyCompletedStep(workspace: WorkspaceData, job: BackgroundJobRow, out
 
   if (job.kind === "consistency_repair") {
     const repaired = parseConsistencyRepair(output, chapter.content);
+    const finalReviewIds = new Set(workspace.automation.finalReview?.issueIds || []);
+    const finalReviewIssues = workspace.issues.filter((issue) => finalReviewIds.has(issue.id) && !issue.resolved && issue.chapterNumber === chapter.number);
+    const isFinalRepair = workspace.automation.finalReview?.status === "repairing" && finalReviewIssues.length > 0;
     const repairValidation = validateGeneratedChapterDraft(chapter, repaired.revisedContent);
     if (repairValidation.length) throw new Error(`\u540e\u53f0\u4fee\u590d\u540e\u7684\u5b8c\u6574\u6b63\u6587\u672a\u901a\u8fc7\u68c0\u67e5\uff1a${repairValidation.join("\uff1b")}`);
     const repairAttempts = (chapter.generation?.repairAttempts || 0) + 1;
     const repairVersionId = `version-${Date.now()}-${chapter.number}`;
-    let updated = removeChapterFromCanon(workspace, chapter.number);
+    let updated = isFinalRepair ? removeCanonFromChapterOnward(workspace, chapter.number) : removeChapterFromCanon(workspace, chapter.number);
     updated = {
       ...updated,
       chapters: updated.chapters.map((item) => item.id === chapter.id ? {
@@ -412,7 +496,7 @@ function applyCompletedStep(workspace: WorkspaceData, job: BackgroundJobRow, out
         memory: undefined,
         revision: (item.revision || 0) + 1,
         updatedAt: now,
-        repairReview: { beforeVersionId: repairVersionId, changeSummary: repaired.changeSummary, createdAt: now, status: "pending" },
+        repairReview: { beforeVersionId: repairVersionId, changeSummary: repaired.changeSummary, edits: repaired.edits, outlineEvidence: repaired.outlineEvidence, createdAt: now, status: "pending" },
         generation: item.generation ? { ...item.generation, status: "repairing" as const, repairAttempts } : item.generation,
       } : item),
       versions: [{
@@ -424,13 +508,26 @@ function applyCompletedStep(workspace: WorkspaceData, job: BackgroundJobRow, out
         note: "自动闭环修复前存档",
       }, ...updated.versions],
       issues: updated.issues.map((issue) => issue.chapterNumber === chapter.number && !issue.resolved ? { ...issue, resolved: true } : issue),
-      automation: { ...updated.automation, updatedAt: now },
+      automation: {
+        ...updated.automation,
+        phase: isFinalRepair ? "reviewing" as const : updated.automation.phase,
+        finalReview: isFinalRepair && updated.automation.finalReview ? {
+          ...updated.automation.finalReview,
+          status: updated.automation.finalReview.repairQueue.filter((number) => number !== chapter.number).length ? "repairing" as const : "reviewing" as const,
+          repairQueue: updated.automation.finalReview.repairQueue.filter((number) => number !== chapter.number),
+          repairAttempts: {
+            ...updated.automation.finalReview.repairAttempts,
+            [String(chapter.number)]: (updated.automation.finalReview.repairAttempts[String(chapter.number)] || 0) + 1,
+          },
+        } : updated.automation.finalReview,
+        updatedAt: now,
+      },
     };
     return updated;
   }
 
   if (job.kind === "chapter_memory") {
-    let updated = applyChapterMemory(workspace, chapter.id, parseChapterMemory(output));
+    let updated = applyChapterMemory(workspace, chapter.id, mergeRepairOutlineEvidence(parseChapterMemory(output), chapter.repairReview?.outlineEvidence));
     updated = {
       ...updated,
       chapters: updated.chapters.map((item) => item.id === chapter.id ? {
@@ -449,7 +546,7 @@ function applyCompletedStep(workspace: WorkspaceData, job: BackgroundJobRow, out
   }
 
   const aiIssues = parseRollingAudit(output, runId, chapter.number, chapter.content);
-  const rawAuditIssues = [...buildChapterQualityIssues(workspace, chapter.number, runId), ...buildChapterPlanDeviationIssues(workspace, chapter.number, runId), ...buildMemoryEvidenceIssues(workspace, chapter.number, runId), ...buildCharacterContinuityIssues(workspace, chapter.number), ...aiIssues];
+  const rawAuditIssues = [...buildChapterQualityIssues(workspace, chapter.number, runId), ...buildChapterPlanDeviationIssues(workspace, chapter.number, runId), ...buildMemoryEvidenceIssues(workspace, chapter.number, runId), ...buildCharacterContinuityIssues(workspace, chapter.number), ...buildMechanicalStyleIssues(workspace, chapter.number), ...buildNarrativeIntelligenceIssues(workspace).filter((issue) => issue.chapterNumber === chapter.number), ...aiIssues];
   const auditIssues = (chapter.generation?.repairAttempts || 0) > 0
     ? stabilizeRepairAuditIssues(workspace.issues.filter((issue) => issue.chapterNumber === chapter.number), rawAuditIssues)
     : rawAuditIssues;
@@ -534,7 +631,8 @@ export async function completeBackgroundResponse(responseId: string, webhookId: 
     const taskLabel = job.kind === "chapter_segment"
       ? retryingShortDraft ? `\u7b2c ${job.chapter_number} \u7ae0\u5b57\u6570\u4e0d\u8db3\uff0c\u81ea\u52a8\u6574\u7ae0\u91cd\u5199` : `\u751f\u6210\u7b2c ${job.chapter_number} \u7ae0\u5b8c\u6574\u6b63\u6587`
       : job.kind === "chapter_memory" ? `\u63d0\u53d6\u7b2c ${job.chapter_number} \u7ae0\u4e8b\u5b9e\u8bb0\u5fc6`
-        : job.kind === "rolling_audit" ? `\u5ba1\u6821\u7b2c ${job.chapter_number} \u7ae0` : `\u4fee\u590d\u7b2c ${job.chapter_number} \u7ae0`;
+        : job.kind === "rolling_audit" ? `\u5ba1\u6821\u7b2c ${job.chapter_number} \u7ae0`
+          : job.kind === "whole_book_audit" ? "\u6267\u884c\u5168\u4e66\u7ec8\u5ba1" : `\u4fee\u590d\u7b2c ${job.chapter_number} \u7ae0`;
     workspace = { ...workspace, automation: { ...workspace.automation, taskLog: [{ id: job.id, runId: job.run_id, kind: job.kind, label: taskLabel, status: "completed" as const, chapterNumber: job.chapter_number ?? undefined, startedAt: new Date().toISOString(), finishedAt: new Date().toISOString() }, ...(workspace.automation.taskLog || []).filter((task) => task.id !== job.id)].slice(0, 500) } };
     await saveAutomationCheckpoint(job.owner_id, job.project_id, workspace, {
       stepKey: job.step_key,

@@ -31,6 +31,7 @@ import {
 } from "lucide-react";
 import {
   buildAutomatedChapterPrompt,
+  compileAutomatedChapterContext,
   chapterDraftWordRange,
   MAX_AUTOMATED_REPAIR_ATTEMPTS,
   buildBlueprintCharactersPrompt,
@@ -43,6 +44,7 @@ import {
   buildChapterPlanDeviationIssues,
   buildMemoryEvidenceIssues,
   buildCharacterContinuityIssues,
+  buildMechanicalStyleIssues,
   buildConsistencyRepairPrompt,
   buildRollingAuditPrompt,
   buildSeedPrompt,
@@ -52,12 +54,14 @@ import {
   estimateWritingRange,
   evaluateChapterQuality,
   parseChapterMemory,
+  mergeRepairOutlineEvidence,
   parseConsistencyRepair,
   parseBlueprintStage,
   parseNovelBlueprint,
   parseRollingAudit,
   parseSeedOptions,
   removeChapterFromCanon,
+  recoverOutlineEvidenceValidationBlock,
   replaceChapterAuditIssues,
   reserveModelRequest,
   restartBlueprintDraft,
@@ -79,8 +83,22 @@ import type {
   WorkspaceData,
 } from "@/lib/types";
 import { recoverWorkspaceFromStep } from "@/lib/workspace-recovery";
+import { buildNarrativeIntelligenceIssues, rankChapterCandidates } from "@/lib/narrative-intelligence";
 import { resolveStageRequestOptions } from "@/lib/ai-stage-config";
+import { readAIResponse } from "@/lib/ai-stream";
 import AutomationTaskCenter from "@/app/components/automation-task-center";
+import {
+  buildWholeBookAuditPrompt,
+  buildWholeBookRepairQueue,
+  clearPropagationDebtsAfterReview,
+  collectWholeBookReviewIssues,
+  markWholeBookReviewPassed,
+  parseWholeBookAudit,
+  prepareWholeBookReview,
+  removeCanonFromChapterOnward,
+  replaceWholeBookReviewIssues,
+  wholeBookBlockingIssues,
+} from "@/lib/whole-book-review";
 
 type Props = {
   workspace: WorkspaceData;
@@ -112,7 +130,7 @@ type Props = {
   onCancelBackground?: () => Promise<void>;
 };
 
-const activePhases: NovelAutomation["phase"][] = ["ideating", "planning", "writing"];
+const activePhases: NovelAutomation["phase"][] = ["ideating", "planning", "writing", "reviewing"];
 
 function countCharacters(value: string) {
   return value.replace(/\s+/g, "").length;
@@ -126,8 +144,9 @@ function phaseLabel(phase: NovelAutomation["phase"]) {
     planning: "正在搭建全书蓝图",
     ready: "蓝图已就绪",
     writing: "正在连续写作",
+    reviewing: "正在进行全书终审",
     paused: "已暂停，可继续",
-    completed: "全书初稿已完成",
+    completed: "全书终审已通过",
     error: "任务遇到问题",
   }[phase];
 }
@@ -193,16 +212,19 @@ export default function AutoNovelStudio({
   const usageRef = useRef(workspace.automation.usage);
   const budgetRef = useRef({ maxRequests: workspace.automation.maxRequests, maxTokens: workspace.automation.maxTokens });
   const [blueprintStage, setBlueprintStage] = useState("");
+  const [streamedCharacters, setStreamedCharacters] = useState(0);
   const [recovery, setRecovery] = useState<AutomationRecoveryData | null>(null);
   const [recoveryLoading, setRecoveryLoading] = useState(false);
   const automation = workspace.automation;
   const isRunning = activePhases.includes(automation.phase) && !(automation.phase === "planning" && !aiBusy);
   const generatedCount = workspace.chapters.filter((item) => automation.generatedChapterIds.includes(item.id)).length;
-  const estimatedCalls = 6 + automation.targetChapters * 2 + Math.ceil(automation.targetChapters / 5);
-  const writingEstimate = estimateWritingRange(workspace);
+  const estimatedCalls = 6 + automation.targetChapters * (1 + (automation.candidateCount || 1)) + Math.ceil(automation.targetChapters / 5);
+  const resumableWorkspace = recoverOutlineEvidenceValidationBlock(workspace);
+  const recoveredEvidenceBlock = resumableWorkspace !== workspace;
+  const writingEstimate = estimateWritingRange(resumableWorkspace);
   const scheduledWorkspace: WorkspaceData = {
-    ...workspace,
-    automation: { ...workspace.automation, writingRange: writingEstimate.range },
+    ...resumableWorkspace,
+    automation: { ...resumableWorkspace.automation, writingRange: writingEstimate.range },
   };
   const currentWorkflowChapter = workspace.chapters.find((chapter) => chapter.number === automation.currentChapterNumber)
     || writingEstimate.pendingChapters[0];
@@ -264,22 +286,23 @@ export default function AutoNovelStudio({
           body: JSON.stringify((() => {
             const stage = detectAIStage(prompt);
             const stageConfig = workspace.automation.stageModels?.[stage];
-            const defaultTokens = prompt.includes("第 5/5 步：章节") ? 32_768 : 16_384;
+            const stageDefaults = { ideation: 8_192, blueprint: prompt.includes("第 5/5 步：章节") ? 32_768 : 16_384, chapter: 16_384, memory: 8_192, audit: 8_192, repair: 16_384 } as const;
+            const defaultTokens = stageDefaults[stage];
             return {
               ...config,
               ...resolveStageRequestOptions(stageConfig, config.temperature, defaultTokens),
               model: stageConfig?.model?.trim() || config.model,
               stage,
+              stream: true,
               prompt,
             };
           })()),
           signal,
         });
-        const payload = await response.json().catch(() => ({})) as {
-          text?: string;
-          error?: string;
-          usage?: Record<string, unknown>;
-        };
+        setStreamedCharacters(0);
+        const payload = await readAIResponse(response, (_chunk, accumulated) => {
+          if (accumulated.length % 200 < 20) setStreamedCharacters(accumulated.length);
+        });
         const usage = payload.usage || {};
         const inputTokens = Number(usage.prompt_tokens ?? usage.input_tokens ?? 0) || 0;
         const outputTokens = Number(usage.completion_tokens ?? usage.output_tokens ?? 0) || 0;
@@ -290,11 +313,8 @@ export default function AutoNovelStudio({
           outputTokens: usageRef.current.outputTokens + outputTokens,
           totalTokens: usageRef.current.totalTokens + totalTokens,
         };
-        if (response.ok && payload.text?.trim()) return payload.text.trim();
-        lastError = payload.error || `模型接口返回 ${response.status}`;
-        if (![408, 429, 500, 502, 503, 504].includes(response.status) || attempt === 2) {
-          throw new Error(lastError);
-        }
+        if (payload.text?.trim()) { setStreamedCharacters(payload.text.length); return payload.text.trim(); }
+        lastError = `模型接口返回 ${response.status}`;
       } catch (error) {
         if (signal?.aborted) throw error;
         lastError = error instanceof Error ? error.message : lastError;
@@ -311,7 +331,7 @@ export default function AutoNovelStudio({
       return parser(first);
     } catch (error) {
       const reason = error instanceof Error ? error.message : "JSON 校验失败";
-      const repaired = await requestText(`请修复下面的模型输出，使其严格满足原任务要求。只输出修复后的合法 JSON，不要解释，也不要 Markdown。\n\n【校验错误】\n${reason}\n\n【原任务】\n${prompt}\n\n【待修复输出】\n${first}`, signal);
+      const repaired = await requestText(`${prompt}\n\n【上一次输出未通过校验】\n${reason}\n\n请重新生成一份完整、合法的 JSON。不要复述上一次输出，不要返回 Markdown 或解释。`, signal);
       return parser(repaired);
     }
   };
@@ -460,6 +480,190 @@ export default function AutoNovelStudio({
     return { blueprint: parseNovelBlueprint(JSON.stringify(merged), seed, settings), draft };
   };
 
+  const runWholeBookReview = async (source: WorkspaceData, runId: string) => {
+    let working = prepareWholeBookReview(source);
+    setWorkspace(working);
+    await onDurableCheckpoint?.(working, {
+      stepKey: `${runId}:whole-book-review:start`,
+      kind: "whole_book_review_started",
+      status: "completed",
+      contextHash: `canon:${working.canon.revision}`,
+    });
+
+    for (let reviewRound = 0; reviewRound < 3; reviewRound += 1) {
+      if (stopRequested.current || runTokenRef.current !== runId) return working;
+      controllerRef.current = new AbortController();
+      const aiIssues = await requestStructured(
+        buildWholeBookAuditPrompt(working),
+        (value) => parseWholeBookAudit(value, runId, working),
+        controllerRef.current.signal,
+      );
+      working = clearPropagationDebtsAfterReview(working);
+      const reviewIssues = collectWholeBookReviewIssues(working, aiIssues);
+      working = replaceWholeBookReviewIssues(working, reviewIssues, reviewIssues.length ? "repairing" : "reviewing");
+      setWorkspace(working);
+      await onDurableCheckpoint?.(working, {
+        stepKey: `${runId}:whole-book-review:${reviewRound + 1}`,
+        kind: "whole_book_audit",
+        status: "completed",
+        outputExcerpt: reviewIssues.map((issue) => `?${issue.chapterNumber}? ${issue.title}`).join("?").slice(0, 1500),
+        contextHash: `canon:${working.canon.revision}`,
+      });
+
+      const blockers = wholeBookBlockingIssues(reviewIssues);
+      if (!blockers.length) {
+        working = markWholeBookReviewPassed(working);
+        setWorkspace(working);
+        await onDurableCheckpoint?.(working, {
+          stepKey: `${runId}:whole-book-review:passed`,
+          kind: "whole_book_accepted",
+          status: "completed",
+          contextHash: `canon:${working.canon.revision}`,
+        });
+        return working;
+      }
+
+      const queue = buildWholeBookRepairQueue(blockers);
+      const remainingRequests = budgetRef.current.maxRequests - usageRef.current.requestCount;
+      if (!queue.length || reviewRound >= 2 || remainingRequests < queue.length * 3 + 1) {
+        const reason = !queue.length
+          ? "全书终审存在无法定位到具体章节的问题，已暂停等待人工确认"
+          : reviewRound >= 2
+            ? `全书终审已自动返修 ${reviewRound} 轮，仍有 ${blockers.length} 项问题`
+            : `全书终审需要至少 ${queue.length * 3 + 1} 次模型调用，当前预算不足`;
+        working = {
+          ...working,
+          project: { ...working.project, status: "全书终审待确认" },
+          automation: {
+            ...working.automation,
+            phase: "paused",
+            lastError: reason,
+            finalReview: {
+              ...(working.automation.finalReview || { status: "blocked", round: reviewRound + 1, issueIds: [], repairQueue: queue, repairAttempts: {} }),
+              status: "blocked",
+              repairQueue: queue,
+              lastError: reason,
+            },
+            updatedAt: new Date().toISOString(),
+          },
+        };
+        setWorkspace(working);
+        notify(reason);
+        return working;
+      }
+
+      let earliestChanged = Number.POSITIVE_INFINITY;
+      for (const chapterNumber of queue) {
+        if (stopRequested.current || runTokenRef.current !== runId) return working;
+        const chapter = working.chapters.find((item) => item.number === chapterNumber);
+        if (!chapter) continue;
+        const chapterIssues = blockers.filter((issue) => issue.chapterNumber === chapterNumber);
+        if (!chapterIssues.length) continue;
+        const combinedIssue: ConsistencyIssue = {
+          ...chapterIssues[0],
+          title: `全书终审返修：第 ${chapterNumber} 章共 ${chapterIssues.length} 项`,
+          description: chapterIssues.map((issue, index) => `${index + 1}. ${issue.title}?${issue.description}`).join("\n"),
+          suggestedFix: chapterIssues.map((issue) => issue.suggestedFix).filter(Boolean).join("?"),
+        };
+        controllerRef.current = new AbortController();
+        const repaired = await requestStructured(
+          buildConsistencyRepairPrompt(working, combinedIssue, chapter),
+          (value) => {
+            const result = parseConsistencyRepair(value, chapter.content);
+            const validationIssues = validateGeneratedChapterDraft(chapter, result.revisedContent);
+            if (validationIssues.length) throw new Error(`全书返修后的正文未通过检查：${validationIssues.join("；")}`);
+            return result;
+          },
+          controllerRef.current.signal,
+        );
+        const versionId = `version-${Date.now()}-final-${chapterNumber}`;
+        const attempts = { ...(working.automation.finalReview?.repairAttempts || {}) };
+        attempts[String(chapterNumber)] = (attempts[String(chapterNumber)] || 0) + 1;
+        working = removeChapterFromCanon(working, chapterNumber);
+        working = {
+          ...working,
+          chapters: working.chapters.map((item) => item.id === chapter.id ? {
+            ...item,
+            content: repaired.revisedContent,
+            memory: undefined,
+            revision: (item.revision || 0) + 1,
+            status: "修订中",
+            updatedAt: new Date().toISOString(),
+            repairReview: { beforeVersionId: versionId, changeSummary: repaired.changeSummary, edits: repaired.edits, outlineEvidence: repaired.outlineEvidence, createdAt: new Date().toISOString(), status: "pending" },
+            generation: item.generation ? { ...item.generation, status: "repairing" } : item.generation,
+          } : item),
+          versions: [{ id: versionId, chapterId: chapter.id, title: chapter.title, content: chapter.content, createdAt: new Date().toISOString(), note: "全书终审自动返修前存档" }, ...working.versions],
+          issues: working.issues.map((issue) => chapterIssues.some((target) => target.id === issue.id) && !issue.resolved ? { ...issue, resolved: true } : issue),
+          automation: {
+            ...working.automation,
+            finalReview: working.automation.finalReview ? { ...working.automation.finalReview, status: "repairing", repairAttempts: attempts } : working.automation.finalReview,
+            updatedAt: new Date().toISOString(),
+          },
+        };
+        earliestChanged = Math.min(earliestChanged, chapterNumber);
+        setWorkspace(working);
+        await onDurableCheckpoint?.(working, {
+          stepKey: `${runId}:whole-book-repair:${reviewRound + 1}:${chapterNumber}`,
+          kind: "whole_book_repair",
+          chapterNumber,
+          status: "completed",
+          outputExcerpt: repaired.changeSummary,
+          contextHash: `canon:${working.canon.revision}`,
+        });
+      }
+
+      if (!Number.isFinite(earliestChanged)) continue;
+      working = removeCanonFromChapterOnward(working, earliestChanged);
+      setWorkspace(working);
+      const downstream = [...working.chapters].filter((chapter) => chapter.number >= earliestChanged).sort((a, b) => a.number - b.number);
+      for (const chapter of downstream) {
+        if (stopRequested.current || runTokenRef.current !== runId) return working;
+        controllerRef.current = new AbortController();
+        const rebuiltMemory = await requestStructured(buildChapterMemoryPrompt(working, chapter), parseChapterMemory, controllerRef.current.signal);
+        working = applyChapterMemory(working, chapter.id, rebuiltMemory);
+        const rebuiltChapter = working.chapters.find((item) => item.id === chapter.id)!;
+        controllerRef.current = new AbortController();
+        const aiAudit = await requestStructured(
+          buildRollingAuditPrompt(working, chapter.number),
+          (value) => parseRollingAudit(value, runId, chapter.number, rebuiltChapter.content),
+          controllerRef.current.signal,
+        );
+        const auditIssues = [
+          ...buildChapterQualityIssues(working, chapter.number, runId),
+          ...buildChapterPlanDeviationIssues(working, chapter.number, runId),
+          ...buildMemoryEvidenceIssues(working, chapter.number, runId),
+          ...buildCharacterContinuityIssues(working, chapter.number),
+          ...buildMechanicalStyleIssues(working, chapter.number),
+          ...buildNarrativeIntelligenceIssues(working).filter((issue) => issue.chapterNumber === chapter.number),
+          ...aiAudit,
+        ];
+        working = replaceChapterAuditIssues(working, chapter.number, auditIssues);
+        const quality = evaluateChapterQuality(working, chapter.number);
+        const errors = unresolvedChapterErrors(working, chapter.number);
+        working = {
+          ...working,
+          chapters: working.chapters.map((item) => item.id === chapter.id ? {
+            ...item,
+            status: errors.length ? "修订中" : "已完成",
+            quality,
+            generation: item.generation ? { ...item.generation, status: errors.length ? "audited" : "accepted", acceptedAt: errors.length ? undefined : new Date().toISOString() } : item.generation,
+          } : item),
+          canon: { ...working.canon, lastAuditedChapter: Math.max(working.canon.lastAuditedChapter, chapter.number) },
+        };
+        setWorkspace(working);
+        await onDurableCheckpoint?.(working, {
+          stepKey: `${runId}:whole-book-rebuild:${reviewRound + 1}:${chapter.number}`,
+          kind: "whole_book_memory_reaudit",
+          chapterNumber: chapter.number,
+          status: "completed",
+          outputExcerpt: rebuiltMemory.summary,
+          contextHash: `canon:${working.canon.revision}`,
+        });
+      }
+    }
+    return working;
+  };
+
   const writeNovel = async (source: WorkspaceData) => {
     if (!ensureConfigured()) return;
     const schedule = estimateWritingRange(source);
@@ -505,13 +709,27 @@ export default function AutoNovelStudio({
         if (stopRequested.current || runTokenRef.current !== runId) break;
         if (working.automation.generatedChapterIds.includes(item.id)) continue;
 
-        const hasCompleteDraft = Boolean(item.content.trim()) && (item.generation?.completedSegments || 0) >= 1 && !validateGeneratedChapterDraft(item, item.content).length;
+        const configuredCandidateCount = working.automation.candidateCount || 1;
+        const contentComplete = Boolean(item.content.trim()) && !validateGeneratedChapterDraft(item, item.content).length;
+        const validStoredCandidateCount = item.candidates?.filter((candidate) => !validateGeneratedChapterDraft(item, candidate.content).length).length || 0;
+        const existingCandidateCount = validStoredCandidateCount || (contentComplete ? 1 : 0);
+        const hasCompleteDraft = contentComplete && (item.generation?.completedSegments || 0) >= 1 && existingCandidateCount >= configuredCandidateCount;
         if (!hasCompleteDraft) {
         const target = working.chapters.find((chapter) => chapter.id === item.id) || item;
         const previousDraft = item.content;
+        const contextManifest = compileAutomatedChapterContext(working, target, previousDraft).manifest;
         controllerRef.current = new AbortController();
         const prompt = buildAutomatedChapterPrompt(working, target, { existingDraft: previousDraft });
-        let generated = await requestText(prompt, controllerRef.current.signal);
+        const candidateCount = working.automation.candidateCount || 1;
+        const candidateOutputs: string[] = [];
+        for (let candidateIndex = 0; candidateIndex < candidateCount; candidateIndex += 1) {
+          const variation = candidateCount > 1 ? `\n\n【候选分支 ${candidateIndex + 1}/${candidateCount}】保持全部事实与章纲不变，但在场景调度、对白节奏和意象选择上提供与其他候选明显不同的完整写法。` : "";
+
+          candidateOutputs.push(await requestText(`${prompt}${variation}`, controllerRef.current.signal));
+        }
+        const validCandidateOutputs = candidateOutputs.filter((content) => !validateGeneratedChapterDraft(target, content).length);
+        let rankedCandidates = rankChapterCandidates(working, target, validCandidateOutputs.length ? validCandidateOutputs : candidateOutputs);
+        let generated = rankedCandidates[0].content;
         if (runTokenRef.current !== runId || stopRequested.current) break;
         let guardIssues = validateGeneratedChapterDraft(target, generated);
         let correctionAttempts = 0;
@@ -530,12 +748,17 @@ export default function AutoNovelStudio({
           guardIssues = validateGeneratedChapterDraft(target, generated);
         }
         if (runTokenRef.current !== runId || stopRequested.current) break;
-        const draft = generated.trim();
+        const correctedDraft = generated.trim();
+        const finalCandidateContents = [correctedDraft, ...rankedCandidates.slice(1).map((candidate) => candidate.content).filter((content) => !validateGeneratedChapterDraft(target, content).length)];
+        rankedCandidates = rankChapterCandidates(working, target, finalCandidateContents);
+        const draft = rankedCandidates[0].content;
         working = {
           ...working,
           chapters: working.chapters.map((chapter) => chapter.id === item.id ? {
             ...chapter,
             content: draft,
+            contextManifest,
+            candidates: rankedCandidates,
             status: "\u4fee\u8ba2\u4e2d",
             updatedAt: new Date().toISOString(),
             generation: {
@@ -543,6 +766,7 @@ export default function AutoNovelStudio({
               status: "generating",
               completedSegments: 1,
               baseRevision: chapter.generation?.baseRevision ?? chapter.revision ?? 0,
+              draftAttempts: (chapter.generation?.draftAttempts || 0) + candidateOutputs.length + correctionAttempts,
             },
           } : chapter),
           automation: {
@@ -607,8 +831,11 @@ export default function AutoNovelStudio({
           if (!currentChapter) throw new Error(`第 ${item.number} 章检查点丢失`);
           const repairAttempts = currentChapter.generation?.repairAttempts || 0;
           controllerRef.current = new AbortController();
+          const repairFocus = repairAttempts > 0
+            ? working.issues.filter((issue) => issue.chapterNumber === item.number && issue.severity === "错误").slice(-8)
+            : [];
           const aiAuditIssues = await requestStructured(
-            buildRollingAuditPrompt(working, item.number),
+            buildRollingAuditPrompt(working, item.number, repairFocus),
             (value) => parseRollingAudit(value, runId, item.number, currentChapter.content),
             controllerRef.current.signal,
           );
@@ -618,6 +845,8 @@ export default function AutoNovelStudio({
             ...buildChapterPlanDeviationIssues(working, item.number, runId),
             ...buildMemoryEvidenceIssues(working, item.number, runId),
             ...buildCharacterContinuityIssues(working, item.number),
+            ...buildMechanicalStyleIssues(working, item.number),
+            ...buildNarrativeIntelligenceIssues(working).filter((issue) => issue.chapterNumber === item.number),
             ...aiAuditIssues,
           ];
           const auditIssues = repairAttempts > 0
@@ -742,7 +971,7 @@ export default function AutoNovelStudio({
               memory: undefined,
               revision: (chapter.revision || 0) + 1,
               updatedAt: new Date().toISOString(),
-              repairReview: { beforeVersionId: repairVersionId, changeSummary: repaired.changeSummary, createdAt: new Date().toISOString(), status: "pending" },
+              repairReview: { beforeVersionId: repairVersionId, changeSummary: repaired.changeSummary, edits: repaired.edits, outlineEvidence: repaired.outlineEvidence, createdAt: new Date().toISOString(), status: "pending" },
               generation: chapter.generation ? {
                 ...chapter.generation,
                 status: "repairing",
@@ -774,7 +1003,7 @@ export default function AutoNovelStudio({
           controllerRef.current = new AbortController();
           const rebuiltMemory = await requestStructured(
             buildChapterMemoryPrompt(working, repairedChapter),
-            parseChapterMemory,
+            (value) => mergeRepairOutlineEvidence(parseChapterMemory(value), repaired.outlineEvidence),
             controllerRef.current.signal,
           );
           if (stopRequested.current || runTokenRef.current !== runId) break;
@@ -835,14 +1064,18 @@ export default function AutoNovelStudio({
       }
 
       const allGenerated = working.chapters.every((chapter) => working.automation.generatedChapterIds.includes(chapter.id));
+      if (allGenerated) {
+        working = await runWholeBookReview(working, runId);
+        if (working.automation.phase === "completed") notify("全书已经通过终审，故事线、传播债务、人物资源和文风闭环均已验收");
+        return;
+      }
       working = {
         ...working,
-        project: { ...working.project, status: allGenerated ? "初稿完成" : "创作中" },
-        outline: allGenerated ? working.outline.map((item) => ({ ...item, status: "已完成" })) : working.outline,
+        project: { ...working.project, status: "创作中" },
         automation: {
           ...working.automation,
-          phase: allGenerated ? "completed" : "paused",
-          currentChapterNumber: allGenerated ? working.chapters.length : schedule.range.toChapter,
+          phase: "paused",
+          currentChapterNumber: schedule.range.toChapter,
           currentSegment: 0,
           lastError: undefined,
           usage: usageRef.current,
@@ -851,13 +1084,11 @@ export default function AutoNovelStudio({
       };
       setWorkspace(working);
       await onDurableCheckpoint?.(working, {
-        stepKey: `${runId}:${allGenerated ? "completed" : `range-completed:${schedule.range.fromChapter}-${schedule.range.toChapter}`}`,
-        kind: allGenerated ? "run_completed" : "range_completed",
+        stepKey: `${runId}:range-completed:${schedule.range.fromChapter}-${schedule.range.toChapter}`,
+        kind: "range_completed",
         status: "completed",
       });
-      notify(allGenerated
-        ? "全书初稿已经完成，可以进入章节审阅与导出"
-        : `第 ${schedule.range.fromChapter}—${schedule.range.toChapter} 章已生成完成，任务已在范围终点安全停靠`);
+      notify(`第 ${schedule.range.fromChapter}—${schedule.range.toChapter} 章已生成完成，任务已在范围终点安全停靠`);
     } catch (error) {
       const paused = stopRequested.current || controllerRef.current?.signal.aborted;
       working = {
@@ -1201,7 +1432,7 @@ export default function AutoNovelStudio({
   return (
     <div className="view auto-novel-view" aria-busy={isRunning}>
       <div className="view-heading">
-        <div><span className="eyebrow">AI AUTOPILOT</span><h1>AI 全书创作</h1><p>即使没有灵感，也能从故事选择开始，自动完成蓝图和全书初稿。</p></div>
+        <div><span className="eyebrow">AI AUTOPILOT</span><h1>AI 全书创作</h1><p>即使没有灵感，也能从故事选择开始，自动完成蓝图、全书正文与终审闭环。</p></div>
         <div className="heading-actions">
           {activePhases.includes(automation.phase) && aiBusy ? <button className="secondary-button" onClick={() => backgroundActive ? void onPauseBackground?.() : pause()}><Pause size={16} />暂停</button> : null}
           {resumableSeed && ["planning", "paused", "error"].includes(automation.phase) && automation.blueprintDraft && automation.blueprintDraft.completedStage < 5 ? <button className="primary-button" disabled={aiBusy} onClick={() => void buildBlueprintFrom(workspace, resumableSeed, false)}><RotateCcw size={16} />从第 {Math.min(5, automation.blueprintDraft!.completedStage + 1)} 步继续蓝图</button> : null}
@@ -1226,8 +1457,8 @@ export default function AutoNovelStudio({
       <div className="auto-step-grid">
         <article className={automation.seeds.length ? "done" : automation.phase === "ideating" ? "active" : ""}><span>01</span><div><b>故事方向</b><small>无灵感也能生成 3 个选择</small></div>{automation.seeds.length ? <Check size={17} /> : <Lightbulb size={17} />}</article>
         <article className={workspace.chapters.length && automation.runId ? "done" : automation.phase === "planning" ? "active" : ""}><span>02</span><div><b>全书蓝图</b><small>{automation.phase === "planning" && blueprintStage ? blueprintStage : "人物 → 设定 → 大纲 → 伏笔 → 章节"}</small></div>{workspace.chapters.length && automation.runId ? <Check size={17} /> : automation.phase === "planning" ? <LoaderCircle className="spin" size={17} /> : <Route size={17} />}</article>
-        <article className={automation.phase === "completed" ? "done" : automation.phase === "writing" ? "active" : ""}><span>03</span><div><b>连续写作</b><small>正文 → 记忆 → 逐章审校</small></div>{automation.phase === "completed" ? <Check size={17} /> : <PenLine size={17} />}</article>
-        <article className={automation.phase === "completed" ? "done" : ""}><span>04</span><div><b>闭环验收</b><small>自动修复 → 复审 → 通过后再写下一章</small></div><BookOpenCheck size={17} /></article>
+        <article className={["reviewing", "completed"].includes(automation.phase) ? "done" : automation.phase === "writing" ? "active" : ""}><span>03</span><div><b>逐章闭环</b><small>正文 → 记忆 → 审校 → 修复 → 复审</small></div>{["reviewing", "completed"].includes(automation.phase) ? <Check size={17} /> : <PenLine size={17} />}</article>
+        <article className={automation.phase === "completed" ? "done" : automation.phase === "reviewing" ? "active" : ""}><span>04</span><div><b>全书终审</b><small>契约、故事线、传播债务、资源与文风总验收</small></div>{automation.phase === "reviewing" ? <LoaderCircle className="spin" size={17} /> : <BookOpenCheck size={17} />}</article>
       </div>
 
       <section className="auto-settings-card card">
@@ -1236,6 +1467,7 @@ export default function AutoNovelStudio({
         <div className="auto-number-grid">
           <label><span>章节数</span><input type="number" min="4" max="60" disabled={isRunning} value={automation.targetChapters} onChange={(event) => { const targetChapters = Math.min(60, Math.max(4, Number(event.target.value) || 4)); patchAutomation({ targetChapters, targetWords: targetChapters * automation.chapterWords }); }} /><small>4—60 章</small></label>
           <label><span>每章目标字数</span><input type="number" min="1200" max="12000" step="100" disabled={isRunning} value={automation.chapterWords} onChange={(event) => { const chapterWords = Math.min(12000, Math.max(1200, Number(event.target.value) || 1200)); patchAutomation({ chapterWords, targetWords: automation.targetChapters * chapterWords }); }} /><small>整章一次生成，不得少于目标字数；超出允许验收</small></label>
+          <label><span>每章候选写法</span><select disabled={isRunning} value={automation.candidateCount || 1} onChange={(event) => patchAutomation({ candidateCount: Number(event.target.value) as 1 | 2 | 3 })}><option value={1}>1 个（省 Token）</option><option value={2}>2 个（自动择优）</option><option value={3}>3 个（质量优先）</option></select><small>多候选会分别生成完整章节，系统评分后选用最佳稿，其他稿保留可切换</small></label>
           <label><span>全书目标字数</span><input type="number" readOnly value={automation.targetChapters * automation.chapterWords} /><small>预计至少 {estimatedCalls} 次模型调用</small></label>
           <label><span>最大模型调用</span><input type="number" min="10" max="1000" disabled={isRunning} value={automation.maxRequests} onChange={(event) => patchAutomation({ maxRequests: Math.min(1000, Math.max(10, Number(event.target.value) || 10)) })} /><small>达到上限自动暂停</small></label>
           <label><span>最大 Token 预算</span><input type="number" min="10000" max="100000000" step="10000" disabled={isRunning} value={automation.maxTokens} onChange={(event) => patchAutomation({ maxTokens: Math.min(100000000, Math.max(10000, Number(event.target.value) || 10000)) })} /><small>当前已用 {automation.usage.totalTokens.toLocaleString("zh-CN")}</small></label>
@@ -1262,7 +1494,7 @@ export default function AutoNovelStudio({
       {automation.blueprintDraft?.completedStage === 5 && selectedSeed && <section className="auto-settings-card card">
         <div className="auto-section-title"><div><span>蓝图维护</span><h2>单独重做一个阶段</h2></div><small>重做上游阶段会自动刷新依赖它的后续阶段</small></div>
         <div className="heading-actions">
-          {(["人物与关系", "世界设定", "故事大纲", "伏笔回收", "逐章目录"] as const).map((label, index) => <button key={label} className="secondary-button compact" disabled={aiBusy || automation.phase === "writing"} onClick={() => void redoBlueprintStage((index + 1) as 1 | 2 | 3 | 4 | 5)}><RotateCcw size={14} />重做{label}</button>)}
+          {(["人物与关系", "世界设定", "故事大纲", "伏笔回收", "逐章目录"] as const).map((label, index) => <button key={label} className="secondary-button compact" disabled={aiBusy || ["writing", "reviewing"].includes(automation.phase)} onClick={() => void redoBlueprintStage((index + 1) as 1 | 2 | 3 | 4 | 5)}><RotateCcw size={14} />重做{label}</button>)}
         </div>
       </section>}
 
@@ -1272,24 +1504,24 @@ export default function AutoNovelStudio({
           <label><span>从第几章开始</span><select disabled={isRunning || backgroundActive} value={writingEstimate.range.fromChapter} onChange={(event) => updateWritingRange(Number(event.target.value), Math.max(Number(event.target.value), writingEstimate.range.toChapter))}>{[...workspace.chapters].sort((a, b) => a.number - b.number).map((item) => <option key={item.id} value={item.number}>第 {item.number} 章 · {item.title}</option>)}</select></label>
           <label><span>写到第几章</span><select disabled={isRunning || backgroundActive} value={writingEstimate.range.toChapter} onChange={(event) => updateWritingRange(Math.min(writingEstimate.range.fromChapter, Number(event.target.value)), Number(event.target.value))}>{[...workspace.chapters].sort((a, b) => a.number - b.number).map((item) => <option key={item.id} value={item.number}>第 {item.number} 章 · {item.title}</option>)}</select></label>
           <div className="auto-scheduler-stat"><span><FileText size={15} />待生成章节</span><b>{writingEstimate.pendingChapters.length}</b><small>共 {writingEstimate.chapters.length} 章在范围内</small></div>
-          <div className="auto-scheduler-stat"><span><PenLine size={15} />剩余整章正文</span><b>{writingEstimate.remainingSegments}</b><small>每章只调用一次正文生成</small></div>
+          <div className="auto-scheduler-stat"><span><PenLine size={15} />{(automation.candidateCount || 1) > 1 ? "剩余候选正文" : "剩余整章正文"}</span><b>{writingEstimate.remainingSegments}</b><small>按候选数生成整章并自动择优</small></div>
           <div className="auto-scheduler-stat"><span><Zap size={15} />最低模型调用</span><b>{writingEstimate.minimumRequests}</b><small>当前还有 {writingEstimate.remainingRequestBudget} 次预算</small></div>
         </div>
         <div className={`auto-scheduler-health ${writingEstimate.errors.length ? "has-error" : "is-ready"}`}>
           {writingEstimate.errors.length ? <><AlertTriangle size={17} /><div><b>当前计划需要调整</b>{writingEstimate.errors.map((error) => <p key={error}>{error}</p>)}</div></> : <><Check size={17} /><div><b>写作计划已就绪</b><p>将从“{currentWorkflowStage}”继续；任务在第 {writingEstimate.range.toChapter} 章通过验收后自动停靠。</p></div></>}
         </div>
         <div className="auto-scheduler-actions">
-          <span>“安全回退”会清理起点之后的旧正文和未来事实，适合大幅改写。</span>
+          <span>{recoveredEvidenceBlock ? "\u5df2\u8bc6\u522b\u65e7\u7248\u7ae0\u7eb2\u8bc1\u636e\u963b\u585e\uff1a\u7ee7\u7eed\u540e\u4f1a\u4fdd\u7559\u6b63\u6587\uff0c\u91cd\u5efa\u672c\u7ae0\u8bb0\u5fc6\u5e76\u91cd\u65b0\u590d\u5ba1\u3002" : "\u201c\u5b89\u5168\u56de\u9000\u201d\u4f1a\u6e05\u7406\u8d77\u70b9\u4e4b\u540e\u7684\u65e7\u6b63\u6587\u548c\u672a\u6765\u4e8b\u5b9e\uff0c\u9002\u5408\u5927\u5e45\u6539\u5199\u3002"}</span>
           <button className="secondary-button" disabled={isRunning || aiBusy || backgroundBusy || backgroundActive} onClick={() => void rewindWritingFromChapter()}><RotateCcw size={16} />从起点安全回退</button>
-          <button className="secondary-button" disabled={isRunning || aiBusy || backgroundBusy || writingEstimate.errors.length > 0} onClick={() => void writeNovel(scheduledWorkspace)}><Play size={16} />浏览器生成范围</button>
-          <button className="primary-button" disabled={isRunning || backgroundBusy || !backgroundConfigured || writingEstimate.errors.length > 0} onClick={() => void onStartBackground?.(scheduledWorkspace)}><Cloud size={16} />云端生成范围</button>
+          <button className="secondary-button" disabled={isRunning || aiBusy || backgroundBusy || writingEstimate.errors.length > 0} onClick={() => void writeNovel(scheduledWorkspace)}><Play size={16} />{recoveredEvidenceBlock ? "\u4ece\u68c0\u67e5\u70b9\u7ee7\u7eed" : "\u6d4f\u89c8\u5668\u751f\u6210\u8303\u56f4"}</button>
+          <button className="primary-button" disabled={isRunning || backgroundBusy || !backgroundConfigured || writingEstimate.errors.length > 0} onClick={() => void onStartBackground?.(scheduledWorkspace)}><Cloud size={16} />{recoveredEvidenceBlock ? "\u4e91\u7aef\u7ee7\u7eed" : "\u4e91\u7aef\u751f\u6210\u8303\u56f4"}</button>
         </div>
       </section>}
 
       {automation.runId && workspace.chapters.length > 0 && <section className="auto-progress-card card">
         <div className="auto-progress-head"><div><span className={`auto-status status-${automation.phase}`}><i />{phaseLabel(automation.phase)}</span><h2>《{workspace.project.title}》</h2><p>{workspace.project.premise}</p></div><div className="auto-progress-ring" style={{ "--auto-progress": `${progress * 3.6}deg` } as React.CSSProperties}><span><b>{progress}%</b><small>{generatedCount}/{workspace.chapters.length} 章</small></span></div></div>
         <div className="auto-track"><i style={{ width: `${progress}%` }} /></div>
-        <div className="auto-progress-meta"><span><Gauge size={15} />{automation.phase === "completed" ? "全书生成完成" : `当前：第 ${Math.min(automation.currentChapterNumber || 1, workspace.chapters.length)} 章 · ${currentWorkflowStage}`}</span><span><FileText size={15} />已生成 {workspace.chapters.reduce((sum, item) => sum + countCharacters(item.content), 0).toLocaleString("zh-CN")} 字</span><span><BrainCircuit size={15} />{backgroundActive ? `${backgroundModel || "OpenAI"} · 云端后台` : config.model || "尚未配置模型"}</span><span><Zap size={15} />{automation.usage.requestCount}/{automation.maxRequests} 次 · {automation.usage.totalTokens.toLocaleString("zh-CN")} Token</span></div>
+        <div className="auto-progress-meta"><span><Gauge size={15} />{automation.phase === "completed" ? "全书终审通过" : automation.phase === "reviewing" ? `全书终审第 ${automation.finalReview?.round || 1} 轮 · ${automation.finalReview?.repairQueue.length || 0} 章待返修` : `当前：第 ${Math.min(automation.currentChapterNumber || 1, workspace.chapters.length)} 章 · ${currentWorkflowStage}`}</span><span><FileText size={15} />已生成 {workspace.chapters.reduce((sum, item) => sum + countCharacters(item.content), 0).toLocaleString("zh-CN")} 字{aiBusy && streamedCharacters > 0 ? ` · 本次流式接收 ${streamedCharacters.toLocaleString("zh-CN")} 字` : ""}</span><span><BrainCircuit size={15} />{backgroundActive ? `${backgroundModel || "OpenAI"} · 云端后台` : config.model || "尚未配置模型"}</span><span><Zap size={15} />{automation.usage.requestCount}/{automation.maxRequests} 次 · {automation.usage.totalTokens.toLocaleString("zh-CN")} Token</span></div>
         {automation.lastError && <div className="auto-error"><AlertTriangle size={16} /><span><b>任务已停在当前检查点</b>{automation.lastError}</span></div>}
         <div className="auto-queue">
           {[...workspace.chapters].sort((a, b) => a.number - b.number).map((item) => {

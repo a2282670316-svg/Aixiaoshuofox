@@ -112,6 +112,146 @@ test("proxies local HTTP model endpoints without requiring an API key", async ()
   }
 });
 
+test("retries a 400 response without optional model parameters", async () => {
+  const worker = await workerPromise;
+  const originalFetch = globalThis.fetch;
+  const bodies = [];
+  globalThis.fetch = async (_input, init) => {
+    bodies.push(JSON.parse(String(init?.body || "{}")));
+    if (bodies.length === 1) {
+      return new Response(JSON.stringify({ error: { message: "Unsupported parameter: verbosity" } }), { status: 400, headers: { "content-type": "application/json" } });
+    }
+    return new Response(JSON.stringify({ choices: [{ message: { content: "兼容重试成功" }, finish_reason: "stop" }] }), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  try {
+    const response = await worker.fetch(
+      new Request("http://localhost/api/ai", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ baseUrl: "http://127.0.0.1:11434/v1", apiKey: "", model: "qwen3", apiMode: "chat", temperature: 0.2, reasoningEffort: "high", verbosity: "medium", maxOutputTokens: 16384, stage: "repair", prompt: "测试修复" }),
+      }),
+      env,
+      context,
+    );
+    assert.equal(response.status, 200);
+    assert.equal(bodies.length, 2);
+    assert.equal(bodies[0].verbosity, "medium");
+    assert.equal(bodies[0].max_tokens, 16384);
+    assert.equal(bodies[1].verbosity, undefined);
+    assert.equal(bodies[1].reasoning_effort, undefined);
+    assert.equal(bodies[1].temperature, undefined);
+    assert.equal(bodies[1].max_tokens, 8192);
+    assert.equal((await response.json()).text, "兼容重试成功");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("normalizes upstream chat streaming into frontend SSE events", async () => {
+  const worker = await workerPromise;
+  const originalFetch = globalThis.fetch;
+  let requestBody = {};
+  globalThis.fetch = async (_input, init) => {
+    requestBody = JSON.parse(String(init?.body || "{}"));
+    const upstream = [
+      'data: {"choices":[{"delta":{"content":"第一段"},"finish_reason":null}]}',
+      '',
+      'data: {"choices":[{"delta":{"content":"第二段"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14}}',
+      '',
+      'data: [DONE]',
+      '',
+    ].join("\n");
+    return new Response(upstream, { status: 200, headers: { "content-type": "text/event-stream" } });
+  };
+  try {
+    const response = await worker.fetch(
+      new Request("http://localhost/api/ai", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ baseUrl: "http://127.0.0.1:11434/v1", apiKey: "", model: "qwen3", apiMode: "chat", maxOutputTokens: 16384, stage: "repair", stream: true, prompt: "流式测试" }),
+      }),
+      env,
+      context,
+    );
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get("content-type") || "", /text\/event-stream/);
+    assert.equal(requestBody.stream, true);
+    assert.equal(requestBody.stream_options.include_usage, true);
+    const output = await response.text();
+    assert.match(output, /event: delta/);
+    assert.match(output, /第一段/);
+    assert.match(output, /第二段/);
+    assert.match(output, /event: done/);
+    assert.match(output, /total_tokens/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("retries Responses API with list input when required by the provider", async () => {
+  const worker = await workerPromise;
+  const originalFetch = globalThis.fetch;
+  const bodies = [];
+  globalThis.fetch = async (_input, init) => {
+    bodies.push(JSON.parse(String(init?.body || "{}")));
+    if (bodies.length === 1) {
+      return new Response(JSON.stringify({ error: { message: "input must be a list" } }), { status: 400, headers: { "content-type": "application/json" } });
+    }
+    return new Response(JSON.stringify({ output_text: "列表格式兼容成功", usage: { input_tokens: 2, output_tokens: 2, total_tokens: 4 } }), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  try {
+    const response = await worker.fetch(
+      new Request("http://localhost/api/ai", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ baseUrl: "http://127.0.0.1:11434/v1/responses", apiKey: "", model: "qwen3", apiMode: "responses", maxOutputTokens: 8192, stage: "repair", prompt: "测试列表输入" }),
+      }),
+      env,
+      context,
+    );
+    assert.equal(response.status, 200);
+    assert.equal(typeof bodies[0].input, "string");
+    assert.ok(Array.isArray(bodies[1].input));
+    assert.equal(bodies[1].input[0].role, "user");
+    assert.equal(bodies[1].input[0].content[0].type, "input_text");
+    assert.equal(bodies[1].input[0].content[0].text, "测试列表输入");
+    assert.equal((await response.json()).text, "列表格式兼容成功");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("removes max_output_tokens when a Responses provider rejects it", async () => {
+  const worker = await workerPromise;
+  const originalFetch = globalThis.fetch;
+  const bodies = [];
+  globalThis.fetch = async (_input, init) => {
+    bodies.push(JSON.parse(String(init?.body || "{}")));
+    if (bodies.length === 1) {
+      return new Response(JSON.stringify({ detail: "Unsupported parameter: max_output_tokens" }), { status: 400, headers: { "content-type": "application/json" } });
+    }
+    return new Response(JSON.stringify({ output_text: "移除参数后成功" }), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  try {
+    const response = await worker.fetch(
+      new Request("http://localhost/api/ai", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ baseUrl: "http://127.0.0.1:11434/v1/responses", apiKey: "", model: "qwen3", apiMode: "responses", maxOutputTokens: 8192, stage: "repair", stream: false, prompt: "测试输出上限兼容" }),
+      }),
+      env,
+      context,
+    );
+    assert.equal(response.status, 200);
+    assert.equal(bodies[0].max_output_tokens, 8192);
+    assert.equal(bodies[1].max_output_tokens, undefined);
+    assert.ok(Array.isArray(bodies[1].input));
+    assert.equal((await response.json()).text, "移除参数后成功");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("uses valid Responses API text input and parses output text", async () => {
   const worker = await workerPromise;
   const originalFetch = globalThis.fetch;

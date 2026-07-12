@@ -26,7 +26,7 @@ export function reconcileInterruptedTasks(
     ...workspace,
     automation: {
       ...workspace.automation,
-      phase: ["ideating", "planning", "writing"].includes(workspace.automation.phase) ? "paused" : workspace.automation.phase,
+      phase: ["ideating", "planning", "writing", "reviewing"].includes(workspace.automation.phase) ? "paused" : workspace.automation.phase,
       taskLog,
       lastError: workspace.automation.lastError || "\u68c0\u6d4b\u5230\u4e0a\u6b21\u672a\u5b8c\u6210\u4efb\u52a1\uff0c\u53ef\u5728\u6062\u590d\u4e2d\u5fc3\u7ee7\u7eed",
       updatedAt: now.toISOString(),
